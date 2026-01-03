@@ -70,25 +70,172 @@ static int class_eq(const char *a, const char *b)
 	}
 }
 
+static int id_eq(const char *a, const char *b)
+{
+	return class_eq(a, b);
+}
+
+static void simple_sel_clear(struct css_simple_selector *s)
+{
+	if (!s) return;
+	s->has_tag = 0;
+	s->has_id = 0;
+	s->has_class = 0;
+	s->tag[0] = 0;
+	s->id[0] = 0;
+	s->klass[0] = 0;
+}
+
+static int simple_match(const struct css_simple_selector *s,
+			const uint8_t *tag_lc,
+			size_t tag_len,
+			const char *id_lc,
+			const char classes[CSS_MAX_CLASSES_PER_NODE][CSS_MAX_CLASS_LEN + 1],
+			uint32_t class_count)
+{
+	if (!s || !tag_lc || tag_len == 0) return 0;
+	if (s->has_tag && !tag_eq(s->tag, tag_lc, tag_len)) return 0;
+	if (s->has_id) {
+		if (!id_lc || id_lc[0] == 0) return 0;
+		if (!id_eq(s->id, id_lc)) return 0;
+	}
+	if (s->has_class) {
+		int ok = 0;
+		for (uint32_t k = 0; k < class_count && k < CSS_MAX_CLASSES_PER_NODE; k++) {
+			if (class_eq(s->klass, classes[k])) { ok = 1; break; }
+		}
+		if (!ok) return 0;
+	}
+	return 1;
+}
+
+static int selector_match(const struct css_selector *sel,
+			 const uint8_t *tag_lc,
+			 size_t tag_len,
+			 const char *id_lc,
+			 const char classes[CSS_MAX_CLASSES_PER_NODE][CSS_MAX_CLASS_LEN + 1],
+			 uint32_t class_count,
+			 const struct css_node *ancestors,
+			 uint32_t ancestor_count)
+{
+	if (!sel) return 0;
+	if (!simple_match(&sel->self, tag_lc, tag_len, id_lc, classes, class_count)) return 0;
+	if (!sel->has_ancestor) return 1;
+	if (!ancestors || ancestor_count == 0) return 0;
+	for (uint32_t i = 0; i < ancestor_count; i++) {
+		const struct css_node *a = &ancestors[i];
+		if (!a || !a->tag_lc || a->tag_len == 0) continue;
+		const char empty_classes[CSS_MAX_CLASSES_PER_NODE][CSS_MAX_CLASS_LEN + 1] = {{0}};
+		const char (*cls)[CSS_MAX_CLASS_LEN + 1] = a->classes ? a->classes : empty_classes;
+		uint32_t cn = a->class_count;
+		if (simple_match(&sel->ancestor, a->tag_lc, a->tag_len, a->id_lc, cls, cn)) return 1;
+	}
+	return 0;
+}
+
+static void rule_clear(struct css_rule *r)
+{
+	if (!r) return;
+	simple_sel_clear(&r->sel.ancestor);
+	simple_sel_clear(&r->sel.self);
+	r->sel.has_ancestor = 0;
+	r->has_display = 0;
+	r->display = CSS_DISPLAY_UNSET;
+	(void)style_attr_parse_inline(0, 0, &r->style);
+}
+
+static void ua_add_hide_id(struct css_sheet *sheet, const char *id)
+{
+	if (!sheet || !id || id[0] == 0) return;
+	if (sheet->ua_n >= CSS_MAX_UA_RULES) return;
+	struct css_rule *r = &sheet->ua_rules[sheet->ua_n++];
+	rule_clear(r);
+	r->sel.self.has_id = 1;
+	size_t i = 0;
+	for (; id[i] && i + 1 < sizeof(r->sel.self.id); i++) r->sel.self.id[i] = id[i];
+	r->sel.self.id[i] = 0;
+	r->has_display = 1;
+	r->display = CSS_DISPLAY_NONE;
+}
+
+static void ua_add_hide_class(struct css_sheet *sheet, const char *klass)
+{
+	if (!sheet || !klass || klass[0] == 0) return;
+	if (sheet->ua_n >= CSS_MAX_UA_RULES) return;
+	struct css_rule *r = &sheet->ua_rules[sheet->ua_n++];
+	rule_clear(r);
+	r->sel.self.has_class = 1;
+	size_t i = 0;
+	for (; klass[i] && i + 1 < sizeof(r->sel.self.klass); i++) r->sel.self.klass[i] = klass[i];
+	r->sel.self.klass[i] = 0;
+	r->has_display = 1;
+	r->display = CSS_DISPLAY_NONE;
+}
+
+static void ua_add_hide_desc_id_class(struct css_sheet *sheet, const char *anc_id, const char *klass)
+{
+	if (!sheet || !anc_id || anc_id[0] == 0 || !klass || klass[0] == 0) return;
+	if (sheet->ua_n >= CSS_MAX_UA_RULES) return;
+	struct css_rule *r = &sheet->ua_rules[sheet->ua_n++];
+	rule_clear(r);
+	r->sel.has_ancestor = 1;
+	r->sel.ancestor.has_id = 1;
+	{
+		size_t i = 0;
+		for (; anc_id[i] && i + 1 < sizeof(r->sel.ancestor.id); i++) r->sel.ancestor.id[i] = anc_id[i];
+		r->sel.ancestor.id[i] = 0;
+	}
+	r->sel.self.has_class = 1;
+	{
+		size_t i = 0;
+		for (; klass[i] && i + 1 < sizeof(r->sel.self.klass); i++) r->sel.self.klass[i] = klass[i];
+		r->sel.self.klass[i] = 0;
+	}
+	r->has_display = 1;
+	r->display = CSS_DISPLAY_NONE;
+}
+
 void css_sheet_init(struct css_sheet *sheet)
 {
 	if (!sheet) return;
 	sheet->n = 0;
+	sheet->ua_n = 0;
 	for (size_t i = 0; i < CSS_MAX_RULES; i++) {
-		sheet->rules[i].kind = CSS_SEL_TAG;
-		sheet->rules[i].tag[0] = 0;
-		sheet->rules[i].klass[0] = 0;
-		sheet->rules[i].has_display = 0;
-		sheet->rules[i].display = CSS_DISPLAY_UNSET;
-		(void)style_attr_parse_inline(0, 0, &sheet->rules[i].style);
+		rule_clear(&sheet->rules[i]);
 	}
+	for (size_t i = 0; i < CSS_MAX_UA_RULES; i++) {
+		rule_clear(&sheet->ua_rules[i]);
+	}
+
+	/* Wikipedia chrome hiding: safe because it only triggers when ids/classes exist. */
+	ua_add_hide_id(sheet, "mw-panel");
+	ua_add_hide_id(sheet, "mw-navigation");
+	ua_add_hide_id(sheet, "mw-head");
+	ua_add_hide_id(sheet, "footer");
+	ua_add_hide_id(sheet, "catlinks");
+	ua_add_hide_id(sheet, "p-lang");
+	ua_add_hide_id(sheet, "mw-page-base");
+	ua_add_hide_id(sheet, "mw-head-base");
+	ua_add_hide_class(sheet, "vector-header-container");
+	ua_add_hide_class(sheet, "vector-page-toolbar");
+	ua_add_hide_class(sheet, "vector-toc");
+	ua_add_hide_class(sheet, "toc");
+	ua_add_hide_class(sheet, "mw-footer");
+	ua_add_hide_class(sheet, "mw-interlanguage-selector");
+	ua_add_hide_class(sheet, "vector-dropdown");
+	ua_add_hide_class(sheet, "vector-menu-portal");
+	ua_add_hide_desc_id_class(sheet, "mw-panel", "mw-portlet");
+	ua_add_hide_desc_id_class(sheet, "mw-navigation", "mw-portlet");
 }
 
 void css_sheet_compute(const struct css_sheet *sheet,
 		       const uint8_t *tag_lc,
 		       size_t tag_len,
+		       const char *id_lc,
 		       const char classes[CSS_MAX_CLASSES_PER_NODE][CSS_MAX_CLASS_LEN + 1],
 		       uint32_t class_count,
+		       const struct css_node *ancestors,
+		       uint32_t ancestor_count,
 		       struct css_computed *out)
 {
 	if (!out) return;
@@ -99,22 +246,19 @@ void css_sheet_compute(const struct css_sheet *sheet,
 
 	for (uint32_t i = 0; i < sheet->n && i < CSS_MAX_RULES; i++) {
 		const struct css_rule *r = &sheet->rules[i];
-		int match = 0;
-		if (r->kind == CSS_SEL_TAG) {
-			match = (r->tag[0] != 0) && tag_eq(r->tag, tag_lc, tag_len);
-		} else if (r->kind == CSS_SEL_CLASS) {
-			for (uint32_t k = 0; k < class_count && k < CSS_MAX_CLASSES_PER_NODE; k++) {
-				if (class_eq(r->klass, classes[k])) { match = 1; break; }
-			}
-		} else if (r->kind == CSS_SEL_TAG_CLASS) {
-			if ((r->tag[0] != 0) && tag_eq(r->tag, tag_lc, tag_len)) {
-				for (uint32_t k = 0; k < class_count && k < CSS_MAX_CLASSES_PER_NODE; k++) {
-					if (class_eq(r->klass, classes[k])) { match = 1; break; }
-				}
-			}
-		}
-		if (!match) continue;
+		if (!selector_match(&r->sel, tag_lc, tag_len, id_lc, classes, class_count, ancestors, ancestor_count)) continue;
 
+		merge_style(&out->style, &r->style);
+		if (r->has_display) {
+			out->has_display = 1;
+			out->display = r->display;
+		}
+	}
+
+	/* UA rules applied last (highest precedence in this tiny model). */
+	for (uint32_t i = 0; i < sheet->ua_n && i < CSS_MAX_UA_RULES; i++) {
+		const struct css_rule *r = &sheet->ua_rules[i];
+		if (!selector_match(&r->sel, tag_lc, tag_len, id_lc, classes, class_count, ancestors, ancestor_count)) continue;
 		merge_style(&out->style, &r->style);
 		if (r->has_display) {
 			out->has_display = 1;
@@ -179,72 +323,122 @@ static int parse_tag_lc(const uint8_t *css,
 	return (o > 0);
 }
 
-static int parse_selector_one(const uint8_t *css, size_t css_len, size_t *io, struct css_rule *out_rule)
+static int parse_simple_selector(const uint8_t *css,
+				 size_t css_len,
+				 size_t *io,
+				 struct css_simple_selector *out)
 {
-	if (!io || !out_rule) return 0;
+	if (!io || !out) return 0;
 	size_t i = *io;
 	while (i < css_len && is_ws(css[i])) i++;
 	if (i >= css_len) { *io = i; return 0; }
 
-	struct css_rule r;
-	r.kind = CSS_SEL_TAG;
-	r.tag[0] = 0;
-	r.klass[0] = 0;
-	r.has_display = 0;
-	r.display = CSS_DISPLAY_UNSET;
-	(void)style_attr_parse_inline(0, 0, &r.style);
+	struct css_simple_selector s;
+	simple_sel_clear(&s);
 
-	if (css[i] == '.') {
-		i++;
+	if (is_alpha(css[i])) {
+		/* tag */
 		size_t j = i;
-		if (!parse_ident_lc(css, css_len, &j, r.klass, sizeof(r.klass))) {
-			*io = i;
-			return 0;
-		}
-		r.kind = CSS_SEL_CLASS;
+		if (!parse_tag_lc(css, css_len, &j, s.tag, sizeof(s.tag))) { *io = i; return 0; }
+		s.has_tag = 1;
 		i = j;
-	} else if (is_alpha(css[i])) {
-		size_t j = i;
-		if (!parse_tag_lc(css, css_len, &j, r.tag, sizeof(r.tag))) {
-			*io = i;
-			return 0;
-		}
-		i = j;
-		if (i < css_len && css[i] == '.') {
-			i++;
-			j = i;
-			if (!parse_ident_lc(css, css_len, &j, r.klass, sizeof(r.klass))) {
-				/* unsupported selector; treat as unparsed */
-				*io = i;
-				return 0;
-			}
-			r.kind = CSS_SEL_TAG_CLASS;
-			i = j;
-		} else {
-			r.kind = CSS_SEL_TAG;
-		}
+	} else if (css[i] == '.' || css[i] == '#') {
+		/* class/id only */
 	} else {
 		*io = i;
 		return 0;
 	}
 
-	/* Ignore pseudo-classes (e.g. a:hover -> a). */
+	/* Suffixes: .class and/or #id in any order (best-effort, at most one each). */
+	while (i < css_len) {
+		if (css[i] == '.') {
+			i++;
+			size_t j = i;
+			char tmp[CSS_MAX_CLASS_LEN + 1];
+			if (!parse_ident_lc(css, css_len, &j, tmp, sizeof(tmp))) { *io = i; return 0; }
+			if (!s.has_class) {
+				for (size_t k = 0; tmp[k] && k + 1 < sizeof(s.klass); k++) s.klass[k] = tmp[k];
+				s.klass[sizeof(s.klass) - 1] = 0;
+				s.has_class = 1;
+			}
+			i = j;
+			continue;
+		}
+		if (css[i] == '#') {
+			i++;
+			size_t j = i;
+			char tmp[CSS_MAX_ID_LEN + 1];
+			if (!parse_ident_lc(css, css_len, &j, tmp, sizeof(tmp))) { *io = i; return 0; }
+			if (!s.has_id) {
+				for (size_t k = 0; tmp[k] && k + 1 < sizeof(s.id); k++) s.id[k] = tmp[k];
+				s.id[sizeof(s.id) - 1] = 0;
+				s.has_id = 1;
+			}
+			i = j;
+			continue;
+		}
+		break;
+	}
+
+	/* Ignore pseudo-classes/elements: best-effort skip ':...' */
 	while (i < css_len && is_ws(css[i])) i++;
 	if (i < css_len && css[i] == ':') {
 		i++;
-		while (i < css_len && is_ident_char(css[i])) i++;
+		while (i < css_len && css[i] != ',' && css[i] != '{' && !is_ws(css[i])) i++;
 		while (i < css_len && is_ws(css[i])) i++;
 	}
 
-	/* Only accept if this selector ends here (or before ',' / '{'). */
-	if (i < css_len && css[i] != ',' && css[i] != '{') {
-		/* unsupported (descendant, combinator, etc) */
-		*io = i;
+	*out = s;
+	*io = i;
+	return 1;
+}
+
+static int parse_selector(const uint8_t *css,
+			  size_t css_len,
+			  size_t *io,
+			  struct css_selector *out_sel)
+{
+	if (!io || !out_sel) return 0;
+	size_t i = *io;
+	while (i < css_len && is_ws(css[i])) i++;
+	if (i >= css_len) { *io = i; return 0; }
+
+	struct css_simple_selector a;
+	if (!parse_simple_selector(css, css_len, &i, &a)) { *io = i; return 0; }
+
+	/* descendant combinator: allow exactly one space-separated second selector */
+	size_t j = i;
+	while (j < css_len && is_ws(css[j])) j++;
+	if (j < css_len && (css[j] == '.' || css[j] == '#' || is_alpha(css[j]))) {
+		struct css_simple_selector b;
+		if (!parse_simple_selector(css, css_len, &j, &b)) {
+			*io = j;
+			return 0;
+		}
+		while (j < css_len && is_ws(css[j])) j++;
+		if (j < css_len && css[j] != ',' && css[j] != '{') {
+			/* unsupported (more complex combinators) */
+			*io = j;
+			return 0;
+		}
+		out_sel->has_ancestor = 1;
+		out_sel->ancestor = a;
+		out_sel->self = b;
+		*io = j;
+		return 1;
+	}
+
+	while (j < css_len && is_ws(css[j])) j++;
+	if (j < css_len && css[j] != ',' && css[j] != '{') {
+		/* unsupported (combinator like '>', '+', attribute selectors, etc) */
+		*io = j;
 		return 0;
 	}
 
-	*out_rule = r;
-	*io = i;
+	out_sel->has_ancestor = 0;
+	simple_sel_clear(&out_sel->ancestor);
+	out_sel->self = a;
+	*io = j;
 	return 1;
 }
 
@@ -262,7 +456,7 @@ int css_parse_style_block(const uint8_t *css, size_t css_len, struct css_sheet *
 		if (is_ws(css[i])) continue;
 
 		/* Parse selector group: sel1, sel2, ... { ... } */
-		struct css_rule sels[16];
+		struct css_selector sels[16];
 		uint32_t sel_n = 0;
 		size_t j = i;
 		while (j < css_len) {
@@ -274,10 +468,10 @@ int css_parse_style_block(const uint8_t *css, size_t css_len, struct css_sheet *
 			if (j >= css_len) break;
 			if (css[j] == '{') break;
 
-			struct css_rule r;
+			struct css_selector sel;
 			size_t sel_pos = j;
-			if (parse_selector_one(css, css_len, &sel_pos, &r)) {
-				if (sel_n < (sizeof(sels) / sizeof(sels[0]))) sels[sel_n++] = r;
+			if (parse_selector(css, css_len, &sel_pos, &sel)) {
+				if (sel_n < (sizeof(sels) / sizeof(sels[0]))) sels[sel_n++] = sel;
 				j = sel_pos;
 			} else {
 				/* Skip unknown selector token until ',' or '{'. */
@@ -360,7 +554,8 @@ int css_parse_style_block(const uint8_t *css, size_t css_len, struct css_sheet *
 		for (uint32_t si = 0; si < sel_n; si++) {
 			if (sheet->n >= CSS_MAX_RULES) break;
 			struct css_rule *r = &sheet->rules[sheet->n++];
-			*r = sels[si];
+			rule_clear(r);
+			r->sel = sels[si];
 			r->style = decl_style;
 			r->has_display = decl_has_display;
 			r->display = decl_display;

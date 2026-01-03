@@ -22,6 +22,25 @@ static int is_tag_name_char(uint8_t c)
 	return is_alpha(c) || is_digit(c);
 }
 
+static int tag_is_void(const uint8_t *tag, size_t n)
+{
+	static const char *voids[] = {
+		"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta",
+		"param", "source", "track", "wbr",
+	};
+	for (size_t i = 0; i < sizeof(voids) / sizeof(voids[0]); i++) {
+		const char *t = voids[i];
+		size_t tl = c_strlen(t);
+		if (tl != n) continue;
+		int eq = 1;
+		for (size_t k = 0; k < n; k++) {
+			if (tag[k] != (uint8_t)t[k]) { eq = 0; break; }
+		}
+		if (eq) return 1;
+	}
+	return 0;
+}
+
 static uint8_t to_lower(uint8_t c)
 {
 	if (c >= 'A' && c <= 'Z') return (uint8_t)(c + ('a' - 'A'));
@@ -69,6 +88,11 @@ static int is_class_char(uint8_t c)
 	return is_alpha(c) || is_digit(c) || c == '_' || c == '-';
 }
 
+static int is_id_char(uint8_t c)
+{
+	return is_alpha(c) || is_digit(c) || c == '_' || c == '-' || c == ':' || c == '.';
+}
+
 static void parse_class_tokens(const uint8_t *v,
 			      size_t vlen,
 			      char classes[CSS_MAX_CLASSES_PER_NODE][CSS_MAX_CLASS_LEN + 1],
@@ -107,6 +131,22 @@ static void parse_class_tokens(const uint8_t *v,
 		}
 	}
 	*io_class_count = n;
+}
+
+static void parse_id_token(const uint8_t *v, size_t vlen, char *out, size_t out_cap)
+{
+	if (!out || out_cap == 0) return;
+	out[0] = 0;
+	if (!v || vlen == 0) return;
+	size_t i = 0;
+	while (i < vlen && is_ascii_space(v[i])) i++;
+	size_t o = 0;
+	while (i < vlen && !is_ascii_space(v[i])) {
+		uint8_t c = v[i++];
+		if (!is_id_char(c)) continue;
+		if (o + 1 < out_cap) out[o++] = (char)to_lower(c);
+	}
+	out[o] = 0;
 }
 
 static uint32_t tag_id(const uint8_t *name_buf, size_t nb)
@@ -410,6 +450,24 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 	struct style_attr style_stack[16];
 	uint32_t tag_stack[16];
 	uint32_t style_depth = 0;
+
+	struct {
+		uint32_t tagid;
+		uint8_t tag_lc[CSS_MAX_TAG_LEN + 1];
+		size_t tag_len;
+		char id[CSS_MAX_ID_LEN + 1];
+		char classes[CSS_MAX_CLASSES_PER_NODE][CSS_MAX_CLASS_LEN + 1];
+		uint32_t class_count;
+	} css_stack[16];
+	uint32_t css_depth = 0;
+	for (uint32_t si = 0; si < 16; si++) {
+		css_stack[si].tagid = 0;
+		css_stack[si].tag_lc[0] = 0;
+		css_stack[si].tag_len = 0;
+		css_stack[si].id[0] = 0;
+		css_stack[si].class_count = 0;
+		for (uint32_t ci = 0; ci < CSS_MAX_CLASSES_PER_NODE; ci++) css_stack[si].classes[ci][0] = 0;
+	}
 	int span_active = 0;
 	uint32_t span_start = 0;
 	struct style_attr span_style;
@@ -471,9 +529,22 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 				for (size_t k = 0; k < nb; k++) name_buf[k] = to_lower(html[name_start + k]);
 				name_buf[nb] = 0;
 				uint32_t id = tag_id(name_buf, nb);
+
+				size_t tag_end = j;
+				while (tag_end < html_len && html[tag_end] != '>') tag_end++;
+				int self_close = 0;
+				if (!is_end && tag_end < html_len) {
+					size_t t = tag_end;
+					while (t > i && is_ascii_space(html[t - 1])) t--;
+					if (t > i && html[t - 1] == '/') self_close = 1;
+				}
+				if (!is_end && !self_close && tag_is_void(name_buf, nb)) self_close = 1;
+
 				if (!is_end) {
-					if (hidden_depth < (sizeof(hidden_tag_stack) / sizeof(hidden_tag_stack[0]))) {
-						hidden_tag_stack[hidden_depth++] = id;
+					if (!self_close) {
+						if (hidden_depth < (sizeof(hidden_tag_stack) / sizeof(hidden_tag_stack[0]))) {
+							hidden_tag_stack[hidden_depth++] = id;
+						}
 					}
 				} else {
 					if (hidden_depth > 0 && hidden_tag_stack[hidden_depth - 1] == id) {
@@ -483,8 +554,7 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 						}
 					}
 				}
-				while (j < html_len && html[j] != '>') j++;
-				i = j;
+				i = tag_end;
 			}
 			continue;
 		}
@@ -524,12 +594,28 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 			size_t nb = min_sz(name_len, sizeof(name_buf) - 1);
 			for (size_t k = 0; k < nb; k++) name_buf[k] = to_lower(html[name_start + k]);
 			name_buf[nb] = 0;
+			uint32_t this_tagid = tag_id(name_buf, nb);
+			if (is_end) {
+				if (css_depth > 0 && css_stack[css_depth - 1].tagid == this_tagid) css_depth--;
+			}
+
+			size_t tag_end = j;
+			while (tag_end < html_len && html[tag_end] != '>') tag_end++;
+			int self_close = 0;
+			if (!is_end && tag_end < html_len) {
+				size_t t = tag_end;
+				while (t > i && is_ascii_space(html[t - 1])) t--;
+				if (t > i && html[t - 1] == '/') self_close = 1;
+			}
+			if (!is_end && !self_close && tag_is_void(name_buf, nb)) self_close = 1;
 
 			char classes[CSS_MAX_CLASSES_PER_NODE][CSS_MAX_CLASS_LEN + 1];
 			for (uint32_t ci = 0; ci < CSS_MAX_CLASSES_PER_NODE; ci++) classes[ci][0] = 0;
 			uint32_t class_count = 0;
+			char node_id[CSS_MAX_ID_LEN + 1];
+			node_id[0] = 0;
 			if (!is_end) {
-				/* Parse class=... within the tag (best-effort). */
+				/* Parse class=... and id=... within the tag (best-effort). */
 				size_t k = j;
 				while (k < html_len && html[k] != '>') {
 					while (k < html_len && is_ascii_space(html[k])) k++;
@@ -556,24 +642,60 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 							while (k < html_len && !is_ascii_space(html[k]) && html[k] != '>') k++;
 						}
 						size_t vlen = (k > vs) ? (k - vs) : 0;
-						if (ieq_attr(html + an, alen, "class") && vlen > 0) {
-							parse_class_tokens(html + vs, vlen, classes, &class_count);
+						if (vlen > 0) {
+							if (ieq_attr(html + an, alen, "class")) {
+								parse_class_tokens(html + vs, vlen, classes, &class_count);
+							} else if (ieq_attr(html + an, alen, "id")) {
+								parse_id_token(html + vs, vlen, node_id, sizeof(node_id));
+							}
 						}
 					}
 					if (k < html_len && html[k] != '>') k++;
 				}
 			}
 
+			struct css_node ancestors[16];
+			uint32_t anc_n = 0;
+			for (uint32_t di = 0; di < css_depth && di < 16; di++) {
+				ancestors[anc_n].tag_lc = css_stack[di].tag_lc;
+				ancestors[anc_n].tag_len = css_stack[di].tag_len;
+				ancestors[anc_n].id_lc = (css_stack[di].id[0] != 0) ? css_stack[di].id : 0;
+				ancestors[anc_n].classes = css_stack[di].classes;
+				ancestors[anc_n].class_count = css_stack[di].class_count;
+				anc_n++;
+			}
+
 			struct css_computed comp;
-			css_sheet_compute(&css, name_buf, nb, classes, class_count, &comp);
+			css_sheet_compute(&css,
+					 name_buf,
+					 nb,
+					 (node_id[0] != 0) ? node_id : 0,
+					 classes,
+					 class_count,
+					 ancestors,
+					 anc_n,
+					 &comp);
 			if (!is_end && comp.has_display && comp.display == CSS_DISPLAY_NONE) {
-				uint32_t id = tag_id(name_buf, nb);
 				if (hidden_depth < (sizeof(hidden_tag_stack) / sizeof(hidden_tag_stack[0]))) {
-					hidden_tag_stack[hidden_depth++] = id;
+					hidden_tag_stack[hidden_depth++] = this_tagid;
 				}
-				while (j < html_len && html[j] != '>') j++;
-				i = j;
+				i = tag_end;
 				continue;
+			}
+
+			if (!is_end && !self_close && css_depth < (sizeof(css_stack) / sizeof(css_stack[0]))) {
+				css_stack[css_depth].tagid = this_tagid;
+				css_stack[css_depth].tag_len = nb;
+				for (size_t t = 0; t < nb && t + 1 < sizeof(css_stack[css_depth].tag_lc); t++) {
+					css_stack[css_depth].tag_lc[t] = name_buf[t];
+					css_stack[css_depth].tag_lc[t + 1] = 0;
+				}
+				cpy_str_trunc(css_stack[css_depth].id, sizeof(css_stack[css_depth].id), node_id);
+				css_stack[css_depth].class_count = class_count;
+				for (uint32_t ci = 0; ci < CSS_MAX_CLASSES_PER_NODE; ci++) {
+					cpy_str_trunc(css_stack[css_depth].classes[ci], sizeof(css_stack[css_depth].classes[ci]), classes[ci]);
+				}
+				css_depth++;
 			}
 
 			/* Link open/close tracking (<a href="...">...</a>) */
@@ -849,8 +971,7 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 			}
 
 			/* skip until '>' */
-			while (j < html_len && html[j] != '>') j++;
-			i = j;
+			i = tag_end;
 			continue;
 		}
 
