@@ -120,6 +120,8 @@ int text_layout_index_for_row_col(const char *text,
 		int r = text_layout_next_line_ex(text, &pos, max_cols, line, sizeof(line), &start);
 		if (r != 0) return -1;
 		if (row == target_row) {
+			/* Special non-text rows (e.g. image placeholder markers) are not clickable. */
+			if (line[0] == (char)0x1e) return -1;
 			size_t len = 0;
 			while (line[len] != 0) len++;
 			if (target_col >= len) return -1;

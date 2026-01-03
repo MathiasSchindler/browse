@@ -31,6 +31,253 @@ static struct html_spans g_spans;
 static uint32_t g_scroll_rows;
 static int g_have_page;
 
+enum img_fmt {
+	IMG_FMT_UNKNOWN = 0,
+	IMG_FMT_PNG,
+	IMG_FMT_JPG,
+	IMG_FMT_GIF,
+	IMG_FMT_WEBP,
+	IMG_FMT_SVG,
+};
+
+struct img_sniff_cache_entry {
+	uint8_t used;
+	uint8_t state; /* 0=empty, 1=pending, 2=done */
+	enum img_fmt fmt;
+	uint32_t hash;
+	char key[256]; /* usually "host|/path" (truncated) */
+};
+
+static struct img_sniff_cache_entry g_img_sniff_cache[32];
+
+static uint32_t hash32_fnv1a(const char *s)
+{
+	uint32_t h = 2166136261u;
+	if (!s) return h;
+	for (size_t i = 0; s[i] != 0; i++) {
+		h ^= (uint8_t)s[i];
+		h *= 16777619u;
+	}
+	return h;
+}
+
+static int streq(const char *a, const char *b)
+{
+	if (a == b) return 1;
+	if (!a || !b) return 0;
+	for (size_t i = 0;; i++) {
+		if (a[i] != b[i]) return 0;
+		if (a[i] == 0) return 1;
+	}
+}
+
+static enum img_fmt img_fmt_from_sniff(const uint8_t *b, size_t n)
+{
+	if (!b || n == 0) return IMG_FMT_UNKNOWN;
+	if (n >= 8 &&
+	    b[0] == 0x89 && b[1] == 0x50 && b[2] == 0x4e && b[3] == 0x47 &&
+	    b[4] == 0x0d && b[5] == 0x0a && b[6] == 0x1a && b[7] == 0x0a) {
+		return IMG_FMT_PNG;
+	}
+	if (n >= 3 && b[0] == 0xff && b[1] == 0xd8 && b[2] == 0xff) {
+		return IMG_FMT_JPG;
+	}
+	if (n >= 6 && b[0] == 'G' && b[1] == 'I' && b[2] == 'F' && b[3] == '8' &&
+	    (b[4] == '7' || b[4] == '9') && b[5] == 'a') {
+		return IMG_FMT_GIF;
+	}
+	if (n >= 12 &&
+	    b[0] == 'R' && b[1] == 'I' && b[2] == 'F' && b[3] == 'F' &&
+	    b[8] == 'W' && b[9] == 'E' && b[10] == 'B' && b[11] == 'P') {
+		return IMG_FMT_WEBP;
+	}
+	/* Best-effort SVG sniff: look for "<svg" near the beginning. */
+	if (n >= 5) {
+		size_t i = 0;
+		while (i < n && (b[i] == ' ' || b[i] == '\n' || b[i] == '\r' || b[i] == '\t')) i++;
+		for (size_t j = i; j + 4 < n && j < 96; j++) {
+			if (b[j] == '<') {
+				uint8_t s0 = b[j + 1];
+				uint8_t s1 = b[j + 2];
+				uint8_t s2 = b[j + 3];
+				uint8_t s3 = b[j + 4];
+				if (s0 >= 'A' && s0 <= 'Z') s0 = (uint8_t)(s0 + ('a' - 'A'));
+				if (s1 >= 'A' && s1 <= 'Z') s1 = (uint8_t)(s1 + ('a' - 'A'));
+				if (s2 >= 'A' && s2 <= 'Z') s2 = (uint8_t)(s2 + ('a' - 'A'));
+				if (s3 >= 'A' && s3 <= 'Z') s3 = (uint8_t)(s3 + ('a' - 'A'));
+				if (s0 == 's' && s1 == 'v' && s2 == 'g' && (s3 == ' ' || s3 == '>' || s3 == '\t' || s3 == '\n' || s3 == '\r')) {
+					return IMG_FMT_SVG;
+				}
+			}
+		}
+	}
+	return IMG_FMT_UNKNOWN;
+}
+
+static const char *img_fmt_token(enum img_fmt fmt)
+{
+	switch (fmt) {
+		case IMG_FMT_PNG: return "PNG";
+		case IMG_FMT_JPG: return "JPG";
+		case IMG_FMT_GIF: return "GIF";
+		case IMG_FMT_WEBP: return "WEBP";
+		case IMG_FMT_SVG: return "SVG";
+		default: return "?";
+	}
+}
+
+static int https_get_prefix_follow_redirects(const char *host_in, const char *path_in, uint8_t *out, size_t out_cap, size_t *out_len)
+{
+	if (!out || out_cap == 0 || !out_len) return -1;
+	*out_len = 0;
+	char host[HOST_BUF_LEN];
+	char path[PATH_BUF_LEN];
+	(void)c_strlcpy_s(host, sizeof(host), host_in ? host_in : "");
+	(void)c_strlcpy_s(path, sizeof(path), path_in ? path_in : "/");
+
+	for (int step = 0; step < 4; step++) {
+		uint8_t ip6[16];
+		c_memset(ip6, 0, sizeof(ip6));
+		if (dns_resolve_aaaa_google(host, ip6) != 0) return -1;
+		int sock = tcp6_connect(ip6, 443);
+		if (sock < 0) return -1;
+
+		char status[128];
+		char location[512];
+		int status_code = -1;
+		size_t body_len = 0;
+		uint64_t content_len = 0;
+		int rc = tls13_https_get_status_location_and_body(sock,
+							 host,
+							 path,
+							 status,
+							 sizeof(status),
+							 &status_code,
+							 location,
+							 sizeof(location),
+							 out,
+							 out_cap,
+							 &body_len,
+							 &content_len);
+		sys_close(sock);
+		if (rc != 0) return -1;
+
+		int is_redirect = (status_code == 301 || status_code == 302 || status_code == 303 || status_code == 307 || status_code == 308);
+		if (!is_redirect || location[0] == 0) {
+			*out_len = (body_len > out_cap) ? out_cap : (size_t)body_len;
+			return 0;
+		}
+		char new_host[HOST_BUF_LEN];
+		char new_path[PATH_BUF_LEN];
+		if (url_apply_location(host, location, new_host, sizeof(new_host), new_path, sizeof(new_path)) != 0) return -1;
+		(void)c_strlcpy_s(host, sizeof(host), new_host);
+		(void)c_strlcpy_s(path, sizeof(path), new_path);
+	}
+	return -1;
+}
+
+static int split_host_path_from_key(const char *key, char *host_out, size_t host_out_len, char *path_out, size_t path_out_len)
+{
+	if (!key || !host_out || !path_out || host_out_len == 0 || path_out_len == 0) return -1;
+	/* key is "host|/path" */
+	size_t bar = 0;
+	for (; key[bar] != 0; bar++) {
+		if (key[bar] == '|') break;
+	}
+	if (key[bar] != '|') return -1;
+	/* host */
+	{
+		size_t o = 0;
+		for (size_t i = 0; i < bar && o + 1 < host_out_len; i++) host_out[o++] = key[i];
+		host_out[o] = 0;
+	}
+	/* path */
+	{
+		size_t o = 0;
+		for (size_t i = bar + 1; key[i] && o + 1 < path_out_len; i++) path_out[o++] = key[i];
+		path_out[o] = 0;
+	}
+	if (host_out[0] == 0 || path_out[0] == 0) return -1;
+	return 0;
+}
+
+static enum img_fmt img_cache_get_or_mark_pending(const char *active_host, const char *url)
+{
+	if (!active_host || !active_host[0] || !url || !url[0]) return IMG_FMT_UNKNOWN;
+
+	/* We only sniff HTTPS via our TLS stack. */
+	if (url[0] == 'd' && url[1] == 'a' && url[2] == 't' && url[3] == 'a' && url[4] == ':') return IMG_FMT_UNKNOWN;
+	if (url[0] == 'h' && url[1] == 't' && url[2] == 't' && url[3] == 'p' && url[4] == ':' && url[5] == '/' && url[6] == '/') return IMG_FMT_UNKNOWN;
+
+	char host[HOST_BUF_LEN];
+	char path[PATH_BUF_LEN];
+	if (url_apply_location(active_host, url, host, sizeof(host), path, sizeof(path)) != 0) {
+		return IMG_FMT_UNKNOWN;
+	}
+
+	char key[256];
+	key[0] = 0;
+	(void)c_strlcpy_s(key, sizeof(key), host);
+	/* Append '|' + path (best-effort). */
+	{
+		size_t o = c_strnlen_s(key, sizeof(key));
+		if (o + 1 < sizeof(key)) key[o++] = '|';
+		for (size_t i = 0; path[i] && o + 1 < sizeof(key); i++) key[o++] = path[i];
+		key[o] = 0;
+	}
+
+	uint32_t h = hash32_fnv1a(key);
+	for (size_t i = 0; i < sizeof(g_img_sniff_cache) / sizeof(g_img_sniff_cache[0]); i++) {
+		struct img_sniff_cache_entry *e = &g_img_sniff_cache[i];
+		if (!e->used) continue;
+		if (e->hash == h && streq(e->key, key)) {
+			return (e->state == 2) ? e->fmt : IMG_FMT_UNKNOWN;
+		}
+	}
+
+	/* Not cached yet: mark pending. */
+	for (size_t i = 0; i < sizeof(g_img_sniff_cache) / sizeof(g_img_sniff_cache[0]); i++) {
+		struct img_sniff_cache_entry *e = &g_img_sniff_cache[i];
+		if (!e->used) {
+			e->used = 1;
+			e->state = 1;
+			e->fmt = IMG_FMT_UNKNOWN;
+			e->hash = h;
+			(void)c_strlcpy_s(e->key, sizeof(e->key), key);
+			break;
+		}
+	}
+	return IMG_FMT_UNKNOWN;
+}
+
+static int img_sniff_pump_one(void)
+{
+	for (size_t i = 0; i < sizeof(g_img_sniff_cache) / sizeof(g_img_sniff_cache[0]); i++) {
+		struct img_sniff_cache_entry *e = &g_img_sniff_cache[i];
+		if (!e->used || e->state != 1) continue;
+
+		char host[HOST_BUF_LEN];
+		char path[PATH_BUF_LEN];
+		if (split_host_path_from_key(e->key, host, sizeof(host), path, sizeof(path)) != 0) {
+			e->fmt = IMG_FMT_UNKNOWN;
+			e->state = 2;
+			return 1;
+		}
+
+		uint8_t prefix[96];
+		size_t got = 0;
+		if (https_get_prefix_follow_redirects(host, path, prefix, sizeof(prefix), &got) != 0) {
+			e->fmt = IMG_FMT_UNKNOWN;
+			e->state = 2;
+			return 1;
+		}
+		e->fmt = img_fmt_from_sniff(prefix, got);
+		e->state = 2;
+		return 1;
+	}
+	return 0;
+}
+
 struct ui_buttons {
 	uint32_t en_x, en_y, en_w, en_h;
 	uint32_t de_x, de_y, de_w, de_h;
@@ -299,13 +546,18 @@ static void draw_body_wrapped(struct shm_fb *fb,
 				     const struct html_spans *spans,
 				     struct text_color tc,
 				     struct text_color linkc,
-				     uint32_t scroll_rows)
+			     uint32_t scroll_rows,
+			     const char *active_host)
 {
 	if (!fb || !text) return;
 	uint32_t max_cols = (w_px / 8u);
 	uint32_t max_rows = (h_px / 16u);
 	if (max_cols == 0 || max_rows == 0) return;
 	if (max_cols > 255) max_cols = 255;
+
+	struct {
+		uint32_t rows_left;
+	} img_box = {0};
 
 	/* Skip scroll_rows lines by running the layout forward. */
 	size_t pos = 0;
@@ -319,7 +571,86 @@ static void draw_body_wrapped(struct shm_fb *fb,
 		size_t start = 0;
 		int r = text_layout_next_line_ex(text, &pos, max_cols, line, sizeof(line), &start);
 		if (r != 0) return;
-		draw_line_with_links(fb, x, y + row * 16u, line, start, links, spans, tc, linkc);
+		uint32_t row_y = y + row * 16u;
+
+		/* Image placeholder marker row: draw real lines in framebuffer.
+		 * Marker format: 0x1e "IMG <rows> ? <label>" 0x1f "<url>".
+		 * Format is sniffed from the first bytes of the URL.
+		 */
+		if (img_box.rows_left != 0) {
+			img_box.rows_left--;
+			continue;
+		}
+		if (line[0] == (char)0x1e && line[1] == 'I' && line[2] == 'M' && line[3] == 'G' && line[4] == ' ') {
+			/* Parse rows */
+			uint32_t rows = 0;
+			size_t p = 5;
+			while (line[p] >= '0' && line[p] <= '9') {
+				uint32_t d = (uint32_t)(line[p] - '0');
+				rows = rows * 10u + d;
+				p++;
+			}
+			while (line[p] == ' ') p++;
+			/* Skip placeholder format token (renderer sniffs actual format). */
+			while (line[p] && line[p] != ' ' && (uint8_t)line[p] != 0x1f) p++;
+			while (line[p] == ' ') p++;
+			char *label = &line[p];
+			char *url = 0;
+			for (size_t k = p; line[k] != 0; k++) {
+				if ((uint8_t)line[k] == 0x1f) {
+					line[k] = 0;
+					url = &line[k + 1];
+					break;
+				}
+			}
+			enum img_fmt sniffed = img_cache_get_or_mark_pending(active_host, url ? url : "");
+			const char *fmt = img_fmt_token(sniffed);
+			if (rows < 2u) rows = 2u;
+			if (rows > 10u) rows = 10u;
+
+			/* Clip to remaining visible content area and framebuffer bounds. */
+			uint32_t content_bottom = y + h_px;
+			uint32_t remaining_h = (content_bottom > row_y) ? (content_bottom - row_y) : 0u;
+			if (fb->height < content_bottom) content_bottom = fb->height;
+			remaining_h = (content_bottom > row_y) ? (content_bottom - row_y) : 0u;
+			uint32_t max_w = (fb->width > x) ? (fb->width - x) : 0u;
+			if (remaining_h == 0u || max_w == 0u) {
+				img_box.rows_left = (rows > 0) ? (rows - 1u) : 0u;
+				continue;
+			}
+
+			uint32_t box_h = rows * 16u;
+			if (box_h > remaining_h) box_h = remaining_h;
+			uint32_t box_w = w_px;
+			if (box_w > max_w) box_w = max_w;
+			uint32_t stroke = 1u;
+			uint32_t col = 0xff505058u;
+			/* Top + bottom */
+			fill_rect_u32(fb->pixels, fb->stride, x, row_y, box_w, stroke, col);
+			if (box_h > 1u) {
+				fill_rect_u32(fb->pixels, fb->stride, x, row_y + box_h - 1u, box_w, stroke, col);
+			}
+			/* Left + right */
+			fill_rect_u32(fb->pixels, fb->stride, x, row_y, stroke, box_h, col);
+			if (box_w > 1u) {
+				fill_rect_u32(fb->pixels, fb->stride, x + box_w - 1u, row_y, stroke, box_h, col);
+			}
+			/* Label: show format in orange, then the rest in normal. */
+			struct text_color fmtc = tc;
+			fmtc.fg = 0xffffa000u;
+			uint32_t label_x = x + 8u;
+			uint32_t label_w = (box_w > 16u) ? (box_w - 16u) : 0u;
+			if (fmt[0] != 0 && label_w >= 8u * 4u) {
+				draw_text_u32(fb->pixels, fb->stride, label_x, row_y + 6u, fmt, fmtc);
+				label_x += 8u * 5u; /* fmt + space */
+				label_w = (label_w > 8u * 5u) ? (label_w - 8u * 5u) : 0u;
+			}
+			draw_text_clipped_u32(fb->pixels, fb->stride, label_x, row_y + 6u, label_w, label, tc);
+			img_box.rows_left = (rows > 0) ? (rows - 1u) : 0u;
+			continue;
+		}
+
+		draw_line_with_links(fb, x, row_y, line, start, links, spans, tc, linkc);
 	}
 }
 
@@ -340,7 +671,7 @@ static void render_page(struct shm_fb *fb,
 	uint32_t y0 = UI_CONTENT_Y0;
 	uint32_t h_px = (fb->height > y0) ? (fb->height - y0) : 0;
 	if (!visible_text) visible_text = "";
-	draw_body_wrapped(fb, 8, y0, w_px, h_px, visible_text, links, &g_spans, dim, linkc, scroll_rows);
+	draw_body_wrapped(fb, 8, y0, w_px, h_px, visible_text, links, &g_spans, dim, linkc, scroll_rows, active_host);
 	fb->hdr->frame_counter++;
 }
 
@@ -575,13 +906,16 @@ int main(void)
 	req.tv_sec = 0;
 	req.tv_nsec = 10 * 1000 * 1000;
 	uint64_t last_mouse_event = fb.hdr->mouse_event_counter;
+	uint32_t idle_ticks = 0;
 	for (;;) {
+		int did_interact = 0;
 		/* Mouse wheel scroll (shared header reserved fields). */
 		static uint64_t last_wheel_counter = 0;
 		uint64_t wc = cfb_wheel_counter(fb.hdr);
 		if (wc != last_wheel_counter) {
 			last_wheel_counter = wc;
 			int32_t dy = cfb_wheel_delta_y(fb.hdr);
+			did_interact = 1;
 			uint32_t step = 12u;
 			if (dy > 0) {
 				uint32_t dec = (uint32_t)dy * step;
@@ -600,6 +934,7 @@ int main(void)
 			if (cur != last_mouse_event) {
 				last_mouse_event = cur;
 				if (fb.hdr->mouse_last_button == 1u && fb.hdr->mouse_last_state == 1u) {
+					did_interact = 1;
 					uint32_t x = fb.hdr->mouse_last_x;
 					uint32_t y = fb.hdr->mouse_last_y;
 						enum ui_action a = ui_action_from_click(&fb, x, y);
@@ -643,6 +978,20 @@ int main(void)
 								}
 							}
 					}
+				}
+			}
+		}
+
+		if (did_interact) {
+			idle_ticks = 0;
+		} else {
+			idle_ticks++;
+			/* Opportunistically sniff at most one pending image when idle.
+			 * This avoids stuttering while the user scrolls.
+			 */
+			if (g_have_page && idle_ticks > 25u && (idle_ticks % 20u) == 0u) {
+				if (img_sniff_pump_one()) {
+					render_page(&fb, g_active_host, g_url_bar, g_status_bar, g_visible, &g_links, g_scroll_rows);
 				}
 			}
 		}

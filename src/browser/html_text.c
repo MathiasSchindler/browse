@@ -287,6 +287,10 @@ static void img_pick_src_tail(const char *src, char *out, size_t out_cap)
 	cpy_str_trunc(out, out_cap, last);
 }
 
+/* Note: image format detection must be based on file sniffing (magic bytes),
+ * not URL extensions. We keep URL-related parsing separate from sniffing.
+ */
+
 static uint32_t parse_uint_dec_attr(const uint8_t *v, size_t vlen)
 {
 	/* Best-effort parse of decimal digits inside an attribute value (e.g. width="320"). */
@@ -380,6 +384,24 @@ static void img_pick_from_srcset(const uint8_t *v, size_t vlen, char *out, size_
 	}
 
 	if (best[0] != 0) cpy_str_trunc(out, out_cap, best);
+}
+
+static void u32_to_dec_local(char out[11], uint32_t v)
+{
+	char tmp[11];
+	uint32_t n = 0;
+	if (!out) return;
+	if (v == 0) {
+		out[0] = '0';
+		out[1] = 0;
+		return;
+	}
+	while (v > 0 && n < 10) {
+		tmp[n++] = (char)('0' + (v % 10u));
+		v /= 10u;
+	}
+	for (uint32_t i = 0; i < n; i++) out[i] = tmp[n - 1 - i];
+	out[n] = 0;
 }
 
 static int decode_entity(const uint8_t *s, size_t n, char *out_ch)
@@ -1184,45 +1206,49 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 					last_was_space = 0;
 					append_space_collapse(out, out_len, &o, &last_was_space);
 				} else {
-					append_newline_collapse(out, out_len, &o, &last_was_space);
-					append_str(out, out_len, &o, "+----------------------+");
-					(void)append_char(out, out_len, &o, '\n');
-					append_str(out, out_len, &o, "| IMG                 |");
-					(void)append_char(out, out_len, &o, '\n');
-					char line[96];
-					line[0] = 0;
+					/* Block image placeholder: emit a marker line and reserve rows.
+					 * Renderer draws the actual rectangle lines in the framebuffer.
+					 * Format: 0x1e "IMG <rows> ? <label>" 0x1f "<url>" \n + (rows-1) blank lines.
+					 * The format token is a placeholder; the renderer will sniff the URL.
+					 */
+					uint32_t rows_total = 4u;
+					if (img_h > 0) {
+						rows_total = (img_h + 15u) / 16u;
+						if (rows_total < 3u) rows_total = 3u;
+						if (rows_total > 10u) rows_total = 10u;
+					}
+
+					char label[96];
+					label[0] = 0;
 					if (alt_tmp[0] != 0) {
-						cpy_str_trunc(line, sizeof(line), alt_tmp);
+						cpy_str_trunc(label, sizeof(label), alt_tmp);
 					} else if (src_tmp[0] != 0) {
 						char tail[64];
 						tail[0] = 0;
 						img_pick_src_tail(src_tmp, tail, sizeof(tail));
-						cpy_str_trunc(line, sizeof(line), tail);
+						cpy_str_trunc(label, sizeof(label), tail);
 					}
-					if (line[0] != 0) {
-						append_str(out, out_len, &o, "| ");
-						append_str(out, out_len, &o, line);
+
+					append_newline_collapse(out, out_len, &o, &last_was_space);
+					(void)append_char(out, out_len, &o, (char)0x1e);
+					append_str(out, out_len, &o, "IMG ");
+					char rows_dec[11];
+					u32_to_dec_local(rows_dec, rows_total);
+					append_str(out, out_len, &o, rows_dec);
+					append_str(out, out_len, &o, " ?");
+					if (label[0] != 0) {
+						(void)append_char(out, out_len, &o, ' ');
+						append_str(out, out_len, &o, label);
+					}
+					if (src_tmp[0] != 0) {
+						(void)append_char(out, out_len, &o, (char)0x1f);
+						append_str(out, out_len, &o, src_tmp);
+					}
+					(void)append_char(out, out_len, &o, '\n');
+					for (uint32_t rr = 1; rr < rows_total; rr++) {
 						(void)append_char(out, out_len, &o, '\n');
 					}
-					append_str(out, out_len, &o, "+----------------------+");
-					(void)append_char(out, out_len, &o, '\n');
 					last_was_space = 1;
-
-					/* Reserve extra vertical space if height= is known.
-					 * The renderer uses 16px rows.
-					 */
-					if (img_h > 0) {
-						uint32_t want_rows = (img_h + 15u) / 16u;
-						if (want_rows > 10u) want_rows = 10u;
-						uint32_t have_rows = (line[0] != 0) ? 4u : 3u;
-						if (want_rows > have_rows) {
-							uint32_t extra = want_rows - have_rows;
-							for (uint32_t r = 0; r < extra; r++) {
-								(void)append_char(out, out_len, &o, '\n');
-							}
-						}
-					}
-
 					append_blankline_collapse(out, out_len, &o, &last_was_space);
 				}
 
