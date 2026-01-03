@@ -61,11 +61,21 @@ TLS_SRCS := \
 	src/tls/gcm.c \
 	src/tls/selftest.c
 
-BROWSER_SRCS := src/core/start.S src/browser/main.c src/browser/http.c src/browser/tls13_client.c src/browser/html_text.c src/browser/text_layout.c src/browser/style_attr.c src/browser/css_tiny.c $(TLS_SRCS)
+FONTGEN_BIN := build/fontgen
+FONTGEN_SRCS := tools/fontgen.c
+
+FONT_BUILTIN_8X8 := src/core/font/font_builtin_8x8.c
+FONT_BUILTIN_8X16 := src/core/font/font_builtin_8x16.c
+FONT_STAMP := build/fonts.stamp
+
+FONT_SRCS := src/core/font/font_render.c $(FONT_BUILTIN_8X8) $(FONT_BUILTIN_8X16)
+
+BROWSER_SRCS := src/core/start.S src/browser/main.c src/browser/http.c src/browser/tls13_client.c src/browser/html_text.c src/browser/text_layout.c src/browser/style_attr.c src/browser/css_tiny.c $(TLS_SRCS) $(FONT_SRCS)
 BROWSER_BIN := build/browser
 BROWSER_CFLAGS := $(CORE_CFLAGS) -DTEXT_LOG_MISSING_GLYPHS
 
 .PHONY: all core browser inputd tests test test-crypto test-net-ipv6 test-http test-text-layout test-links test-style-attr test-spans test-css-parser test-text-font clean clean-all viewer
+.PHONY: fontgen fonts
 .PHONY: test-x25519
 .PHONY: test-http
 
@@ -75,18 +85,35 @@ FORCE:
 HAVE_SDL2 := $(shell pkg-config --exists sdl2 && echo 1)
 
 ifeq ($(HAVE_SDL2),1)
-all: core browser inputd tests viewer
+all: fontgen fonts core browser inputd tests viewer
 else
-all: core browser inputd tests
+all: fontgen fonts core browser inputd tests
 endif
 
 build:
 	@mkdir -p build
 
+fontgen: build $(FONTGEN_BIN)
+
+$(FONTGEN_BIN): $(FONTGEN_SRCS)
+	$(CC) $(CFLAGS_COMMON) -o $@ $(FONTGEN_SRCS)
+
+$(FONTGEN_BIN): FORCE
+
+fonts: $(FONT_BUILTIN_8X8) $(FONT_BUILTIN_8X16)
+
+$(FONT_STAMP): build $(FONTGEN_BIN) $(FONTGEN_SRCS)
+	@mkdir -p src/core/font
+	./$(FONTGEN_BIN) --out-dir src/core/font
+	@touch $@
+
+$(FONT_BUILTIN_8X8) $(FONT_BUILTIN_8X16): $(FONT_STAMP)
+	@true
+
 core: build $(CORE_BIN)
 
-$(CORE_BIN): $(CORE_SRCS)
-	$(CC) $(CORE_CFLAGS) $(CORE_LDFLAGS) -o $@ $(CORE_SRCS)
+$(CORE_BIN): $(CORE_SRCS) $(FONT_SRCS)
+	$(CC) $(CORE_CFLAGS) $(CORE_LDFLAGS) -o $@ $(CORE_SRCS) $(FONT_SRCS)
 	$(POST_LINK)
 
 $(CORE_BIN): FORCE
@@ -225,7 +252,7 @@ test-text-font: build $(TEST_TEXT_FONT_BIN)
 	./$(TEST_TEXT_FONT_BIN)
 
 $(TEST_TEXT_FONT_BIN): tools/test_text_font.c src/core/start.S src/core/text.h src/core/syscall.h
-	$(CC) $(CORE_CFLAGS) $(CORE_LDFLAGS) -o $@ src/core/start.S tools/test_text_font.c
+	$(CC) $(CORE_CFLAGS) $(CORE_LDFLAGS) -o $@ src/core/start.S tools/test_text_font.c $(FONT_SRCS)
 
 $(TEST_TEXT_FONT_BIN): FORCE
 
@@ -250,6 +277,8 @@ clean:
 	rm -f $(INPUTD_BIN) $(INPUTD_BIN).debug
 	rm -f $(TEST_CRYPTO_BIN) $(TEST_NET_IPV6_BIN) $(TEST_HTTP_BIN) $(TEST_HTTP_PARSE_BIN) $(TEST_CHUNKED_BIN) $(TEST_VISIBLE_TEXT_BIN) $(TEST_X25519_BIN) $(TEST_TEXT_FONT_BIN) $(TEST_REDIRECT_BIN)
 	rm -f build/*.debug
+	rm -f $(FONTGEN_BIN)
+	rm -f $(FONT_STAMP)
 	rm -f $(VIEWER_BIN)
 	@true
 

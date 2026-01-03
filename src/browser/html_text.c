@@ -12,6 +12,16 @@ static int is_alpha(uint8_t c)
 	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
 }
 
+static int is_digit(uint8_t c)
+{
+	return (c >= '0' && c <= '9');
+}
+
+static int is_tag_name_char(uint8_t c)
+{
+	return is_alpha(c) || is_digit(c);
+}
+
 static uint8_t to_lower(uint8_t c)
 {
 	if (c >= 'A' && c <= 'Z') return (uint8_t)(c + ('a' - 'A'));
@@ -174,6 +184,21 @@ static int decode_entity(const uint8_t *s, size_t n, char *out_ch)
 	if (!s || !out_ch) return -1;
 	*out_ch = 0;
 
+	/* German umlauts + ß (emit Latin-1 single bytes; we later render those glyphs). */
+	if (n == 4 && s[1] == 'u' && s[2] == 'm' && s[3] == 'l') {
+		/* &auml; &ouml; &uuml; &Auml; &Ouml; &Uuml; */
+		if (s[0] == 'a') { *out_ch = (char)0xE4; return 0; }
+		if (s[0] == 'o') { *out_ch = (char)0xF6; return 0; }
+		if (s[0] == 'u') { *out_ch = (char)0xFC; return 0; }
+		if (s[0] == 'A') { *out_ch = (char)0xC4; return 0; }
+		if (s[0] == 'O') { *out_ch = (char)0xD6; return 0; }
+		if (s[0] == 'U') { *out_ch = (char)0xDC; return 0; }
+	}
+	if (n == 5 && s[0] == 's' && s[1] == 'z' && s[2] == 'l' && s[3] == 'i' && s[4] == 'g') {
+		*out_ch = (char)0xDF;
+		return 0;
+	}
+
 	if (n == 2 && s[0] == 'l' && s[1] == 't') {
 		*out_ch = '<';
 		return 0;
@@ -228,8 +253,16 @@ static int decode_entity(const uint8_t *s, size_t n, char *out_ch)
 			*out_ch = ' ';
 			return 0;
 		}
+		if (v == 0xA0) {
+			*out_ch = ' ';
+			return 0;
+		}
 		if (v >= 32 && v < 127) {
 			*out_ch = (char)v;
+			return 0;
+		}
+		if (v >= 0xA0 && v <= 0xFF) {
+			*out_ch = (char)(uint8_t)v;
 			return 0;
 		}
 		return -1;
@@ -338,7 +371,10 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 				size_t j = i + 2;
 				while (j < html_len && is_ascii_space(html[j])) j++;
 				size_t name_start = j;
-				while (j < html_len && is_alpha(html[j])) j++;
+				if (j < html_len && is_alpha(html[j])) {
+					j++;
+					while (j < html_len && is_tag_name_char(html[j])) j++;
+				}
 				size_t name_len = j - name_start;
 				if (skip_mode == 2 && ieq_lit_n(html + name_start, name_len, "style")) {
 					/* Parse CSS inside <style>...</style> (best-effort). */
@@ -386,7 +422,10 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 				while (j < html_len && is_ascii_space(html[j])) j++;
 			}
 			size_t name_start = j;
-			while (j < html_len && is_alpha(html[j])) j++;
+			if (j < html_len && is_alpha(html[j])) {
+				j++;
+				while (j < html_len && is_tag_name_char(html[j])) j++;
+			}
 			size_t name_len = j - name_start;
 			uint8_t name_buf[16];
 			size_t nb = min_sz(name_len, sizeof(name_buf) - 1);
@@ -672,7 +711,7 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 				char ch = 0;
 				size_t n = j - (i + 1);
 				uint8_t ent[32];
-				for (size_t k = 0; k < n && k < sizeof(ent); k++) ent[k] = to_lower(html[i + 1 + k]);
+				for (size_t k = 0; k < n && k < sizeof(ent); k++) ent[k] = html[i + 1 + k];
 				if (decode_entity(ent, n, &ch) == 0) {
 					if (ch == ' ') append_space_collapse(out, out_len, &o, &last_was_space);
 					else {
@@ -699,19 +738,31 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 		}
 
 		if (c < 32 || c >= 127) {
-			/* Minimal UTF-8 handling for common German umlauts (Latin-1 supplement).
-			 * Wikipedia frequently uses these in headings.
+			/* Minimal UTF-8 handling: decode 2-byte sequences that map into Latin-1.
+			 * This covers German umlauts and ß, plus most Western European punctuation.
 			 */
-			if (c == 0xC3 && i + 1 < html_len) {
-				uint8_t d = html[i + 1];
-				/* ä ö ü Ä Ö Ü ß */
-				if (d == 0xA4) { (void)append_char(out, out_len, &o, 'a'); (void)append_char(out, out_len, &o, 'e'); last_was_space = 0; i++; continue; }
-				if (d == 0xB6) { (void)append_char(out, out_len, &o, 'o'); (void)append_char(out, out_len, &o, 'e'); last_was_space = 0; i++; continue; }
-				if (d == 0xBC) { (void)append_char(out, out_len, &o, 'u'); (void)append_char(out, out_len, &o, 'e'); last_was_space = 0; i++; continue; }
-				if (d == 0x84) { (void)append_char(out, out_len, &o, 'A'); (void)append_char(out, out_len, &o, 'E'); last_was_space = 0; i++; continue; }
-				if (d == 0x96) { (void)append_char(out, out_len, &o, 'O'); (void)append_char(out, out_len, &o, 'E'); last_was_space = 0; i++; continue; }
-				if (d == 0x9C) { (void)append_char(out, out_len, &o, 'U'); (void)append_char(out, out_len, &o, 'E'); last_was_space = 0; i++; continue; }
-				if (d == 0x9F) { (void)append_char(out, out_len, &o, 's'); (void)append_char(out, out_len, &o, 's'); last_was_space = 0; i++; continue; }
+			if (i + 1 < html_len) {
+				uint8_t c0 = c;
+				uint8_t c1 = html[i + 1];
+				if ((c0 & 0xE0) == 0xC0 && (c1 & 0xC0) == 0x80) {
+					uint32_t cp = ((uint32_t)(c0 & 0x1Fu) << 6) | (uint32_t)(c1 & 0x3Fu);
+					if (cp == 0xAD) {
+						/* Soft hyphen: ignore (used for optional hyphenation). */
+						i++;
+						continue;
+					}
+					if (cp == 0xA0) {
+						append_space_collapse(out, out_len, &o, &last_was_space);
+						i++;
+						continue;
+					}
+					if (cp >= 0xA0 && cp <= 0xFF) {
+						(void)append_char(out, out_len, &o, (char)(uint8_t)cp);
+						last_was_space = 0;
+						i++;
+						continue;
+					}
+				}
 			}
 			/* Other non-ASCII ignored for now. */
 			continue;

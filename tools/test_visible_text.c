@@ -30,7 +30,7 @@ int main(void)
 	if (expect_eq("skip_script", "X<script>alert(1)</script>Y", "X Y")) return 1;
 	if (expect_eq("comment", "A<!-- hidden -->B", "A B")) return 1;
 	if (expect_eq("numeric", "A&#32;B&#x20;C", "A B C")) return 1;
-	if (expect_eq("umlaut", "WIKIPEDIA DIE FREIE ENZYKLOP\xC3\x84" "DIE", "WIKIPEDIA DIE FREIE ENZYKLOPAEDIE")) return 1;
+	if (expect_eq("umlaut", "WIKIPEDIA DIE FREIE ENZYKLOP\xC3\x84" "DIE", "WIKIPEDIA DIE FREIE ENZYKLOP\xC4" "DIE")) return 1;
 
 	puts("visible-text selftest: OK");
 	return 0;
