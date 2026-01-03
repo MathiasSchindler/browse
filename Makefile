@@ -70,7 +70,7 @@ FONT_STAMP := build/fonts.stamp
 
 FONT_SRCS := src/core/font/font_render.c $(FONT_BUILTIN_8X8) $(FONT_BUILTIN_8X16)
 
-BROWSER_SRCS := src/core/start.S src/browser/main.c src/browser/http.c src/browser/tls13_client.c src/browser/html_text.c src/browser/text_layout.c src/browser/style_attr.c src/browser/css_tiny.c src/browser/image/jpeg.c src/browser/image/jpeg_decode.c src/browser/image/png.c src/browser/image/gif.c src/browser/image/gif_decode.c $(TLS_SRCS) $(FONT_SRCS)
+BROWSER_SRCS := src/core/start.S src/browser/main.c src/browser/http.c src/browser/tls13_client.c src/browser/html_text.c src/browser/text_layout.c src/browser/style_attr.c src/browser/css_tiny.c src/browser/image/jpeg.c src/browser/image/jpeg_decode.c src/browser/image/png.c src/browser/image/png_decode.c src/browser/image/gif.c src/browser/image/gif_decode.c $(TLS_SRCS) $(FONT_SRCS)
 BROWSER_BIN := build/browser
 BROWSER_CFLAGS := $(CORE_CFLAGS) -DTEXT_LOG_MISSING_GLYPHS
 
@@ -153,11 +153,20 @@ TEST_PNG_HEADER_BIN := build/test_png_header
 TEST_GIF_HEADER_BIN := build/test_gif_header
 TEST_GIF_DECODE_BIN := build/test_gif_decode
 TEST_JPEG_DECODE_BIN := build/test_jpeg_decode
+TEST_PNG_DECODE_BIN := build/test_png_decode
 
 # Build (but do not run) all test binaries.
-tests: build $(TEST_CRYPTO_BIN) $(TEST_NET_IPV6_BIN) $(TEST_HTTP_BIN) $(TEST_HTTP_PARSE_BIN) $(TEST_CHUNKED_BIN) $(TEST_VISIBLE_TEXT_BIN) $(TEST_TEXT_LAYOUT_BIN) $(TEST_LINKS_BIN) $(TEST_STYLE_ATTR_BIN) $(TEST_SPANS_BIN) $(TEST_CSS_PARSER_BIN) $(TEST_TEXT_FONT_BIN) $(TEST_X25519_BIN) $(TEST_REDIRECT_BIN) $(TEST_JPEG_HEADER_BIN) $(TEST_PNG_HEADER_BIN) $(TEST_GIF_HEADER_BIN) $(TEST_GIF_DECODE_BIN) $(TEST_JPEG_DECODE_BIN)
+tests: build $(TEST_CRYPTO_BIN) $(TEST_NET_IPV6_BIN) $(TEST_HTTP_BIN) $(TEST_HTTP_PARSE_BIN) $(TEST_CHUNKED_BIN) $(TEST_VISIBLE_TEXT_BIN) $(TEST_TEXT_LAYOUT_BIN) $(TEST_LINKS_BIN) $(TEST_STYLE_ATTR_BIN) $(TEST_SPANS_BIN) $(TEST_CSS_PARSER_BIN) $(TEST_TEXT_FONT_BIN) $(TEST_X25519_BIN) $(TEST_REDIRECT_BIN) $(TEST_JPEG_HEADER_BIN) $(TEST_PNG_HEADER_BIN) $(TEST_GIF_HEADER_BIN) $(TEST_GIF_DECODE_BIN) $(TEST_JPEG_DECODE_BIN) $(TEST_PNG_DECODE_BIN)
 
-test: test-crypto test-net-ipv6 test-http test-http-parse test-chunked test-visible-text test-text-layout test-links test-style-attr test-spans test-css-parser test-text-font test-redirect test-jpeg-header test-png-header test-gif-header test-gif-decode test-jpeg-decode
+test: test-crypto test-net-ipv6 test-http test-http-parse test-chunked test-visible-text test-text-layout test-links test-style-attr test-spans test-css-parser test-text-font test-redirect test-jpeg-header test-png-header test-gif-header test-gif-decode test-jpeg-decode test-png-decode
+
+test-png-decode: build $(TEST_PNG_DECODE_BIN)
+	./$(TEST_PNG_DECODE_BIN)
+
+$(TEST_PNG_DECODE_BIN): tools/test_png_decode.c src/browser/image/png_decode.c src/browser/image/png_decode.h
+	$(CC) $(CFLAGS_COMMON) -Isrc -o $@ tools/test_png_decode.c src/browser/image/png_decode.c
+
+$(TEST_PNG_DECODE_BIN): FORCE
 
 test-jpeg-decode: build $(TEST_JPEG_DECODE_BIN)
 	./$(TEST_JPEG_DECODE_BIN)

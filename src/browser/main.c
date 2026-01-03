@@ -12,6 +12,7 @@
 #include "image/jpeg.h"
 #include "image/jpeg_decode.h"
 #include "image/png.h"
+#include "image/png_decode.h"
 #include "image/gif.h"
 #include "image/gif_decode.h"
 
@@ -423,6 +424,37 @@ static int img_sniff_pump_one(void)
 				e->has_dims = 1;
 				e->w = (w > 0xffffu) ? 0xffffu : (uint16_t)w;
 				e->h = (h > 0xffffu) ? 0xffffu : (uint16_t)h;
+			}
+			/* First PNG decoder: non-interlaced, bit depth 8, small-ish images. */
+			if (e->has_dims) {
+				uint32_t px = (uint32_t)e->w * (uint32_t)e->h;
+				if (e->w <= 512u && e->h <= 512u && px <= (uint32_t)(sizeof(g_img_pixel_pool) / sizeof(g_img_pixel_pool[0]))) {
+					size_t got_full = 0;
+					if (https_get_prefix_follow_redirects(host, path, g_img_fetch_buf, sizeof(g_img_fetch_buf), &got_full) == 0 && got_full > 0) {
+						uint32_t old_used = g_img_pixel_pool_used;
+						uint32_t off = 0;
+						if (img_pixel_alloc(px, &off) == 0) {
+							uint32_t dw = 0, dh = 0;
+							uint8_t *scratch = &g_img_fetch_buf[got_full];
+							size_t scratch_cap = sizeof(g_img_fetch_buf) - got_full;
+							if (png_decode_xrgb(g_img_fetch_buf,
+									   got_full,
+									   scratch,
+									   scratch_cap,
+									   &g_img_pixel_pool[off],
+									   (size_t)px,
+									   &dw,
+									   &dh) == 0) {
+								e->has_pixels = 1;
+								e->pix_off = off;
+								e->pix_w = (dw > 0xffffu) ? 0xffffu : (uint16_t)dw;
+								e->pix_h = (dh > 0xffffu) ? 0xffffu : (uint16_t)dh;
+							} else {
+								g_img_pixel_pool_used = old_used;
+							}
+						}
+					}
+				}
 			}
 		} else if (e->fmt == IMG_FMT_GIF) {
 			uint32_t w = 0, h = 0;

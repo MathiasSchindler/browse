@@ -1,0 +1,68 @@
+#include <stdio.h>
+
+#include "browser/image/png_decode.h"
+
+static int test_1x1_red_rgba(void)
+{
+	/* Minimal PNG (RGBA, 8bpc, non-interlaced) with a stored (uncompressed) deflate block.
+	 *
+	 * Pixel: (255,0,0,255)
+	 * Scanline: filter=0, then RGBA.
+	 * CRCs are set to 0; decoder does not validate them.
+	 */
+	static const uint8_t png[] = {
+		/* signature */
+		0x89,'P','N','G',0x0d,0x0a,0x1a,0x0a,
+		/* IHDR */
+		0x00,0x00,0x00,0x0d,
+		'I','H','D','R',
+		0x00,0x00,0x00,0x01, /* w=1 */
+		0x00,0x00,0x00,0x01, /* h=1 */
+		0x08, /* bit depth */
+		0x06, /* color type RGBA */
+		0x00, /* compression */
+		0x00, /* filter */
+		0x00, /* interlace */
+		0x00,0x00,0x00,0x00, /* CRC */
+		/* IDAT: zlib stream */
+		0x00,0x00,0x00,0x10,
+		'I','D','A','T',
+		0x78,0x01, /* zlib header */
+		0x01,       /* BFINAL=1, BTYPE=00 (stored) */
+		0x05,0x00,  /* LEN=5 */
+		0xFA,0xFF,  /* NLEN=~5 */
+		0x00,0xFF,0x00,0x00,0xFF, /* scanline: filter 0 + RGBA */
+		0x05,0x00,0x01,0xFF, /* Adler32 */
+		0x00,0x00,0x00,0x00, /* CRC */
+		/* IEND */
+		0x00,0x00,0x00,0x00,
+		'I','E','N','D',
+		0x00,0x00,0x00,0x00, /* CRC */
+	};
+
+	uint8_t scratch[64];
+	for (size_t i = 0; i < sizeof(scratch); i++) scratch[i] = 0;
+
+	uint32_t px[1] = {0};
+	uint32_t w = 0, h = 0;
+	if (png_decode_xrgb(png, sizeof(png), scratch, sizeof(scratch), px, 1, &w, &h) != 0) {
+		fprintf(stderr, "png_decode_xrgb failed\n");
+		return 1;
+	}
+	if (w != 1 || h != 1) {
+		fprintf(stderr, "dims mismatch: got %ux%u expected 1x1\n", w, h);
+		return 1;
+	}
+	if (px[0] != 0xffff0000u) {
+		fprintf(stderr, "pixel mismatch: got 0x%08x expected 0xffff0000\n", px[0]);
+		return 1;
+	}
+	return 0;
+}
+
+int main(void)
+{
+	if (test_1x1_red_rgba()) return 1;
+	printf("png decode selftest: OK\n");
+	return 0;
+}
