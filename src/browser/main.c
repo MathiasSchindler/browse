@@ -42,6 +42,8 @@ static int g_have_page;
 static uint8_t g_body[512 * 1024];
 static size_t g_body_len;
 
+static uint32_t g_img_use_tick;
+
 enum img_fmt {
 	IMG_FMT_UNKNOWN = 0,
 	IMG_FMT_PNG,
@@ -54,6 +56,8 @@ enum img_fmt {
 struct img_sniff_cache_entry {
 	uint8_t used;
 	uint8_t state; /* 0=empty, 1=pending, 2=done */
+	uint8_t inflight; /* dispatched to a worker */
+	uint8_t want_pixels;
 	enum img_fmt fmt;
 	uint8_t has_dims;
 	uint16_t w;
@@ -62,13 +66,14 @@ struct img_sniff_cache_entry {
 	uint32_t pix_off; /* offset into g_img_pixel_pool */
 	uint16_t pix_w;
 	uint16_t pix_h;
+	uint32_t pix_len; /* pixels allocated */
 	uint32_t hash;
+	uint32_t last_use;
 	char key[256]; /* usually "host|/path" (truncated) */
 };
 
-static struct img_sniff_cache_entry g_img_sniff_cache[32];
+static struct img_sniff_cache_entry g_img_sniff_cache[256];
 
-static uint8_t g_img_sniff_buf[4096];
 static uint8_t g_img_fetch_buf[1024 * 1024];
 
 /* Extremely small pixel pool for the first real decoder (GIF).
@@ -76,6 +81,49 @@ static uint8_t g_img_fetch_buf[1024 * 1024];
  */
 static uint32_t g_img_pixel_pool[1024 * 1024]; /* 1M px = 4 MiB */
 static uint32_t g_img_pixel_pool_used;
+
+struct img_pix_free_block {
+	uint32_t off;
+	uint32_t len;
+};
+
+static struct img_pix_free_block g_img_pix_free[128];
+static uint32_t g_img_pix_free_n;
+
+static void img_pixel_free(uint32_t off, uint32_t n_pixels)
+{
+	if (n_pixels == 0) return;
+	if (off > (uint32_t)(sizeof(g_img_pixel_pool) / sizeof(g_img_pixel_pool[0]))) return;
+	uint32_t cap = (uint32_t)(sizeof(g_img_pixel_pool) / sizeof(g_img_pixel_pool[0]));
+	if (off + n_pixels > cap) return;
+
+	if (g_img_pix_free_n < (uint32_t)(sizeof(g_img_pix_free) / sizeof(g_img_pix_free[0]))) {
+		g_img_pix_free[g_img_pix_free_n].off = off;
+		g_img_pix_free[g_img_pix_free_n].len = n_pixels;
+		g_img_pix_free_n++;
+	}
+
+	/* Best-effort merge of adjacent free blocks (small N, simple O(n^2)). */
+	for (uint32_t i = 0; i < g_img_pix_free_n; i++) {
+		for (uint32_t j = 0; j < g_img_pix_free_n; j++) {
+			if (i == j) continue;
+			struct img_pix_free_block *a = &g_img_pix_free[i];
+			struct img_pix_free_block *b = &g_img_pix_free[j];
+			if (a->len == 0 || b->len == 0) continue;
+			if (a->off + a->len == b->off) {
+				a->len += b->len;
+				b->len = 0;
+			}
+		}
+	}
+	/* Compact: remove zero-len entries. */
+	uint32_t w = 0;
+	for (uint32_t i = 0; i < g_img_pix_free_n; i++) {
+		if (g_img_pix_free[i].len == 0) continue;
+		g_img_pix_free[w++] = g_img_pix_free[i];
+	}
+	g_img_pix_free_n = w;
+}
 
 static int img_pixel_alloc(uint32_t n_pixels, uint32_t *out_off)
 {
@@ -85,9 +133,100 @@ static int img_pixel_alloc(uint32_t n_pixels, uint32_t *out_off)
 	if (n_pixels > (uint32_t)(sizeof(g_img_pixel_pool) / sizeof(g_img_pixel_pool[0]))) return -1;
 	uint32_t cap = (uint32_t)(sizeof(g_img_pixel_pool) / sizeof(g_img_pixel_pool[0]));
 	if (g_img_pixel_pool_used > cap) g_img_pixel_pool_used = cap;
+
+	/* First-fit from free list. */
+	for (uint32_t i = 0; i < g_img_pix_free_n; i++) {
+		struct img_pix_free_block *b = &g_img_pix_free[i];
+		if (b->len < n_pixels) continue;
+		*out_off = b->off;
+		b->off += n_pixels;
+		b->len -= n_pixels;
+		if (b->len == 0) {
+			g_img_pix_free[i] = g_img_pix_free[g_img_pix_free_n - 1u];
+			g_img_pix_free_n--;
+		}
+		return 0;
+	}
+
 	if (cap - g_img_pixel_pool_used < n_pixels) return -1;
 	*out_off = g_img_pixel_pool_used;
 	g_img_pixel_pool_used += n_pixels;
+	return 0;
+}
+
+static int img_cache_evict_one(void)
+{
+	uint32_t best_i = 0xffffffffu;
+	uint32_t best_use = 0xffffffffu;
+	for (uint32_t i = 0; i < (uint32_t)(sizeof(g_img_sniff_cache) / sizeof(g_img_sniff_cache[0])); i++) {
+		struct img_sniff_cache_entry *e = &g_img_sniff_cache[i];
+		if (!e->used) continue;
+		if (e->state != 2) continue;
+		if (e->inflight) continue;
+		if (e->last_use < best_use) {
+			best_use = e->last_use;
+			best_i = i;
+		}
+	}
+	if (best_i == 0xffffffffu) return -1;
+	struct img_sniff_cache_entry *e = &g_img_sniff_cache[best_i];
+	if (e->has_pixels && e->pix_len != 0) {
+		img_pixel_free(e->pix_off, e->pix_len);
+	}
+	e->used = 0;
+	e->state = 0;
+	e->inflight = 0;
+	e->want_pixels = 0;
+	e->fmt = IMG_FMT_UNKNOWN;
+	e->has_dims = 0;
+	e->w = 0;
+	e->h = 0;
+	e->has_pixels = 0;
+	e->pix_off = 0;
+	e->pix_w = 0;
+	e->pix_h = 0;
+	e->pix_len = 0;
+	e->hash = 0;
+	e->last_use = 0;
+	e->key[0] = 0;
+	return 0;
+}
+
+static int img_cache_drop_pending_one(void)
+{
+	uint32_t best_i = 0xffffffffu;
+	uint32_t best_use = 0xffffffffu;
+	for (uint32_t i = 0; i < (uint32_t)(sizeof(g_img_sniff_cache) / sizeof(g_img_sniff_cache[0])); i++) {
+		struct img_sniff_cache_entry *e = &g_img_sniff_cache[i];
+		if (!e->used) continue;
+		if (e->state != 1) continue;
+		if (e->inflight) continue;
+		/* Prefer dropping entries that are no longer wanted. */
+		uint32_t score = e->want_pixels ? (e->last_use | 0x80000000u) : e->last_use;
+		if (score < best_use) {
+			best_use = score;
+			best_i = i;
+		}
+	}
+	if (best_i == 0xffffffffu) return -1;
+	struct img_sniff_cache_entry *e = &g_img_sniff_cache[best_i];
+	/* Pending entries have no pixels yet; just drop the slot. */
+	e->used = 0;
+	e->state = 0;
+	e->inflight = 0;
+	e->want_pixels = 0;
+	e->fmt = IMG_FMT_UNKNOWN;
+	e->has_dims = 0;
+	e->w = 0;
+	e->h = 0;
+	e->has_pixels = 0;
+	e->pix_off = 0;
+	e->pix_w = 0;
+	e->pix_h = 0;
+	e->pix_len = 0;
+	e->hash = 0;
+	e->last_use = 0;
+	e->key[0] = 0;
 	return 0;
 }
 
@@ -235,7 +374,10 @@ static struct img_sniff_cache_entry *img_cache_find_done(const char *active_host
 	for (size_t i = 0; i < sizeof(g_img_sniff_cache) / sizeof(g_img_sniff_cache[0]); i++) {
 		struct img_sniff_cache_entry *e = &g_img_sniff_cache[i];
 		if (!e->used || e->state != 2) continue;
-		if (e->hash == h && streq(e->key, key)) return e;
+		if (e->hash == h && streq(e->key, key)) {
+			e->last_use = ++g_img_use_tick;
+			return e;
+		}
 	}
 	return 0;
 }
@@ -345,183 +487,363 @@ static enum img_fmt img_cache_get_or_mark_pending(const char *active_host, const
 		struct img_sniff_cache_entry *e = &g_img_sniff_cache[i];
 		if (!e->used) continue;
 		if (e->hash == h && streq(e->key, key)) {
+			e->last_use = ++g_img_use_tick;
+			e->want_pixels = 1;
 			return (e->state == 2) ? e->fmt : IMG_FMT_UNKNOWN;
 		}
 	}
 
 	/* Not cached yet: mark pending. */
+	struct img_sniff_cache_entry *slot = 0;
 	for (size_t i = 0; i < sizeof(g_img_sniff_cache) / sizeof(g_img_sniff_cache[0]); i++) {
 		struct img_sniff_cache_entry *e = &g_img_sniff_cache[i];
 		if (!e->used) {
-			e->used = 1;
-			e->state = 1;
-			e->fmt = IMG_FMT_UNKNOWN;
-			e->has_dims = 0;
-			e->w = 0;
-			e->h = 0;
-				e->has_pixels = 0;
-				e->pix_off = 0;
-				e->pix_w = 0;
-				e->pix_h = 0;
-			e->hash = h;
-			(void)c_strlcpy_s(e->key, sizeof(e->key), key);
+			slot = e;
 			break;
 		}
+	}
+	if (!slot) {
+		/* If we over-prefetch, allow dropping least-recently-used pending entries. */
+		if (img_cache_drop_pending_one() == 0 || img_cache_evict_one() == 0) {
+			for (size_t i = 0; i < sizeof(g_img_sniff_cache) / sizeof(g_img_sniff_cache[0]); i++) {
+				struct img_sniff_cache_entry *e = &g_img_sniff_cache[i];
+				if (!e->used) {
+					slot = e;
+					break;
+				}
+			}
+		}
+	}
+	if (slot) {
+		slot->used = 1;
+		slot->state = 1;
+		slot->inflight = 0;
+		slot->want_pixels = 1;
+		slot->fmt = IMG_FMT_UNKNOWN;
+		slot->has_dims = 0;
+		slot->w = 0;
+		slot->h = 0;
+		slot->has_pixels = 0;
+		slot->pix_off = 0;
+		slot->pix_w = 0;
+		slot->pix_h = 0;
+		slot->pix_len = 0;
+		slot->hash = h;
+		slot->last_use = ++g_img_use_tick;
+		(void)c_strlcpy_s(slot->key, sizeof(slot->key), key);
 	}
 	return IMG_FMT_UNKNOWN;
 }
 
-static int img_sniff_pump_one(void)
+enum {
+	IMG_WORKERS = 4,
+	IMG_WORKER_MAX_W = 128,
+	IMG_WORKER_MAX_H = 128,
+	IMG_WORKER_MAX_PX = IMG_WORKER_MAX_W * IMG_WORKER_MAX_H,
+};
+
+struct img_worker_shm {
+	volatile uint32_t state; /* 0=idle, 1=req, 2=done */
+	char key[256];
+	uint32_t fmt;
+	uint32_t has_dims;
+	uint16_t w;
+	uint16_t h;
+	uint32_t has_pixels;
+	uint16_t pix_w;
+	uint16_t pix_h;
+	uint32_t pix_len;
+	int32_t rc;
+	uint32_t pixels[IMG_WORKER_MAX_PX];
+};
+
+static struct img_worker_shm *g_img_workers;
+
+static void img_worker_loop(uint32_t wi)
+{
+	if (!g_img_workers || wi >= IMG_WORKERS) sys_exit(1);
+	struct img_worker_shm *w = &g_img_workers[wi];
+	struct timespec req;
+	req.tv_sec = 0;
+	req.tv_nsec = 1 * 1000 * 1000;
+
+	for (;;) {
+		if (w->state != 1u) {
+			sys_nanosleep(&req, 0);
+			continue;
+		}
+		w->rc = -1;
+		w->fmt = IMG_FMT_UNKNOWN;
+		w->has_dims = 0;
+		w->w = 0;
+		w->h = 0;
+		w->has_pixels = 0;
+		w->pix_w = 0;
+		w->pix_h = 0;
+		w->pix_len = 0;
+
+		char host[HOST_BUF_LEN];
+		char path[PATH_BUF_LEN];
+		if (split_host_path_from_key(w->key, host, sizeof(host), path, sizeof(path)) != 0) {
+			w->rc = -1;
+			w->state = 2u;
+			continue;
+		}
+
+		uint8_t sniff_buf[4096];
+		size_t got = 0;
+		if (https_get_prefix_follow_redirects(host, path, sniff_buf, sizeof(sniff_buf), &got) != 0 || got == 0) {
+			w->rc = -1;
+			w->state = 2u;
+			continue;
+		}
+		w->fmt = (uint32_t)img_fmt_from_sniff(sniff_buf, got);
+		uint32_t dim_w = 0, dim_h = 0;
+		if ((enum img_fmt)w->fmt == IMG_FMT_JPG) {
+			if (jpeg_get_dimensions(sniff_buf, got, &dim_w, &dim_h) == 0) {
+				w->has_dims = 1;
+				w->w = (dim_w > 0xffffu) ? 0xffffu : (uint16_t)dim_w;
+				w->h = (dim_h > 0xffffu) ? 0xffffu : (uint16_t)dim_h;
+			}
+		} else if ((enum img_fmt)w->fmt == IMG_FMT_PNG) {
+			if (png_get_dimensions(sniff_buf, got, &dim_w, &dim_h) == 0) {
+				w->has_dims = 1;
+				w->w = (dim_w > 0xffffu) ? 0xffffu : (uint16_t)dim_w;
+				w->h = (dim_h > 0xffffu) ? 0xffffu : (uint16_t)dim_h;
+			}
+		} else if ((enum img_fmt)w->fmt == IMG_FMT_GIF) {
+			if (gif_get_dimensions(sniff_buf, got, &dim_w, &dim_h) == 0) {
+				w->has_dims = 1;
+				w->w = (dim_w > 0xffffu) ? 0xffffu : (uint16_t)dim_w;
+				w->h = (dim_h > 0xffffu) ? 0xffffu : (uint16_t)dim_h;
+			}
+		}
+
+		/* Only decode tiny images in workers (icons) to keep IPC small. */
+		if (w->has_dims) {
+			uint32_t pw = (uint32_t)w->w;
+			uint32_t ph = (uint32_t)w->h;
+			uint32_t px = pw * ph;
+			if (pw > 0 && ph > 0 && pw <= IMG_WORKER_MAX_W && ph <= IMG_WORKER_MAX_H && px <= IMG_WORKER_MAX_PX) {
+				uint8_t fetch_buf[512 * 1024];
+				size_t got_full = 0;
+				if (https_get_prefix_follow_redirects(host, path, fetch_buf, sizeof(fetch_buf), &got_full) == 0 && got_full > 0) {
+					uint32_t dw = 0, dh = 0;
+					int dec_ok = -1;
+					if ((enum img_fmt)w->fmt == IMG_FMT_JPG) {
+						dec_ok = jpeg_decode_baseline_xrgb(fetch_buf, got_full, w->pixels, (size_t)IMG_WORKER_MAX_PX, &dw, &dh);
+					} else if ((enum img_fmt)w->fmt == IMG_FMT_PNG) {
+						uint8_t *scratch = &fetch_buf[got_full];
+						size_t scratch_cap = sizeof(fetch_buf) - got_full;
+						dec_ok = png_decode_xrgb(fetch_buf, got_full, scratch, scratch_cap, w->pixels, (size_t)IMG_WORKER_MAX_PX, &dw, &dh);
+					} else if ((enum img_fmt)w->fmt == IMG_FMT_GIF) {
+						dec_ok = gif_decode_first_frame_xrgb(fetch_buf, got_full, w->pixels, (size_t)IMG_WORKER_MAX_PX, &dw, &dh);
+					}
+					if (dec_ok == 0 && dw <= IMG_WORKER_MAX_W && dh <= IMG_WORKER_MAX_H && dw * dh <= IMG_WORKER_MAX_PX) {
+						w->has_pixels = 1;
+						w->pix_w = (uint16_t)dw;
+						w->pix_h = (uint16_t)dh;
+						w->pix_len = (uint32_t)(dw * dh);
+						w->rc = 0;
+					} else {
+						w->rc = -1;
+					}
+				}
+			}
+		}
+
+		if (w->rc != 0) {
+			/* Even if pixel decode failed, keep sniff results (fmt/dims) best-effort. */
+			w->rc = 0;
+		}
+		w->state = 2u;
+	}
+}
+
+static void img_workers_init(void)
+{
+	if (g_img_workers) return;
+	void *p = sys_mmap(0,
+			    sizeof(struct img_worker_shm) * (size_t)IMG_WORKERS,
+			    PROT_READ | PROT_WRITE,
+			    MAP_SHARED | MAP_ANONYMOUS,
+			    -1,
+			    0);
+	if (p == MAP_FAILED) return;
+	g_img_workers = (struct img_worker_shm *)p;
+	for (uint32_t i = 0; i < IMG_WORKERS; i++) {
+		g_img_workers[i].state = 0;
+		g_img_workers[i].key[0] = 0;
+	}
+	for (uint32_t i = 0; i < IMG_WORKERS; i++) {
+		int pid = sys_fork();
+		if (pid == 0) {
+			img_worker_loop(i);
+			sys_exit(0);
+		}
+		/* Parent: if fork failed, just leave fewer workers. */
+		if (pid < 0) break;
+	}
+}
+
+static struct img_sniff_cache_entry *img_cache_find_by_key(const char *key)
+{
+	if (!key || !key[0]) return 0;
+	uint32_t h = hash32_fnv1a(key);
+	for (size_t i = 0; i < sizeof(g_img_sniff_cache) / sizeof(g_img_sniff_cache[0]); i++) {
+		struct img_sniff_cache_entry *e = &g_img_sniff_cache[i];
+		if (!e->used) continue;
+		if (e->hash == h && streq(e->key, key)) return e;
+	}
+	return 0;
+}
+
+static int img_workers_pump(int *out_any_dims_changed)
+{
+	if (out_any_dims_changed) *out_any_dims_changed = 0;
+	if (!g_img_workers) return 0;
+	int did_complete = 0;
+
+	/* Collect completed workers. */
+	for (uint32_t wi = 0; wi < IMG_WORKERS; wi++) {
+		struct img_worker_shm *w = &g_img_workers[wi];
+		if (w->state != 2u) continue;
+		did_complete = 1;
+		struct img_sniff_cache_entry *e = img_cache_find_by_key(w->key);
+		if (e) {
+			uint8_t had_dims = e->has_dims;
+			e->fmt = (enum img_fmt)w->fmt;
+			e->has_dims = (uint8_t)(w->has_dims != 0);
+			e->w = w->w;
+			e->h = w->h;
+			if (out_any_dims_changed && e->has_dims && !had_dims) {
+				*out_any_dims_changed = 1;
+			}
+
+			if (w->has_pixels && w->pix_len != 0) {
+				/* Replace existing pixels if any. */
+				if (e->has_pixels && e->pix_len != 0) {
+					img_pixel_free(e->pix_off, e->pix_len);
+					e->has_pixels = 0;
+					e->pix_off = 0;
+					e->pix_w = 0;
+					e->pix_h = 0;
+					e->pix_len = 0;
+				}
+
+				uint32_t off = 0;
+				int alloc_ok = img_pixel_alloc(w->pix_len, &off);
+				for (int tries = 0; alloc_ok != 0 && tries < 8; tries++) {
+					if (img_cache_evict_one() != 0) break;
+					alloc_ok = img_pixel_alloc(w->pix_len, &off);
+				}
+				if (alloc_ok == 0) {
+					/* Copy pixels into shared pool. */
+					for (uint32_t i = 0; i < w->pix_len; i++) {
+						g_img_pixel_pool[off + i] = w->pixels[i];
+					}
+					e->has_pixels = 1;
+					e->pix_off = off;
+					e->pix_w = w->pix_w;
+					e->pix_h = w->pix_h;
+					e->pix_len = w->pix_len;
+				}
+			}
+			e->state = 2;
+			e->inflight = 0;
+			e->last_use = ++g_img_use_tick;
+		}
+
+		w->state = 0u;
+	}
+
+	/* Dispatch new work to idle workers. */
+	for (uint32_t wi = 0; wi < IMG_WORKERS; wi++) {
+		struct img_worker_shm *w = &g_img_workers[wi];
+		if (w->state != 0u) continue;
+		struct img_sniff_cache_entry *pick = 0;
+		uint32_t best_use = 0;
+		for (uint32_t i = 0; i < (uint32_t)(sizeof(g_img_sniff_cache) / sizeof(g_img_sniff_cache[0])); i++) {
+			struct img_sniff_cache_entry *e = &g_img_sniff_cache[i];
+			if (!e->used) continue;
+			if (e->state != 1) continue;
+			if (e->inflight) continue;
+			if (!e->want_pixels) continue;
+			if (!pick || e->last_use > best_use) {
+				pick = e;
+				best_use = e->last_use;
+			}
+		}
+		if (!pick) break;
+		pick->inflight = 1;
+		(void)c_strlcpy_s(w->key, sizeof(w->key), pick->key);
+		w->state = 1u;
+		w->rc = 0;
+	}
+
+	return did_complete;
+}
+
+static int img_decode_large_pump_one(void)
 {
 	for (size_t i = 0; i < sizeof(g_img_sniff_cache) / sizeof(g_img_sniff_cache[0]); i++) {
 		struct img_sniff_cache_entry *e = &g_img_sniff_cache[i];
-		if (!e->used || e->state != 1) continue;
-		e->has_dims = 0;
-		e->w = 0;
-		e->h = 0;
-		e->has_pixels = 0;
-		e->pix_off = 0;
-		e->pix_w = 0;
-		e->pix_h = 0;
+		if (!e->used) continue;
+		if (e->state != 2) continue;
+		if (!e->want_pixels) continue;
+		if (e->inflight) continue;
+		if (e->has_pixels) continue;
+		if (!e->has_dims) continue;
+		if (e->w <= IMG_WORKER_MAX_W && e->h <= IMG_WORKER_MAX_H) continue;
+		if (e->w > 512u || e->h > 512u) continue;
+		if (!(e->fmt == IMG_FMT_JPG || e->fmt == IMG_FMT_PNG || e->fmt == IMG_FMT_GIF)) continue;
 
 		char host[HOST_BUF_LEN];
 		char path[PATH_BUF_LEN];
 		if (split_host_path_from_key(e->key, host, sizeof(host), path, sizeof(path)) != 0) {
-			e->fmt = IMG_FMT_UNKNOWN;
-			e->state = 2;
-			return 1;
+			e->want_pixels = 0;
+			return 0;
 		}
 
-		size_t got = 0;
-		if (https_get_prefix_follow_redirects(host, path, g_img_sniff_buf, sizeof(g_img_sniff_buf), &got) != 0) {
-			e->fmt = IMG_FMT_UNKNOWN;
-			e->state = 2;
-			return 1;
+		uint32_t px = (uint32_t)e->w * (uint32_t)e->h;
+		if (px == 0 || px > (uint32_t)(sizeof(g_img_pixel_pool) / sizeof(g_img_pixel_pool[0]))) {
+			e->want_pixels = 0;
+			return 0;
 		}
-		e->fmt = img_fmt_from_sniff(g_img_sniff_buf, got);
+
+		size_t got_full = 0;
+		if (https_get_prefix_follow_redirects(host, path, g_img_fetch_buf, sizeof(g_img_fetch_buf), &got_full) != 0 || got_full == 0) {
+			e->want_pixels = 0;
+			return 0;
+		}
+
+		uint32_t old_used = g_img_pixel_pool_used;
+		uint32_t off = 0;
+		if (img_pixel_alloc(px, &off) != 0) return 0;
+		uint32_t dw = 0, dh = 0;
+		int ok = -1;
 		if (e->fmt == IMG_FMT_JPG) {
-			uint32_t w = 0, h = 0;
-			if (jpeg_get_dimensions(g_img_sniff_buf, got, &w, &h) == 0) {
-				e->has_dims = 1;
-				e->w = (w > 0xffffu) ? 0xffffu : (uint16_t)w;
-				e->h = (h > 0xffffu) ? 0xffffu : (uint16_t)h;
-			}
-			/* First JPEG decoder: baseline decode for small-ish images. */
-			if (e->has_dims) {
-				uint32_t px = (uint32_t)e->w * (uint32_t)e->h;
-				if (e->w <= 512u && e->h <= 512u && px <= (uint32_t)(sizeof(g_img_pixel_pool) / sizeof(g_img_pixel_pool[0]))) {
-					const uint8_t *jpg_data = g_img_sniff_buf;
-					size_t jpg_len = got;
-					{
-						size_t got_full = 0;
-						if (https_get_prefix_follow_redirects(host, path, g_img_fetch_buf, sizeof(g_img_fetch_buf), &got_full) == 0 && got_full > 0) {
-							jpg_data = g_img_fetch_buf;
-							jpg_len = got_full;
-						}
-					}
-					uint32_t old_used = g_img_pixel_pool_used;
-					uint32_t off = 0;
-					if (img_pixel_alloc(px, &off) == 0) {
-						uint32_t dw = 0, dh = 0;
-						if (jpeg_decode_baseline_xrgb(jpg_data,
-									     jpg_len,
-									     &g_img_pixel_pool[off],
-									     (size_t)px,
-									     &dw,
-									     &dh) == 0) {
-							e->has_pixels = 1;
-							e->pix_off = off;
-							e->pix_w = (dw > 0xffffu) ? 0xffffu : (uint16_t)dw;
-							e->pix_h = (dh > 0xffffu) ? 0xffffu : (uint16_t)dh;
-						} else {
-							g_img_pixel_pool_used = old_used;
-						}
-					}
-				}
-			}
+			ok = jpeg_decode_baseline_xrgb(g_img_fetch_buf, got_full, &g_img_pixel_pool[off], (size_t)px, &dw, &dh);
 		} else if (e->fmt == IMG_FMT_PNG) {
-			uint32_t w = 0, h = 0;
-			if (png_get_dimensions(g_img_sniff_buf, got, &w, &h) == 0) {
-				e->has_dims = 1;
-				e->w = (w > 0xffffu) ? 0xffffu : (uint16_t)w;
-				e->h = (h > 0xffffu) ? 0xffffu : (uint16_t)h;
-			}
-			/* First PNG decoder: non-interlaced, bit depth 8, small-ish images. */
-			if (e->has_dims) {
-				uint32_t px = (uint32_t)e->w * (uint32_t)e->h;
-				if (e->w <= 512u && e->h <= 512u && px <= (uint32_t)(sizeof(g_img_pixel_pool) / sizeof(g_img_pixel_pool[0]))) {
-					size_t got_full = 0;
-					if (https_get_prefix_follow_redirects(host, path, g_img_fetch_buf, sizeof(g_img_fetch_buf), &got_full) == 0 && got_full > 0) {
-						uint32_t old_used = g_img_pixel_pool_used;
-						uint32_t off = 0;
-						if (img_pixel_alloc(px, &off) == 0) {
-							uint32_t dw = 0, dh = 0;
-							uint8_t *scratch = &g_img_fetch_buf[got_full];
-							size_t scratch_cap = sizeof(g_img_fetch_buf) - got_full;
-							if (png_decode_xrgb(g_img_fetch_buf,
-									   got_full,
-									   scratch,
-									   scratch_cap,
-									   &g_img_pixel_pool[off],
-									   (size_t)px,
-									   &dw,
-									   &dh) == 0) {
-								e->has_pixels = 1;
-								e->pix_off = off;
-								e->pix_w = (dw > 0xffffu) ? 0xffffu : (uint16_t)dw;
-								e->pix_h = (dh > 0xffffu) ? 0xffffu : (uint16_t)dh;
-							} else {
-								g_img_pixel_pool_used = old_used;
-							}
-						}
-					}
-				}
-			}
+			uint8_t *scratch = &g_img_fetch_buf[got_full];
+			size_t scratch_cap = sizeof(g_img_fetch_buf) - got_full;
+			ok = png_decode_xrgb(g_img_fetch_buf, got_full, scratch, scratch_cap, &g_img_pixel_pool[off], (size_t)px, &dw, &dh);
 		} else if (e->fmt == IMG_FMT_GIF) {
-			uint32_t w = 0, h = 0;
-			if (gif_get_dimensions(g_img_sniff_buf, got, &w, &h) == 0) {
-				e->has_dims = 1;
-				e->w = (w > 0xffffu) ? 0xffffu : (uint16_t)w;
-				e->h = (h > 0xffffu) ? 0xffffu : (uint16_t)h;
-			}
-			/* First real decoder: decode first frame for small-ish GIFs. */
-			if (e->has_dims) {
-				uint32_t px = (uint32_t)e->w * (uint32_t)e->h;
-				if (e->w <= 512u && e->h <= 512u && px <= (uint32_t)(sizeof(g_img_pixel_pool) / sizeof(g_img_pixel_pool[0]))) {
-					/* Try a larger body fetch for actual decode (GIFs are rarely complete in 4KB). */
-					const uint8_t *gif_data = g_img_sniff_buf;
-					size_t gif_len = got;
-					{
-						size_t got_full = 0;
-						if (https_get_prefix_follow_redirects(host, path, g_img_fetch_buf, sizeof(g_img_fetch_buf), &got_full) == 0 && got_full > 0) {
-							gif_data = g_img_fetch_buf;
-							gif_len = got_full;
-						}
-					}
-
-					uint32_t old_used = g_img_pixel_pool_used;
-					uint32_t off = 0;
-					if (img_pixel_alloc(px, &off) == 0) {
-						uint32_t dw = 0, dh = 0;
-						if (gif_decode_first_frame_xrgb(gif_data,
-									      gif_len,
-									      &g_img_pixel_pool[off],
-									      (size_t)px,
-									      &dw,
-									      &dh) == 0) {
-							e->has_pixels = 1;
-							e->pix_off = off;
-							e->pix_w = (dw > 0xffffu) ? 0xffffu : (uint16_t)dw;
-							e->pix_h = (dh > 0xffffu) ? 0xffffu : (uint16_t)dh;
-						} else {
-							g_img_pixel_pool_used = old_used;
-						}
-					}
-				}
-			}
+			ok = gif_decode_first_frame_xrgb(g_img_fetch_buf, got_full, &g_img_pixel_pool[off], (size_t)px, &dw, &dh);
 		}
-		e->state = 2;
-		return 1;
+		if (ok == 0) {
+			e->has_pixels = 1;
+			e->pix_off = off;
+			e->pix_w = (dw > 0xffffu) ? 0xffffu : (uint16_t)dw;
+			e->pix_h = (dh > 0xffffu) ? 0xffffu : (uint16_t)dh;
+			e->pix_len = px;
+			e->last_use = ++g_img_use_tick;
+			return 1;
+		} else {
+			g_img_pixel_pool_used = old_used;
+			e->want_pixels = 0;
+		}
+		return 0;
 	}
 	return 0;
 }
@@ -1152,6 +1474,37 @@ static void compose_url_bar(char *out, size_t out_len, const char *host, const c
 	out[o] = 0;
 }
 
+static void prefetch_page_images(const char *active_host, const char *visible_text, const struct html_inline_imgs *inline_imgs)
+{
+	if (!active_host || !active_host[0]) return;
+	if (inline_imgs) {
+		for (uint32_t i = 0; i < inline_imgs->n; i++) {
+			const struct html_inline_img *im = &inline_imgs->imgs[i];
+			if (!im->url[0]) continue;
+			(void)img_cache_get_or_mark_pending(active_host, im->url);
+		}
+	}
+	/* Best-effort: prefetch block images referenced by marker lines too. */
+	if (!visible_text) return;
+	for (size_t i = 0; visible_text[i] != 0; ) {
+		size_t line_start = i;
+		while (visible_text[i] != 0 && visible_text[i] != '\n') i++;
+		size_t line_end = i;
+		if (visible_text[i] == '\n') i++;
+		if (line_end <= line_start) continue;
+		if ((uint8_t)visible_text[line_start] != 0x1eu) continue;
+		if (line_end - line_start < 8) continue;
+		if (!(visible_text[line_start + 1] == 'I' && visible_text[line_start + 2] == 'M' && visible_text[line_start + 3] == 'G')) continue;
+		for (size_t k = line_start; k < line_end; k++) {
+			if ((uint8_t)visible_text[k] == 0x1fu) {
+				const char *url = &visible_text[k + 1];
+				if (url[0]) (void)img_cache_get_or_mark_pending(active_host, url);
+				break;
+			}
+		}
+	}
+}
+
 static void do_https_status(struct shm_fb *fb, char host[HOST_BUF_LEN], char path[PATH_BUF_LEN], char url_bar[URL_BUF_LEN])
 {
 	g_body_len = 0;
@@ -1166,11 +1519,9 @@ static void do_https_status(struct shm_fb *fb, char host[HOST_BUF_LEN], char pat
 	g_inline_imgs.n = 0;
 	g_scroll_rows = 0;
 	g_have_page = 0;
-	/* Reset image decode/sniff state for the new page to avoid stale pixel pool offsets. */
-	g_img_pixel_pool_used = 0;
+	/* Keep the image cache across navigations for faster icon-heavy pages. */
 	for (size_t i = 0; i < sizeof(g_img_sniff_cache) / sizeof(g_img_sniff_cache[0]); i++) {
-		g_img_sniff_cache[i].used = 0;
-		g_img_sniff_cache[i].state = 0;
+		g_img_sniff_cache[i].want_pixels = 0;
 	}
 
 	for (int step = 0; step < 6; step++) {
@@ -1289,6 +1640,8 @@ static void do_https_status(struct shm_fb *fb, char host[HOST_BUF_LEN], char pat
 	(void)c_strlcpy_s(g_url_bar, sizeof(g_url_bar), url_bar);
 	(void)c_strlcpy_s(g_active_host, sizeof(g_active_host), host);
 	g_have_page = 1;
+	prefetch_page_images(g_active_host, g_visible, &g_inline_imgs);
+	(void)img_workers_pump(0);
 	render_page(fb, host, url_bar, g_status_bar, g_visible, &g_links, g_scroll_rows);
 }
 
@@ -1310,6 +1663,8 @@ int main(void)
 			sys_nanosleep(&req, 0);
 		}
 	}
+
+	img_workers_init();
 
 	char host[HOST_BUF_LEN];
 	char path[PATH_BUF_LEN];
@@ -1407,28 +1762,32 @@ int main(void)
 			idle_ticks = 0;
 		} else {
 			idle_ticks++;
-			/* Opportunistically sniff at most one pending image when idle.
-			 * This avoids stuttering while the user scrolls.
-			 */
-			if (g_have_page && idle_ticks > 25u && (idle_ticks % 20u) == 0u) {
-				if (img_sniff_pump_one()) {
-					/* Re-extract visible text so <img> placeholders can reserve the correct
-					 * number of rows once we know dimensions.
-					 */
-					if (g_body_len > 0) {
-						struct img_dim_ctx ctx = { .active_host = g_active_host };
-						(void)html_visible_text_extract_links_spans_and_inline_imgs_ex(g_body,
-											  g_body_len,
-											  g_visible,
-											  sizeof(g_visible),
-											  &g_links,
-											  &g_spans,
-									  &g_inline_imgs,
-											  html_img_dim_lookup,
-											  &ctx);
-					}
-					render_page(&fb, g_active_host, g_url_bar, g_status_bar, g_visible, &g_links, g_scroll_rows);
+		}
+
+		if (g_have_page) {
+			int dims_changed = 0;
+			if (img_workers_pump(&dims_changed)) {
+				if (dims_changed && g_body_len > 0) {
+					struct img_dim_ctx ctx = { .active_host = g_active_host };
+					(void)html_visible_text_extract_links_spans_and_inline_imgs_ex(g_body,
+									  g_body_len,
+									  g_visible,
+									  sizeof(g_visible),
+									  &g_links,
+									  &g_spans,
+								  &g_inline_imgs,
+									  html_img_dim_lookup,
+									  &ctx);
+					prefetch_page_images(g_active_host, g_visible, &g_inline_imgs);
 				}
+				render_page(&fb, g_active_host, g_url_bar, g_status_bar, g_visible, &g_links, g_scroll_rows);
+			}
+		}
+
+		/* Large-image fallback: keep it slow to avoid stutter. */
+		if (!did_interact && g_have_page && idle_ticks > 100u && (idle_ticks % 100u) == 0u) {
+			if (img_decode_large_pump_one()) {
+				render_page(&fb, g_active_host, g_url_bar, g_status_bar, g_visible, &g_links, g_scroll_rows);
 			}
 		}
 		sys_nanosleep(&req, 0);
