@@ -48,6 +48,9 @@ endif
 CORE_SRCS := src/core/start.S src/core/main.c
 CORE_BIN := build/core
 
+INPUTD_SRCS := src/core/start.S src/inputd/main.c
+INPUTD_BIN := build/inputd
+
 TLS_SRCS := \
 	src/tls/sha256.c \
 	src/tls/hmac_sha256.c \
@@ -62,7 +65,7 @@ BROWSER_SRCS := src/core/start.S src/browser/main.c src/browser/http.c src/brows
 BROWSER_BIN := build/browser
 BROWSER_CFLAGS := $(CORE_CFLAGS) -DTEXT_LOG_MISSING_GLYPHS
 
-.PHONY: all core browser tests test test-crypto test-net-ipv6 test-http test-text-font clean clean-all viewer
+.PHONY: all core browser inputd tests test test-crypto test-net-ipv6 test-http test-text-font clean clean-all viewer
 .PHONY: test-x25519
 .PHONY: test-http
 
@@ -72,9 +75,9 @@ FORCE:
 HAVE_SDL2 := $(shell pkg-config --exists sdl2 && echo 1)
 
 ifeq ($(HAVE_SDL2),1)
-all: core browser tests viewer
+all: core browser inputd tests viewer
 else
-all: core browser tests
+all: core browser inputd tests
 endif
 
 build:
@@ -95,6 +98,14 @@ $(BROWSER_BIN): $(BROWSER_SRCS)
 	$(POST_LINK)
 
 $(BROWSER_BIN): FORCE
+
+inputd: build $(INPUTD_BIN)
+
+$(INPUTD_BIN): $(INPUTD_SRCS)
+	$(CC) $(CORE_CFLAGS) $(CORE_LDFLAGS) -o $@ $(INPUTD_SRCS)
+	$(POST_LINK)
+
+$(INPUTD_BIN): FORCE
 
 TEST_CRYPTO_BIN := build/test_crypto
 TEST_NET_IPV6_BIN := build/test_net_ipv6
@@ -155,6 +166,7 @@ $(VIEWER_BIN): tools/viewer_sdl.c
 clean:
 	rm -f $(CORE_BIN) $(CORE_BIN).debug
 	rm -f $(BROWSER_BIN) $(BROWSER_BIN).debug
+	rm -f $(INPUTD_BIN) $(INPUTD_BIN).debug
 	rm -f $(TEST_CRYPTO_BIN) $(TEST_NET_IPV6_BIN) $(TEST_HTTP_BIN) $(TEST_X25519_BIN) $(TEST_TEXT_FONT_BIN)
 	rm -f build/*.debug
 	rm -f $(VIEWER_BIN)
