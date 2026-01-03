@@ -44,6 +44,8 @@ static inline int shm_fb_open(struct shm_fb *out, uint32_t width, uint32_t heigh
 	hdr->height = height;
 	hdr->stride_bytes = stride;
 	hdr->format = CFB_FORMAT_XRGB8888;
+	hdr->reserved0 = 0;
+	hdr->reserved1 = 0;
 	/* Initialize optional input fields to 0. */
 	hdr->input_counter = 0;
 	hdr->mouse_x = 0;
@@ -54,6 +56,8 @@ static inline int shm_fb_open(struct shm_fb *out, uint32_t width, uint32_t heigh
 	hdr->mouse_last_x = 0;
 	hdr->mouse_last_y = 0;
 	hdr->mouse_event_counter = 0;
+	hdr->reserved2 = 0;
+	hdr->reserved3 = 0;
 
 	out->hdr = hdr;
 	out->base = mapped;

@@ -17,6 +17,13 @@ enum {
 	URL_BUF_LEN = 640,
 };
 
+static char g_visible[64 * 1024];
+static char g_status_bar[128];
+static char g_url_bar[URL_BUF_LEN];
+static char g_active_host[HOST_BUF_LEN];
+static uint32_t g_scroll_rows;
+static int g_have_page;
+
 struct ui_buttons {
 	uint32_t en_x, en_y, en_w, en_h;
 	uint32_t de_x, de_y, de_w, de_h;
@@ -63,7 +70,7 @@ static void draw_text_clipped_u32(void *base, uint32_t stride_bytes, uint32_t x,
 	draw_text_u32(base, stride_bytes, x, y, tmp, color);
 }
 
-static void draw_ui(struct shm_fb *fb, const char *active_host, const char *url_bar, const char *line1, const char *line2, const char *line3)
+static void draw_ui(struct shm_fb *fb, const char *active_host, const char *url_bar, const char *status_bar, const char *line1, const char *line2, const char *line3)
 {
 	/* Background */
 	fill_rect_u32(fb->pixels, fb->stride, 0, 0, fb->width, fb->height, 0xff101014u);
@@ -72,8 +79,6 @@ static void draw_ui(struct shm_fb *fb, const char *active_host, const char *url_
 	fill_rect_u32(fb->pixels, fb->stride, 0, 0, fb->width, 24, 0xff202028u);
 	struct text_color tc = { .fg = 0xffffffffu, .bg = 0, .opaque_bg = 0 };
 	struct text_color dim = { .fg = 0xffb0b0b0u, .bg = 0, .opaque_bg = 0 };
-
-	draw_text_u32(fb->pixels, fb->stride, 8, 8, "BROWSER (SYS) - NET/TLS WIP", tc);
 
 	/* Clickable buttons in the top bar */
 	struct ui_buttons b = ui_layout_buttons(fb);
@@ -92,11 +97,26 @@ static void draw_ui(struct shm_fb *fb, const char *active_host, const char *url_
 	draw_text_u32(fb->pixels, fb->stride, b.de_x + 8, b.de_y + 7, "DE", dim);
 	draw_text_u32(fb->pixels, fb->stride, b.reload_x + 8, b.reload_y + 7, "Reload", dim);
 
-	/* Current/final URL (clipped to available space). */
-	uint32_t url_x = 8 + 8 * 24; /* after title */
+	/* URL + HTTP status (clipped to available space). */
+	uint32_t url_x = 8;
 	uint32_t url_right = (b.en_x > 8) ? (b.en_x - 8) : 0;
 	uint32_t url_w = (url_right > url_x) ? (url_right - url_x) : 0;
-	draw_text_clipped_u32(fb->pixels, fb->stride, url_x, 8, url_w, url_bar, dim);
+	char top[512];
+	top[0] = 0;
+	if (url_bar && url_bar[0]) {
+		(void)c_strlcpy_s(top, sizeof(top), url_bar);
+	}
+	if (status_bar && status_bar[0]) {
+		/* Append a separator + status. */
+		size_t o = c_strnlen_s(top, sizeof(top));
+		if (o + 1 < sizeof(top)) top[o++] = ' ';
+		if (o + 1 < sizeof(top)) top[o++] = ' ';
+		for (size_t i = 0; status_bar[i] && o + 1 < sizeof(top); i++) {
+			top[o++] = status_bar[i];
+		}
+		top[o] = 0;
+	}
+	draw_text_clipped_u32(fb->pixels, fb->stride, url_x, 8, url_w, top, dim);
 
 	/* Body */
 	fill_rect_u32(fb->pixels, fb->stride, 0, 24, fb->width, fb->height - 24, 0xff101014u);
@@ -155,6 +175,58 @@ static void draw_body_wrapped(struct shm_fb *fb, uint32_t x, uint32_t y, uint32_
 	}
 }
 
+static void render_page(struct shm_fb *fb,
+				const char *active_host,
+				const char *url_bar,
+				const char *status_bar,
+				const char *visible_text,
+				uint32_t scroll_rows)
+{
+	struct text_color dim = { .fg = 0xffb0b0b0u, .bg = 0, .opaque_bg = 0 };
+	draw_ui(fb, active_host, url_bar, status_bar, "", "", "");
+	fill_rect_u32(fb->pixels, fb->stride, 0, 24, fb->width, (fb->height > 24) ? (fb->height - 24) : 0, 0xff101014u);
+	fill_rect_u32(fb->pixels, fb->stride, 0, 88, fb->width, (fb->height > 88) ? (fb->height - 88) : 0, 0xff101014u);
+	uint32_t w_px = (fb->width > 16) ? (fb->width - 16) : 0;
+	uint32_t h_px = (fb->height > 96) ? (fb->height - 96) : 0;
+	/* Skip scroll_rows by pre-advancing through wrapped output. */
+	if (!visible_text) visible_text = "";
+	if (scroll_rows == 0) {
+		draw_body_wrapped(fb, 8, 96, w_px, h_px, visible_text, dim);
+	} else {
+		/* Fast-ish skip: count produced rows without drawing, then draw the rest. */
+		uint32_t max_cols = (w_px / 8u);
+		if (max_cols == 0) max_cols = 1;
+		if (max_cols > 255) max_cols = 255;
+		uint32_t row = 0;
+		uint32_t col = 0;
+		size_t start_i = 0;
+		for (size_t i = 0; visible_text[i] != 0; i++) {
+			char c = visible_text[i];
+			if (c == '\r') continue;
+			if (c == '\n') {
+				row++;
+				col = 0;
+				if (row >= scroll_rows) {
+					start_i = i + 1;
+					break;
+				}
+				continue;
+			}
+			col++;
+			if (col >= max_cols) {
+				row++;
+				col = 0;
+				if (row >= scroll_rows) {
+					start_i = i + 1;
+					break;
+				}
+			}
+		}
+		draw_body_wrapped(fb, 8, 96, w_px, h_px, visible_text + start_i, dim);
+	}
+	fb->hdr->frame_counter++;
+}
+
 enum ui_action {
 	UI_NONE = 0,
 	UI_GO_EN = 1,
@@ -198,17 +270,19 @@ static void compose_url_bar(char *out, size_t out_len, const char *host, const c
 static void do_https_status(struct shm_fb *fb, char host[HOST_BUF_LEN], char path[PATH_BUF_LEN], char url_bar[URL_BUF_LEN])
 {
 	static uint8_t body[96 * 1024];
-	static char visible[64 * 1024];
 	size_t body_len = 0;
 	uint64_t content_len = 0;
 	char final_status[128];
 	final_status[0] = 0;
-	visible[0] = 0;
+	g_visible[0] = 0;
 	body[0] = 0;
+	g_status_bar[0] = 0;
+	g_scroll_rows = 0;
+	g_have_page = 0;
 
 	for (int step = 0; step < 6; step++) {
 		compose_url_bar(url_bar, URL_BUF_LEN, host, path);
-		draw_ui(fb, host, url_bar, "Resolving AAAA via Google DNS v6 ...", host, path);
+				draw_ui(fb, host, url_bar, "", "Resolving AAAA via Google DNS v6 ...", host, path);
 		fb->hdr->frame_counter++;
 
 		uint8_t ip6[16];
@@ -230,7 +304,7 @@ static void do_https_status(struct shm_fb *fb, char host[HOST_BUF_LEN], char pat
 		line1[o] = 0;
 
 		compose_url_bar(url_bar, URL_BUF_LEN, host, path);
-		draw_ui(fb, host, url_bar, line1, "Connecting IPv6 to :443 ...", path);
+		draw_ui(fb, host, url_bar, "", line1, "Connecting IPv6 to :443 ...", path);
 		fb->hdr->frame_counter++;
 
 		int sock = -1;
@@ -240,12 +314,12 @@ static void do_https_status(struct shm_fb *fb, char host[HOST_BUF_LEN], char pat
 
 		const char *line2 = (sock >= 0) ? "TCP connect OK (TLS 1.3 handshake ...)" : "TCP connect FAILED";
 		compose_url_bar(url_bar, URL_BUF_LEN, host, path);
-		draw_ui(fb, host, url_bar, line1, line2, "Sending ClientHello + SNI + HTTP/1.1 GET");
+		draw_ui(fb, host, url_bar, "", line1, line2, "Sending ClientHello + SNI + HTTP/1.1 GET");
 		fb->hdr->frame_counter++;
 
 		if (sock < 0) {
 			compose_url_bar(url_bar, URL_BUF_LEN, host, path);
-			draw_ui(fb, host, url_bar, line1, "TLS+HTTP FAILED", "(connect)");
+			draw_ui(fb, host, url_bar, "", line1, "TLS+HTTP FAILED", "(connect)");
 			fb->hdr->frame_counter++;
 			break;
 		}
@@ -269,7 +343,7 @@ static void do_https_status(struct shm_fb *fb, char host[HOST_BUF_LEN], char pat
 
 		if (rc != 0) {
 			compose_url_bar(url_bar, URL_BUF_LEN, host, path);
-			draw_ui(fb, host, url_bar, line1, "TLS+HTTP FAILED", "(no cert validation yet; handshake bring-up)");
+			draw_ui(fb, host, url_bar, "", line1, "TLS+HTTP FAILED", "(no cert validation yet; handshake bring-up)");
 			fb->hdr->frame_counter++;
 			break;
 		}
@@ -284,9 +358,11 @@ static void do_https_status(struct shm_fb *fb, char host[HOST_BUF_LEN], char pat
 		}
 
 		compose_url_bar(url_bar, URL_BUF_LEN, host, path);
-		draw_ui(fb, host, url_bar, line1, status, (location[0] ? location : path));
+		/* During redirects, keep status in the top bar instead of body. */
+		draw_ui(fb, host, url_bar, status, line1, (location[0] ? "Redirecting..." : ""), (location[0] ? location : path));
 		/* If this is not a redirect, keep the body we just fetched. */
 		(void)c_strlcpy_s(final_status, sizeof(final_status), status);
+		(void)c_strlcpy_s(g_status_bar, sizeof(g_status_bar), status);
 		fb->hdr->frame_counter++;
 
 		int is_redirect = (status_code == 301 || status_code == 302 || status_code == 303 || status_code == 307 || status_code == 308);
@@ -306,16 +382,12 @@ static void do_https_status(struct shm_fb *fb, char host[HOST_BUF_LEN], char pat
 
 	/* Render extracted visible text (best-effort). */
 	if (body_len > 0) {
-		(void)html_visible_text_extract(body, body_len, visible, sizeof(visible));
+		(void)html_visible_text_extract(body, body_len, g_visible, sizeof(g_visible));
 	}
-	struct text_color dim = { .fg = 0xffb0b0b0u, .bg = 0, .opaque_bg = 0 };
-	draw_ui(fb, host, url_bar, "HTTP done", final_status[0] ? final_status : "", (visible[0] ? "Rendering visible text..." : "(no body)"));
-	/* Clear body area below status lines and draw content. */
-	fill_rect_u32(fb->pixels, fb->stride, 0, 88, fb->width, (fb->height > 88) ? (fb->height - 88) : 0, 0xff101014u);
-	uint32_t w_px = (fb->width > 16) ? (fb->width - 16) : 0;
-	uint32_t h_px = (fb->height > 96) ? (fb->height - 96) : 0;
-	draw_body_wrapped(fb, 8, 96, w_px, h_px, visible, dim);
-	fb->hdr->frame_counter++;
+	(void)c_strlcpy_s(g_url_bar, sizeof(g_url_bar), url_bar);
+	(void)c_strlcpy_s(g_active_host, sizeof(g_active_host), host);
+	g_have_page = 1;
+	render_page(fb, host, url_bar, g_status_bar, g_visible, g_scroll_rows);
 }
 
 int main(void)
@@ -327,7 +399,7 @@ int main(void)
 
 	int crypto_ok = tls_crypto_selftest();
 	if (!crypto_ok) {
-		draw_ui(&fb, "", "", "CRYPTO SELFTEST: FAIL", "Refusing to continue.", "Run: make test");
+		draw_ui(&fb, "", "", "", "CRYPTO SELFTEST: FAIL", "Refusing to continue.", "Run: make test");
 		fb.hdr->frame_counter++;
 		for (;;) {
 			struct timespec req;
@@ -343,7 +415,7 @@ int main(void)
 	(void)c_strlcpy_s(host, sizeof(host), "de.wikipedia.org");
 	(void)c_strlcpy_s(path, sizeof(path), "/");
 	compose_url_bar(url_bar, sizeof(url_bar), host, path);
-	draw_ui(&fb, host, url_bar, "CRYPTO SELFTEST: OK", "Click EN / DE / Reload", host);
+	draw_ui(&fb, host, url_bar, "", "CRYPTO SELFTEST: OK", "Click EN / DE / Reload", host);
 	fb.hdr->frame_counter++;
 
 	do_https_status(&fb, host, path, url_bar);
@@ -354,6 +426,25 @@ int main(void)
 	req.tv_nsec = 10 * 1000 * 1000;
 	uint64_t last_mouse_event = fb.hdr->mouse_event_counter;
 	for (;;) {
+		/* Mouse wheel scroll (shared header reserved fields). */
+		static uint64_t last_wheel_counter = 0;
+		uint64_t wc = cfb_wheel_counter(fb.hdr);
+		if (wc != last_wheel_counter) {
+			last_wheel_counter = wc;
+			int32_t dy = cfb_wheel_delta_y(fb.hdr);
+			uint32_t step = 3u;
+			if (dy > 0) {
+				uint32_t dec = (uint32_t)dy * step;
+				g_scroll_rows = (g_scroll_rows > dec) ? (g_scroll_rows - dec) : 0u;
+			} else if (dy < 0) {
+				uint32_t inc = (uint32_t)(-dy) * step;
+				g_scroll_rows += inc;
+			}
+			if (g_have_page) {
+				render_page(&fb, g_active_host, g_url_bar, g_status_bar, g_visible, g_scroll_rows);
+			}
+		}
+
 		if (fb.hdr->version >= 2) {
 			uint64_t cur = fb.hdr->mouse_event_counter;
 			if (cur != last_mouse_event) {
@@ -365,20 +456,23 @@ int main(void)
 					if (a == UI_GO_EN) {
 						(void)c_strlcpy_s(host, sizeof(host), "en.wikipedia.org");
 						(void)c_strlcpy_s(path, sizeof(path), "/");
+						g_scroll_rows = 0;
 						compose_url_bar(url_bar, sizeof(url_bar), host, path);
-						draw_ui(&fb, host, url_bar, "EN clicked", host, "Fetching ...");
+							draw_ui(&fb, host, url_bar, "", "EN clicked", host, "Fetching ...");
 						fb.hdr->frame_counter++;
 						do_https_status(&fb, host, path, url_bar);
 					} else if (a == UI_GO_DE) {
 						(void)c_strlcpy_s(host, sizeof(host), "de.wikipedia.org");
 						(void)c_strlcpy_s(path, sizeof(path), "/");
+						g_scroll_rows = 0;
 						compose_url_bar(url_bar, sizeof(url_bar), host, path);
-						draw_ui(&fb, host, url_bar, "DE clicked", host, "Fetching ...");
+							draw_ui(&fb, host, url_bar, "", "DE clicked", host, "Fetching ...");
 						fb.hdr->frame_counter++;
 						do_https_status(&fb, host, path, url_bar);
 					} else if (a == UI_RELOAD) {
+						g_scroll_rows = 0;
 						compose_url_bar(url_bar, sizeof(url_bar), host, path);
-						draw_ui(&fb, host, url_bar, "Reload clicked", host, "Fetching ...");
+							draw_ui(&fb, host, url_bar, "", "Reload clicked", host, "Fetching ...");
 						fb.hdr->frame_counter++;
 						do_https_status(&fb, host, path, url_bar);
 					}

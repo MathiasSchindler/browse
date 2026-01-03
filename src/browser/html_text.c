@@ -266,7 +266,21 @@ int html_visible_text_extract(const uint8_t *html, size_t html_len, char *out, s
 		}
 
 		if (c < 32 || c >= 127) {
-			/* Non-ASCII ignored for now (future: UTF-8 decode). */
+			/* Minimal UTF-8 handling for common German umlauts (Latin-1 supplement).
+			 * Wikipedia frequently uses these in headings.
+			 */
+			if (c == 0xC3 && i + 1 < html_len) {
+				uint8_t d = html[i + 1];
+				/* ä ö ü Ä Ö Ü ß */
+				if (d == 0xA4) { (void)append_char(out, out_len, &o, 'a'); (void)append_char(out, out_len, &o, 'e'); last_was_space = 0; i++; continue; }
+				if (d == 0xB6) { (void)append_char(out, out_len, &o, 'o'); (void)append_char(out, out_len, &o, 'e'); last_was_space = 0; i++; continue; }
+				if (d == 0xBC) { (void)append_char(out, out_len, &o, 'u'); (void)append_char(out, out_len, &o, 'e'); last_was_space = 0; i++; continue; }
+				if (d == 0x84) { (void)append_char(out, out_len, &o, 'A'); (void)append_char(out, out_len, &o, 'E'); last_was_space = 0; i++; continue; }
+				if (d == 0x96) { (void)append_char(out, out_len, &o, 'O'); (void)append_char(out, out_len, &o, 'E'); last_was_space = 0; i++; continue; }
+				if (d == 0x9C) { (void)append_char(out, out_len, &o, 'U'); (void)append_char(out, out_len, &o, 'E'); last_was_space = 0; i++; continue; }
+				if (d == 0x9F) { (void)append_char(out, out_len, &o, 's'); (void)append_char(out, out_len, &o, 's'); last_was_space = 0; i++; continue; }
+			}
+			/* Other non-ASCII ignored for now. */
 			continue;
 		}
 

@@ -127,6 +127,20 @@ int main(int argc, char **argv)
 			if (ev.type == SDL_QUIT) {
 				goto out;
 			}
+			if (ev.type == SDL_MOUSEWHEEL && mapped && mapped_len >= CFB_HEADER_V1_SIZE) {
+				struct cfb_header *hdr = (struct cfb_header *)mapped;
+				if (hdr->magic == CFB_MAGIC && hdr->format == CFB_FORMAT_XRGB8888) {
+					/* Only write into shm if the header supports it (v2+). */
+					if (hdr->version >= 2 && mapped_len >= sizeof(struct cfb_header)) {
+						/* Reuse reserved fields (reserved0=wheel delta y, reserved2=wheel counter). */
+						hdr->reserved0 = (uint32_t)ev.wheel.y;
+						hdr->reserved2++;
+						hdr->input_counter++;
+					}
+					fprintf(stderr, "mouse wheel y=%d\n", ev.wheel.y);
+					fflush(stderr);
+				}
+			}
 			if ((ev.type == SDL_MOUSEBUTTONDOWN || ev.type == SDL_MOUSEBUTTONUP) && mapped && mapped_len >= CFB_HEADER_V1_SIZE) {
 				struct cfb_header *hdr = (struct cfb_header *)mapped;
 				if (hdr->magic == CFB_MAGIC && hdr->format == CFB_FORMAT_XRGB8888) {

@@ -10,6 +10,7 @@ enum {
 
 	REL_X = 0x00,
 	REL_Y = 0x01,
+	REL_WHEEL = 0x08,
 
 	BTN_LEFT = 0x110,
 	BTN_RIGHT = 0x111,
@@ -226,6 +227,11 @@ int main(void)
 					} else if (ev[i].code == REL_Y) {
 						int64_t ny = (int64_t)cur_y + (int64_t)ev[i].value;
 						cur_y = clamp_u32(ny, 0u, (hdr->height ? (hdr->height - 1u) : 0u));
+					} else if (ev[i].code == REL_WHEEL) {
+						/* Wheel: reuse reserved fields (see core/cfb.h helpers). */
+						cfb_set_wheel_delta_y(hdr, ev[i].value);
+						cfb_bump_wheel_counter(hdr);
+						hdr->input_counter++;
 					}
 					continue;
 				}
