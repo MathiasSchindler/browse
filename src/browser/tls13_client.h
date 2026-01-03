@@ -22,3 +22,17 @@ int tls13_https_get_status_line(int sock,
 				const char *path,
 				char *status_line,
 				size_t status_line_len);
+
+/* Like tls13_https_get_status_line, but also parses response headers enough to
+ * extract the numeric status code and a Location header (if present).
+ *
+ * location_out is set to an empty string if not present.
+ */
+int tls13_https_get_status_and_location(int sock,
+					const char *host,
+					const char *path,
+					char *status_line,
+					size_t status_line_len,
+					int *status_code_out,
+					char *location_out,
+					size_t location_out_len);

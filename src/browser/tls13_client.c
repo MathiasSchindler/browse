@@ -2,6 +2,7 @@
 
 #include "http.h"
 #include "net_ip6.h"
+#include "url.h"
 #include "util.h"
 
 #include "../tls/gcm.h"
@@ -264,6 +265,22 @@ static int build_client_hello(const char *host,
 		}
 	}
 
+	/* ALPN: offer http/1.1 */
+	{
+		static const char proto[] = "http/1.1";
+		put_u16(p, 0x0010);
+		p += 2;
+		/* ext_len = 2 + (1 + proto_len) */
+		put_u16(p, (uint16_t)(2u + 1u + (uint16_t)(sizeof(proto) - 1u)));
+		p += 2;
+		put_u16(p, (uint16_t)(1u + (uint16_t)(sizeof(proto) - 1u)));
+		p += 2;
+		*p++ = (uint8_t)(sizeof(proto) - 1u);
+		for (size_t i = 0; i < sizeof(proto) - 1u; i++) {
+			*p++ = (uint8_t)proto[i];
+		}
+	}
+
 	/* supported_versions */
 	{
 		put_u16(p, 0x002b);
@@ -457,8 +474,29 @@ int tls13_https_get_status_line(int sock,
 				char *status_line,
 				size_t status_line_len)
 {
+	return tls13_https_get_status_and_location(sock,
+						 host,
+						 path,
+						 status_line,
+						 status_line_len,
+						 0,
+						 0,
+						 0);
+}
+
+int tls13_https_get_status_and_location(int sock,
+					const char *host,
+					const char *path,
+					char *status_line,
+					size_t status_line_len,
+					int *status_code_out,
+					char *location_out,
+					size_t location_out_len)
+{
 	if (!host || !path || !status_line || status_line_len == 0) return -1;
 	status_line[0] = 0;
+	if (status_code_out) *status_code_out = -1;
+	if (location_out && location_out_len) location_out[0] = 0;
 
 	/* Avoid hanging forever during bring-up. */
 	{
@@ -625,9 +663,17 @@ int tls13_https_get_status_line(int sock,
 	crypto_memset(req, 0, sizeof(req));
 	dbg_write("tls: HTTP request sent\n");
 
-	/* Read application data until we have the HTTP status line. */
-	size_t so = 0;
-	int got_line = 0;
+	/* Read application data until end of HTTP headers (CRLFCRLF).
+	 * While streaming, capture:
+	 * - status line
+	 * - Location header (if present)
+	 */
+	char line[512];
+	size_t line_len = 0;
+	int got_status = 0;
+	int got_headers_end = 0;
+	uint8_t last = 0;
+	uint8_t crlf_state = 0; /* counts consecutive \r\n pairs */
 	dbg_write("tls: waiting for HTTP response...\n");
 	for (;;) {
 		if (tls_read_record(sock, hdr, payload, sizeof(payload), &payload_len) != 0) {
@@ -657,20 +703,54 @@ int tls13_https_get_status_line(int sock,
 		if (dec_type != 0x17) continue;
 		for (size_t i = 0; i < dec_len; i++) {
 			uint8_t b = dec[i];
-			if (b == '\n') {
-				/* Strip optional preceding '\r'. */
-				if (so > 0 && status_line[so - 1] == '\r') so--;
-				status_line[so] = 0;
-				got_line = 1;
-				break;
+
+			/* Track CRLFCRLF */
+			if (last == '\r' && b == '\n') {
+				crlf_state++;
+			} else if (b != '\r') {
+				crlf_state = 0;
 			}
-			if (so + 1 < status_line_len) {
-				status_line[so++] = (char)b;
+			last = b;
+			if (crlf_state >= 2) {
+				got_headers_end = 1;
+			}
+
+			/* Build current line for parsing */
+			if (line_len + 1 < sizeof(line)) {
+				line[line_len++] = (char)b;
+				line[line_len] = 0;
+			}
+
+			if (b == '\n') {
+				/* A full header line collected */
+				if (!got_status) {
+					/* Status line: copy without CRLF */
+					size_t n = line_len;
+					while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) n--;
+					size_t w = 0;
+					for (; w < n && w + 1 < status_line_len; w++) status_line[w] = line[w];
+					status_line[w] = 0;
+					if (status_code_out) *status_code_out = http_parse_status_code(status_line);
+					got_status = 1;
+				} else {
+					/* Header line */
+					if (location_out && location_out_len && location_out[0] == 0) {
+						char tmp[512];
+						if (http_header_extract_value(line, "Location", tmp, sizeof(tmp)) == 0) {
+							(void)c_strlcpy_s(location_out, location_out_len, tmp);
+						}
+					}
+				}
+
+				line_len = 0;
+				line[0] = 0;
+
+				if (got_headers_end) break;
 			}
 		}
-		if (got_line) break;
+		if (got_headers_end) break;
 	}
-	dbg_write("tls: got HTTP status line\n");
+	dbg_write("tls: got HTTP response headers\n");
 
 	crypto_memset(shared, 0, sizeof(shared));
 	crypto_memset(c_hs_traffic, 0, sizeof(c_hs_traffic));

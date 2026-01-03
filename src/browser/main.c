@@ -2,6 +2,7 @@
 #include "fb_shm.h"
 #include "net_dns.h"
 #include "net_tcp.h"
+#include "url.h"
 
 #include "../tls/selftest.h"
 #include "tls13_client.h"
@@ -100,51 +101,89 @@ static enum ui_action ui_action_from_click(const struct shm_fb *fb, uint32_t x, 
 	return UI_NONE;
 }
 
-static void do_https_status(struct shm_fb *fb, const char *host, const char *path)
+static void do_https_status(struct shm_fb *fb, const char *start_host, const char *start_path)
 {
-	draw_ui(fb, host, "Resolving AAAA via Google DNS v6 ...", host, "");
-	fb->hdr->frame_counter++;
+	char host[128];
+	char path[512];
+	(void)c_strlcpy_s(host, sizeof(host), start_host);
+	(void)c_strlcpy_s(path, sizeof(path), start_path);
 
-	uint8_t ip6[16];
-	c_memset(ip6, 0, sizeof(ip6));
-	int dns_ok = dns_resolve_aaaa_google(host, ip6);
-	char ip_str[48];
-	if (dns_ok == 0) {
-		ip6_to_str(ip_str, ip6);
-	} else {
-		c_memcpy(ip_str, "<dns6 fail>", 12);
-	}
-
-	char line1[96];
-	c_memset(line1, 0, sizeof(line1));
-	const char *pfx = "DNS AAAA = ";
-	size_t o = 0;
-	for (size_t i = 0; pfx[i] && o + 1 < sizeof(line1); i++) line1[o++] = pfx[i];
-	for (size_t i = 0; ip_str[i] && o + 1 < sizeof(line1); i++) line1[o++] = ip_str[i];
-	line1[o] = 0;
-
-	draw_ui(fb, host, line1, "Connecting IPv6 to :443 ...", "");
-	fb->hdr->frame_counter++;
-
-	int sock = -1;
-	if (dns_ok == 0) {
-		sock = tcp6_connect(ip6, 443);
-	}
-
-	const char *line2 = (sock >= 0) ? "TCP connect OK (TLS 1.3 handshake ...)" : "TCP connect FAILED";
-	draw_ui(fb, host, line1, line2, "Sending ClientHello + SNI + HTTP/1.1 GET");
-	fb->hdr->frame_counter++;
-
-	if (sock >= 0) {
-		char status[128];
-		int rc = tls13_https_get_status_line(sock, host, path, status, sizeof(status));
-		if (rc == 0) {
-			draw_ui(fb, host, line1, "TLS+HTTP OK", status);
-		} else {
-			draw_ui(fb, host, line1, "TLS+HTTP FAILED", "(no cert validation yet; handshake bring-up)");
-		}
+	for (int step = 0; step < 6; step++) {
+		draw_ui(fb, host, "Resolving AAAA via Google DNS v6 ...", host, path);
 		fb->hdr->frame_counter++;
+
+		uint8_t ip6[16];
+		c_memset(ip6, 0, sizeof(ip6));
+		int dns_ok = dns_resolve_aaaa_google(host, ip6);
+		char ip_str[48];
+		if (dns_ok == 0) {
+			ip6_to_str(ip_str, ip6);
+		} else {
+			c_memcpy(ip_str, "<dns6 fail>", 12);
+		}
+
+		char line1[128];
+		c_memset(line1, 0, sizeof(line1));
+		const char *pfx = "DNS AAAA = ";
+		size_t o = 0;
+		for (size_t i = 0; pfx[i] && o + 1 < sizeof(line1); i++) line1[o++] = pfx[i];
+		for (size_t i = 0; ip_str[i] && o + 1 < sizeof(line1); i++) line1[o++] = ip_str[i];
+		line1[o] = 0;
+
+		draw_ui(fb, host, line1, "Connecting IPv6 to :443 ...", path);
+		fb->hdr->frame_counter++;
+
+		int sock = -1;
+		if (dns_ok == 0) {
+			sock = tcp6_connect(ip6, 443);
+		}
+
+		const char *line2 = (sock >= 0) ? "TCP connect OK (TLS 1.3 handshake ...)" : "TCP connect FAILED";
+		draw_ui(fb, host, line1, line2, "Sending ClientHello + SNI + HTTP/1.1 GET");
+		fb->hdr->frame_counter++;
+
+		if (sock < 0) {
+			draw_ui(fb, host, line1, "TLS+HTTP FAILED", "(connect)");
+			fb->hdr->frame_counter++;
+			break;
+		}
+
+		char status[128];
+		char location[512];
+		int status_code = -1;
+		int rc = tls13_https_get_status_and_location(sock, host, path, status, sizeof(status), &status_code, location, sizeof(location));
 		sys_close(sock);
+
+		if (rc != 0) {
+			draw_ui(fb, host, line1, "TLS+HTTP FAILED", "(no cert validation yet; handshake bring-up)");
+			fb->hdr->frame_counter++;
+			break;
+		}
+
+		dbg_write("http: ");
+		dbg_write(status);
+		dbg_write("\n");
+		if (location[0]) {
+			dbg_write("loc: ");
+			dbg_write(location);
+			dbg_write("\n");
+		}
+
+		draw_ui(fb, host, line1, status, (location[0] ? location : path));
+		fb->hdr->frame_counter++;
+
+		int is_redirect = (status_code == 301 || status_code == 302 || status_code == 303 || status_code == 307 || status_code == 308);
+		if (!is_redirect || location[0] == 0) {
+			break;
+		}
+
+		char new_host[128];
+		char new_path[512];
+		if (url_apply_location(host, location, new_host, sizeof(new_host), new_path, sizeof(new_path)) != 0) {
+			break;
+		}
+		(void)c_strlcpy_s(host, sizeof(host), new_host);
+		(void)c_strlcpy_s(path, sizeof(path), new_path);
 	}
 }
 

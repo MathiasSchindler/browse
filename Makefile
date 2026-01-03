@@ -112,11 +112,12 @@ TEST_NET_IPV6_BIN := build/test_net_ipv6
 TEST_X25519_BIN := build/test_x25519
 TEST_HTTP_BIN := build/test_http
 TEST_TEXT_FONT_BIN := build/test_text_font
+TEST_REDIRECT_BIN := build/test_redirect
 
 # Build (but do not run) all test binaries.
-tests: build $(TEST_CRYPTO_BIN) $(TEST_NET_IPV6_BIN) $(TEST_HTTP_BIN) $(TEST_TEXT_FONT_BIN) $(TEST_X25519_BIN)
+tests: build $(TEST_CRYPTO_BIN) $(TEST_NET_IPV6_BIN) $(TEST_HTTP_BIN) $(TEST_TEXT_FONT_BIN) $(TEST_X25519_BIN) $(TEST_REDIRECT_BIN)
 
-test: test-crypto test-net-ipv6 test-http test-text-font
+test: test-crypto test-net-ipv6 test-http test-text-font test-redirect
 
 test-x25519: build $(TEST_X25519_BIN)
 	./$(TEST_X25519_BIN)
@@ -156,6 +157,14 @@ $(TEST_TEXT_FONT_BIN): tools/test_text_font.c src/core/start.S src/core/text.h s
 
 $(TEST_TEXT_FONT_BIN): FORCE
 
+test-redirect: build $(TEST_REDIRECT_BIN)
+	./$(TEST_REDIRECT_BIN)
+
+$(TEST_REDIRECT_BIN): tools/test_redirect.c src/core/start.S src/core/syscall.h src/browser/util.h src/browser/url.h
+	$(CC) $(CORE_CFLAGS) $(CORE_LDFLAGS) -Isrc -o $@ src/core/start.S tools/test_redirect.c
+
+$(TEST_REDIRECT_BIN): FORCE
+
 # Optional dev viewer: needs libsdl2-dev
 VIEWER_BIN := build/viewer
 viewer: build $(VIEWER_BIN)
@@ -167,7 +176,7 @@ clean:
 	rm -f $(CORE_BIN) $(CORE_BIN).debug
 	rm -f $(BROWSER_BIN) $(BROWSER_BIN).debug
 	rm -f $(INPUTD_BIN) $(INPUTD_BIN).debug
-	rm -f $(TEST_CRYPTO_BIN) $(TEST_NET_IPV6_BIN) $(TEST_HTTP_BIN) $(TEST_X25519_BIN) $(TEST_TEXT_FONT_BIN)
+	rm -f $(TEST_CRYPTO_BIN) $(TEST_NET_IPV6_BIN) $(TEST_HTTP_BIN) $(TEST_X25519_BIN) $(TEST_TEXT_FONT_BIN) $(TEST_REDIRECT_BIN)
 	rm -f build/*.debug
 	rm -f $(VIEWER_BIN)
 	@true

@@ -3,7 +3,7 @@
 #include "../core/syscall.h"
 
 /* User-Agent must point at the project repo. */
-#define BROWSE_USER_AGENT "browse (+https://github.com/MathiasSchindler/browse)"
+#define BROWSE_USER_AGENT "browse/0.1 (+https://github.com/MathiasSchindler/browse; contact: https://github.com/MathiasSchindler)"
 
 /* Formats a minimal HTTP/1.1 GET request.
  *
