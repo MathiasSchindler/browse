@@ -266,6 +266,122 @@ static void append_blankline_collapse(char *out, size_t out_len, size_t *io, int
 	if (last_was_space) *last_was_space = 1;
 }
 
+static void append_str(char *out, size_t out_len, size_t *io, const char *s)
+{
+	if (!out || !io || !s) return;
+	for (size_t i = 0; s[i] != 0; i++) {
+		(void)append_char(out, out_len, io, s[i]);
+	}
+}
+
+static void img_pick_src_tail(const char *src, char *out, size_t out_cap)
+{
+	if (!out || out_cap == 0) return;
+	out[0] = 0;
+	if (!src || src[0] == 0) return;
+	/* Best-effort: show only the last path segment so lines stay short. */
+	const char *last = src;
+	for (size_t i = 0; src[i] != 0; i++) {
+		if (src[i] == '/') last = &src[i + 1];
+	}
+	cpy_str_trunc(out, out_cap, last);
+}
+
+static uint32_t parse_uint_dec_attr(const uint8_t *v, size_t vlen)
+{
+	/* Best-effort parse of decimal digits inside an attribute value (e.g. width="320"). */
+	if (!v || vlen == 0) return 0;
+	uint32_t x = 0;
+	int seen = 0;
+	for (size_t i = 0; i < vlen; i++) {
+		uint8_t c = v[i];
+		if (c >= '0' && c <= '9') {
+			seen = 1;
+			uint32_t d = (uint32_t)(c - '0');
+			if (x > 0xFFFFFFFFu / 10u) return 0;
+			x = x * 10u + d;
+			continue;
+		}
+		if (seen) break;
+		/* Skip leading non-digits (e.g. whitespace). */
+	}
+	return x;
+}
+
+static int img_url_ext_rank(const char *url)
+{
+	/* Higher is better. Used only for srcset selection heuristics. */
+	if (!url) return 0;
+	/* Find last '.' before query/fragment. */
+	const char *dot = 0;
+	for (size_t i = 0; url[i] != 0; i++) {
+		char c = url[i];
+		if (c == '?' || c == '#') break;
+		if (c == '.') dot = &url[i + 1];
+		if (c == '/') dot = 0;
+	}
+	if (!dot || dot[0] == 0) return 0;
+	char ext[8];
+	size_t n = 0;
+	while (dot[n] && dot[n] != '?' && dot[n] != '#' && dot[n] != '/' && n + 1 < sizeof(ext)) {
+		uint8_t c = (uint8_t)dot[n];
+		if (c >= 'A' && c <= 'Z') c = (uint8_t)(c + ('a' - 'A'));
+		ext[n] = (char)c;
+		n++;
+	}
+	ext[n] = 0;
+	if (ext[0] == 0) return 0;
+	if (ieq_lit_n((const uint8_t *)ext, n, "png")) return 40;
+	if (ieq_lit_n((const uint8_t *)ext, n, "jpg")) return 30;
+	if (ieq_lit_n((const uint8_t *)ext, n, "jpeg")) return 30;
+	if (ieq_lit_n((const uint8_t *)ext, n, "gif")) return 20;
+	if (ieq_lit_n((const uint8_t *)ext, n, "webp")) return 10;
+	if (ieq_lit_n((const uint8_t *)ext, n, "svg")) return 1;
+	return 0;
+}
+
+static void img_pick_from_srcset(const uint8_t *v, size_t vlen, char *out, size_t out_cap)
+{
+	/* Very small srcset parser:
+	 * - split on ','
+	 * - for each candidate, take the first token as URL
+	 * - pick the URL with best extension rank
+	 */
+	if (!out || out_cap == 0) return;
+	out[0] = 0;
+	if (!v || vlen == 0) return;
+
+	char best[128];
+	best[0] = 0;
+	int best_rank = 0;
+
+	size_t i = 0;
+	while (i < vlen) {
+		while (i < vlen && (v[i] == ',' || is_ascii_space(v[i]))) i++;
+		if (i >= vlen) break;
+		/* URL token */
+		char url[128];
+		size_t o = 0;
+		while (i < vlen && !is_ascii_space(v[i]) && v[i] != ',') {
+			uint8_t c = v[i++];
+			if (c < 32 || c >= 127) continue;
+			if (o + 1 < sizeof(url)) url[o++] = (char)c;
+		}
+		url[o] = 0;
+		if (url[0] != 0) {
+			int r = img_url_ext_rank(url);
+			if (r > best_rank) {
+				best_rank = r;
+				cpy_str_trunc(best, sizeof(best), url);
+			}
+		}
+		/* skip rest of candidate until ',' */
+		while (i < vlen && v[i] != ',') i++;
+	}
+
+	if (best[0] != 0) cpy_str_trunc(out, out_cap, best);
+}
+
 static int decode_entity(const uint8_t *s, size_t n, char *out_ch)
 {
 	/* s points to after '&', n is bytes up to before ';' */
@@ -958,6 +1074,162 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 			}
 			int is_heading = (nb == 2 && name_buf[0] == 'h' && name_buf[1] >= '1' && name_buf[1] <= '6');
 			int is_li = (nb == 2 && name_buf[0] == 'l' && name_buf[1] == 'i');
+
+			/* Phase 1 images: treat <img> as a block placeholder so layout reserves space.
+			 * No decoding yet; we print a small boxed marker plus alt/src tail.
+			 */
+			if (allow_output && !is_end && nb == 3 && ieq_lit_n(name_buf, nb, "img")) {
+				char alt_tmp[64];
+				char src_tmp[128];
+				char srcset_tmp[256];
+				uint32_t img_w = 0;
+				uint32_t img_h = 0;
+				alt_tmp[0] = 0;
+				src_tmp[0] = 0;
+				srcset_tmp[0] = 0;
+
+				/* Parse alt=, src=/data-src=, srcset=, height= (best-effort, ASCII only). */
+				size_t k = j;
+				while (k < html_len && k < tag_end && html[k] != '>') {
+					while (k < html_len && k < tag_end && is_ascii_space(html[k])) k++;
+					if (k >= html_len || k >= tag_end || html[k] == '>') break;
+
+					size_t an = k;
+					while (k < html_len && k < tag_end && (is_alpha(html[k]) || is_digit(html[k]) || html[k] == '-' || html[k] == '_')) k++;
+					size_t alen = k - an;
+					if (alen == 0) {
+						k++;
+						continue;
+					}
+					while (k < html_len && k < tag_end && is_ascii_space(html[k])) k++;
+					if (!(k < html_len && k < tag_end && html[k] == '=')) {
+						/* Attribute without value. */
+						continue;
+					}
+					k++;
+					while (k < html_len && k < tag_end && is_ascii_space(html[k])) k++;
+					uint8_t q = 0;
+					if (k < html_len && k < tag_end && (html[k] == '"' || html[k] == '\'')) {
+						q = html[k];
+						k++;
+					}
+					size_t vs = k;
+					if (q) {
+						while (k < html_len && k < tag_end && html[k] != q) k++;
+					} else {
+						while (k < html_len && k < tag_end && !is_ascii_space(html[k]) && html[k] != '>') k++;
+					}
+					size_t vlen = (k > vs) ? (k - vs) : 0;
+					if (vlen > 0) {
+						if (ieq_attr(html + an, alen, "alt") && alt_tmp[0] == 0) {
+							size_t o2 = 0;
+							int last_space2 = 1;
+							for (size_t t = 0; t < vlen && o2 + 1 < sizeof(alt_tmp); t++) {
+								uint8_t ac = html[vs + t];
+								if (ac == 0 || ac == '\r' || ac == '\n' || ac == '\t') ac = ' ';
+								if (ac < 32 || ac >= 127) continue;
+								if (ac == ' ') {
+									if (last_space2) continue;
+									last_space2 = 1;
+								} else {
+									last_space2 = 0;
+								}
+								alt_tmp[o2++] = (char)ac;
+							}
+							while (o2 > 0 && alt_tmp[o2 - 1] == ' ') o2--;
+							alt_tmp[o2] = 0;
+						} else if ((ieq_attr(html + an, alen, "src") || ieq_attr(html + an, alen, "data-src")) && src_tmp[0] == 0) {
+							size_t o2 = 0;
+							for (size_t t = 0; t < vlen && o2 + 1 < sizeof(src_tmp); t++) {
+								uint8_t sc = html[vs + t];
+								if (sc < 32 || sc >= 127) break;
+								src_tmp[o2++] = (char)sc;
+							}
+							src_tmp[o2] = 0;
+						} else if (ieq_attr(html + an, alen, "srcset") && srcset_tmp[0] == 0) {
+							size_t o2 = 0;
+							for (size_t t = 0; t < vlen && o2 + 1 < sizeof(srcset_tmp); t++) {
+								uint8_t sc = html[vs + t];
+								if (sc < 32 || sc >= 127) break;
+								srcset_tmp[o2++] = (char)sc;
+							}
+							srcset_tmp[o2] = 0;
+						} else if (ieq_attr(html + an, alen, "width") && img_w == 0) {
+							img_w = parse_uint_dec_attr(html + vs, vlen);
+						} else if (ieq_attr(html + an, alen, "height") && img_h == 0) {
+							img_h = parse_uint_dec_attr(html + vs, vlen);
+						}
+					}
+					if (q && k < html_len && k < tag_end && html[k] == q) k++;
+				}
+
+				/* Prefer srcset candidate (if any) for label selection; this is also a good
+				 * future hook once decoding exists.
+				 */
+				if (srcset_tmp[0] != 0) {
+					char picked[128];
+					picked[0] = 0;
+					img_pick_from_srcset((const uint8_t *)srcset_tmp, c_strlen(srcset_tmp), picked, sizeof(picked));
+					if (picked[0] != 0) {
+						cpy_str_trunc(src_tmp, sizeof(src_tmp), picked);
+					}
+				}
+
+				int inline_img = 0;
+				if (img_w > 0 && img_h > 0 && img_w <= 32u && img_h <= 32u) inline_img = 1;
+				if (inline_img) {
+					/* Inline icon: keep layout compact. */
+					append_space_collapse(out, out_len, &o, &last_was_space);
+					append_str(out, out_len, &o, "[img]");
+					last_was_space = 0;
+					append_space_collapse(out, out_len, &o, &last_was_space);
+				} else {
+					append_newline_collapse(out, out_len, &o, &last_was_space);
+					append_str(out, out_len, &o, "+----------------------+");
+					(void)append_char(out, out_len, &o, '\n');
+					append_str(out, out_len, &o, "| IMG                 |");
+					(void)append_char(out, out_len, &o, '\n');
+					char line[96];
+					line[0] = 0;
+					if (alt_tmp[0] != 0) {
+						cpy_str_trunc(line, sizeof(line), alt_tmp);
+					} else if (src_tmp[0] != 0) {
+						char tail[64];
+						tail[0] = 0;
+						img_pick_src_tail(src_tmp, tail, sizeof(tail));
+						cpy_str_trunc(line, sizeof(line), tail);
+					}
+					if (line[0] != 0) {
+						append_str(out, out_len, &o, "| ");
+						append_str(out, out_len, &o, line);
+						(void)append_char(out, out_len, &o, '\n');
+					}
+					append_str(out, out_len, &o, "+----------------------+");
+					(void)append_char(out, out_len, &o, '\n');
+					last_was_space = 1;
+
+					/* Reserve extra vertical space if height= is known.
+					 * The renderer uses 16px rows.
+					 */
+					if (img_h > 0) {
+						uint32_t want_rows = (img_h + 15u) / 16u;
+						if (want_rows > 10u) want_rows = 10u;
+						uint32_t have_rows = (line[0] != 0) ? 4u : 3u;
+						if (want_rows > have_rows) {
+							uint32_t extra = want_rows - have_rows;
+							for (uint32_t r = 0; r < extra; r++) {
+								(void)append_char(out, out_len, &o, '\n');
+							}
+						}
+					}
+
+					append_blankline_collapse(out, out_len, &o, &last_was_space);
+				}
+
+				/* skip until '>' */
+				i = tag_end;
+				continue;
+			}
 			if (allow_output && is_heading) {
 				append_blankline_collapse(out, out_len, &o, &last_was_space);
 			} else if (allow_output && is_block) {
