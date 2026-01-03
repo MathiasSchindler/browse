@@ -1,6 +1,7 @@
 #include "tls13_client.h"
 
 #include "http.h"
+#include "http_parse.h"
 #include "net_ip6.h"
 #include "url.h"
 #include "util.h"
@@ -475,13 +476,13 @@ int tls13_https_get_status_line(int sock,
 				size_t status_line_len)
 {
 	return tls13_https_get_status_and_location(sock,
-						 host,
-						 path,
-						 status_line,
-						 status_line_len,
-						 0,
-						 0,
-						 0);
+					 host,
+					 path,
+					 status_line,
+					 status_line_len,
+					 0,
+					 0,
+					 0);
 }
 
 int tls13_https_get_status_and_location(int sock,
@@ -493,10 +494,65 @@ int tls13_https_get_status_and_location(int sock,
 					char *location_out,
 					size_t location_out_len)
 {
+	return tls13_https_get_status_location_and_body(sock,
+					 host,
+					 path,
+					 status_line,
+					 status_line_len,
+					 status_code_out,
+					 location_out,
+					 location_out_len,
+					 0,
+					 0,
+					 0,
+					 0);
+}
+
+static int tls_read_record_stream(int fd,
+				 uint8_t hdr[5],
+				 uint8_t *payload,
+				 size_t payload_cap,
+				 size_t *payload_len)
+{
+	/* Like tls_read_record, but returns 1 on clean EOF before reading a record. */
+	size_t off = 0;
+	while (off < 5) {
+		long r = sys_read(fd, hdr + off, 5 - off);
+		if (r == 0) return 1;
+		if (r < 0) return -1;
+		off += (size_t)r;
+	}
+	size_t len = ((size_t)hdr[3] << 8) | (size_t)hdr[4];
+	if (len > payload_cap) return -1;
+	off = 0;
+	while (off < len) {
+		long r = sys_read(fd, payload + off, len - off);
+		if (r <= 0) return -1;
+		off += (size_t)r;
+	}
+	*payload_len = len;
+	return 0;
+}
+
+int tls13_https_get_status_location_and_body(int sock,
+					const char *host,
+					const char *path,
+					char *status_line,
+					size_t status_line_len,
+					int *status_code_out,
+					char *location_out,
+					size_t location_out_len,
+					uint8_t *body,
+					size_t body_cap,
+					size_t *body_len_out,
+					uint64_t *content_length_out)
+{
 	if (!host || !path || !status_line || status_line_len == 0) return -1;
 	status_line[0] = 0;
 	if (status_code_out) *status_code_out = -1;
 	if (location_out && location_out_len) location_out[0] = 0;
+	if (body_len_out) *body_len_out = 0;
+	if (content_length_out) *content_length_out = 0;
 
 	/* Avoid hanging forever during bring-up. */
 	{
@@ -663,20 +719,31 @@ int tls13_https_get_status_and_location(int sock,
 	crypto_memset(req, 0, sizeof(req));
 	dbg_write("tls: HTTP request sent\n");
 
-	/* Read application data until end of HTTP headers (CRLFCRLF).
-	 * While streaming, capture:
-	 * - status line
-	 * - Location header (if present)
+	/* Read response headers, then (optionally) a bounded amount of body.
+	 * Phase 0.1: Content-Length supported; chunked not yet.
 	 */
 	char line[512];
 	size_t line_len = 0;
 	int got_status = 0;
 	int got_headers_end = 0;
-	uint8_t last = 0;
-	uint8_t crlf_state = 0; /* counts consecutive \r\n pairs */
+	uint8_t header_buf[8192];
+	size_t header_len = 0;
+	uint64_t content_len = 0;
+	int have_content_len = 0;
+	int is_chunked = 0;
+	struct http_chunked_dec chunked;
+	http_chunked_init(&chunked);
+	int chunked_done = 0;
+	size_t body_len = 0;
+
 	dbg_write("tls: waiting for HTTP response...\n");
 	for (;;) {
-		if (tls_read_record(sock, hdr, payload, sizeof(payload), &payload_len) != 0) {
+		int rr = tls_read_record_stream(sock, hdr, payload, sizeof(payload), &payload_len);
+		if (rr == 1) {
+			/* EOF: if we had no Content-Length, treat as end-of-body. */
+			break;
+		}
+		if (rr != 0) {
 			dbg_write("tls: read app record failed\n");
 			return -1;
 		}
@@ -701,56 +768,132 @@ int tls13_https_get_status_and_location(int sock,
 		}
 		if (dec_type == 0x15) return -1;
 		if (dec_type != 0x17) continue;
+
 		for (size_t i = 0; i < dec_len; i++) {
 			uint8_t b = dec[i];
 
-			/* Track CRLFCRLF */
-			if (last == '\r' && b == '\n') {
-				crlf_state++;
-			} else if (b != '\r') {
-				crlf_state = 0;
-			}
-			last = b;
-			if (crlf_state >= 2) {
-				got_headers_end = 1;
-			}
+			if (!got_headers_end) {
+				if (header_len >= sizeof(header_buf)) return -1;
+				header_buf[header_len++] = b;
 
-			/* Build current line for parsing */
-			if (line_len + 1 < sizeof(line)) {
-				line[line_len++] = (char)b;
-				line[line_len] = 0;
-			}
+				/* Build current line for parsing (headers only). */
+				if (line_len + 1 < sizeof(line)) {
+					line[line_len++] = (char)b;
+					line[line_len] = 0;
+				}
 
-			if (b == '\n') {
-				/* A full header line collected */
-				if (!got_status) {
-					/* Status line: copy without CRLF */
-					size_t n = line_len;
-					while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) n--;
-					size_t w = 0;
-					for (; w < n && w + 1 < status_line_len; w++) status_line[w] = line[w];
-					status_line[w] = 0;
-					if (status_code_out) *status_code_out = http_parse_status_code(status_line);
-					got_status = 1;
-				} else {
-					/* Header line */
-					if (location_out && location_out_len && location_out[0] == 0) {
-						char tmp[512];
-						if (http_header_extract_value(line, "Location", tmp, sizeof(tmp)) == 0) {
-							(void)c_strlcpy_s(location_out, location_out_len, tmp);
+				/* Parse line on LF. */
+				if (b == '\n') {
+					if (!got_status) {
+						size_t n = line_len;
+						while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) n--;
+						size_t w = 0;
+						for (; w < n && w + 1 < status_line_len; w++) status_line[w] = line[w];
+						status_line[w] = 0;
+						if (status_code_out) *status_code_out = http_parse_status_code(status_line);
+						got_status = 1;
+					} else {
+						if (!have_content_len) {
+							uint64_t v = 0;
+							if (http_parse_content_length_line(line, &v) == 0) {
+								have_content_len = 1;
+								content_len = v;
+							}
+						}
+						if (!is_chunked) {
+							char tmp[256];
+							if (http_header_extract_value(line, "Transfer-Encoding", tmp, sizeof(tmp)) == 0) {
+								if (http_value_has_token_ci(tmp, "chunked")) {
+									is_chunked = 1;
+								}
+							}
+						}
+						if (location_out && location_out_len && location_out[0] == 0) {
+							char tmp[512];
+							if (http_header_extract_value(line, "Location", tmp, sizeof(tmp)) == 0) {
+								(void)c_strlcpy_s(location_out, location_out_len, tmp);
+							}
+						}
+					}
+					line_len = 0;
+					line[0] = 0;
+				}
+
+				/* Check for end-of-headers and flush any already-buffered body bytes. */
+				size_t hdr_end = 0;
+				if (http_find_header_end(header_buf, header_len, &hdr_end) == 0) {
+					got_headers_end = 1;
+					size_t pre_body = header_len - hdr_end;
+					if (pre_body && body && body_cap) {
+						if (is_chunked) {
+							size_t used = 0;
+							size_t wrote = 0;
+							int r = http_chunked_feed(&chunked,
+										 header_buf + hdr_end,
+										 pre_body,
+										 &used,
+										 body + body_len,
+										 body_cap - body_len,
+										 &wrote);
+							body_len += wrote;
+							if (r < 0) return -1;
+							if (r == 1) chunked_done = 1;
+						} else {
+							size_t want = body_cap;
+							if (have_content_len && content_len < (uint64_t)want) want = (size_t)content_len;
+							size_t ncopy = pre_body;
+							if (body_len >= want) ncopy = 0;
+							else if (ncopy > want - body_len) ncopy = want - body_len;
+							if (ncopy) {
+								crypto_memcpy(body + body_len, header_buf + hdr_end, ncopy);
+								body_len += ncopy;
+							}
 						}
 					}
 				}
-
-				line_len = 0;
-				line[0] = 0;
-
-				if (got_headers_end) break;
+			} else {
+				/* Body */
+				if (body && body_cap) {
+					if (is_chunked) {
+						size_t used = 0;
+						size_t wrote = 0;
+						int r = http_chunked_feed(&chunked,
+									 &b,
+									 1,
+									 &used,
+									 body + body_len,
+									 body_cap - body_len,
+									 &wrote);
+						body_len += wrote;
+						if (r < 0) return -1;
+						if (r == 1) chunked_done = 1;
+					} else {
+						size_t want = body_cap;
+						if (have_content_len && content_len < (uint64_t)want) want = (size_t)content_len;
+						if (body_len < want) {
+							body[body_len++] = b;
+						}
+					}
+				}
 			}
 		}
-		if (got_headers_end) break;
+
+		if (got_headers_end) {
+			if (!body || body_cap == 0) break;
+			if (is_chunked) {
+				if (chunked_done) break;
+				if (body_len >= body_cap) break;
+			} else {
+				size_t want = body_cap;
+				if (have_content_len && content_len < (uint64_t)want) want = (size_t)content_len;
+				if (body_len >= want) break;
+			}
+		}
 	}
-	dbg_write("tls: got HTTP response headers\n");
+
+	if (body_len_out) *body_len_out = body_len;
+	if (content_length_out) *content_length_out = (!is_chunked && have_content_len) ? content_len : 0;
+	dbg_write("tls: got HTTP response headers/body\n");
 
 	crypto_memset(shared, 0, sizeof(shared));
 	crypto_memset(c_hs_traffic, 0, sizeof(c_hs_traffic));

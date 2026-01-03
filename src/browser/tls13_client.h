@@ -36,3 +36,22 @@ int tls13_https_get_status_and_location(int sock,
 					int *status_code_out,
 					char *location_out,
 					size_t location_out_len);
+
+/* Performs a TLS 1.3 HTTPS GET and returns response status line, Location (if any),
+ * and an initial slice of the response body.
+ *
+ * If Content-Length is present, reads up to min(Content-Length, body_cap) bytes.
+ * If Content-Length is absent, reads until close (best-effort) or until body_cap.
+ */
+int tls13_https_get_status_location_and_body(int sock,
+					const char *host,
+					const char *path,
+					char *status_line,
+					size_t status_line_len,
+					int *status_code_out,
+					char *location_out,
+					size_t location_out_len,
+					uint8_t *body,
+					size_t body_cap,
+					size_t *body_len_out,
+					uint64_t *content_length_out);
