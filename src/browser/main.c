@@ -27,6 +27,7 @@ static char g_status_bar[128];
 static char g_url_bar[URL_BUF_LEN];
 static char g_active_host[HOST_BUF_LEN];
 static struct html_links g_links;
+static struct html_spans g_spans;
 static uint32_t g_scroll_rows;
 static int g_have_page;
 
@@ -142,17 +143,51 @@ static int links_contains_index(const struct html_links *links, uint32_t idx)
 	return 0;
 }
 
-static uint32_t links_color_at_index(const struct html_links *links, uint32_t idx, uint32_t default_xrgb)
+struct link_style {
+	uint32_t fg_xrgb;
+	uint32_t bg_xrgb;
+	uint8_t has_bg;
+	uint8_t bold;
+};
+
+static struct link_style spans_style_at_index(const struct html_spans *spans, uint32_t idx, uint32_t default_fg_xrgb)
 {
-	if (!links) return default_xrgb;
+	struct link_style st;
+	st.fg_xrgb = default_fg_xrgb;
+	st.bg_xrgb = 0;
+	st.has_bg = 0;
+	st.bold = 0;
+	if (!spans) return st;
+	for (uint32_t i = 0; i < spans->n && i < HTML_MAX_SPANS; i++) {
+		const struct html_span *sp = &spans->spans[i];
+		if (idx >= sp->start && idx < sp->end) {
+			if (sp->has_fg) st.fg_xrgb = sp->fg_xrgb;
+			if (sp->has_bg) { st.has_bg = 1; st.bg_xrgb = sp->bg_xrgb; }
+			st.bold = sp->bold;
+			return st;
+		}
+	}
+	return st;
+}
+
+static struct link_style links_style_at_index(const struct html_links *links, uint32_t idx, uint32_t default_fg_xrgb)
+{
+	struct link_style st;
+	st.fg_xrgb = default_fg_xrgb;
+	st.bg_xrgb = 0;
+	st.has_bg = 0;
+	st.bold = 0;
+	if (!links) return st;
 	for (uint32_t i = 0; i < links->n && i < HTML_MAX_LINKS; i++) {
 		const struct html_link *l = &links->links[i];
 		if (idx >= l->start && idx < l->end) {
-			if (l->has_fg) return l->fg_xrgb;
-			return default_xrgb;
+			if (l->has_fg) st.fg_xrgb = l->fg_xrgb;
+			if (l->has_bg) { st.has_bg = 1; st.bg_xrgb = l->bg_xrgb; }
+			st.bold = l->bold;
+			return st;
 		}
 	}
-	return default_xrgb;
+	return st;
 }
 
 static const char *links_href_at_index(const struct html_links *links, uint32_t idx)
@@ -171,6 +206,7 @@ static void draw_line_with_links(struct shm_fb *fb,
 				 const char *line,
 				 size_t base_index,
 				 const struct html_links *links,
+				 const struct html_spans *spans,
 				 struct text_color normal,
 				 struct text_color linkc)
 {
@@ -179,31 +215,52 @@ static void draw_line_with_links(struct shm_fb *fb,
 	char seg[256];
 	uint32_t seg_x = x;
 	int seg_is_link = 0;
-	uint32_t seg_link_color = linkc.fg;
+	struct link_style seg_st;
+	seg_st.fg_xrgb = linkc.fg;
+	seg_st.bg_xrgb = 0;
+	seg_st.has_bg = 0;
+	seg_st.bold = 0;
 	uint32_t si = 0;
 	for (uint32_t i = 0; line[i] != 0; i++) {
 		uint32_t idx = (base_index > 0xffffffffu) ? 0xffffffffu : (uint32_t)(base_index + (size_t)i);
 		int is_link = links_contains_index(links, idx);
-		uint32_t lc = is_link ? links_color_at_index(links, idx, linkc.fg) : normal.fg;
-		if (i == 0) seg_is_link = is_link;
-		if (i == 0) seg_link_color = lc;
-		if (is_link != seg_is_link || (is_link && lc != seg_link_color) || si + 2 >= sizeof(seg)) {
+		struct link_style st = spans_style_at_index(spans, idx, normal.fg);
+		if (is_link) {
+			/* Links override spans. */
+			st = links_style_at_index(links, idx, linkc.fg);
+		}
+		if (i == 0) { seg_is_link = is_link; seg_st = st; }
+		if (is_link != seg_is_link ||
+		    (is_link && (st.fg_xrgb != seg_st.fg_xrgb || st.has_bg != seg_st.has_bg || st.bg_xrgb != seg_st.bg_xrgb || st.bold != seg_st.bold)) ||
+		    si + 2 >= sizeof(seg)) {
 			seg[si] = 0;
 			struct text_color c = seg_is_link ? linkc : normal;
-			if (seg_is_link) c.fg = seg_link_color;
+			c.fg = seg_st.fg_xrgb;
+			if (seg_st.has_bg) {
+				fill_rect_u32(fb->pixels, fb->stride, seg_x, y, (uint32_t)si * 8u, 16u, seg_st.bg_xrgb);
+			}
 			draw_text_u32(fb->pixels, fb->stride, seg_x, y, seg, c);
+			if (seg_st.bold) {
+				draw_text_u32(fb->pixels, fb->stride, seg_x + 1, y, seg, c);
+			}
 			seg_x += (uint32_t)si * 8u;
 			si = 0;
 			seg_is_link = is_link;
-			seg_link_color = lc;
+			seg_st = st;
 		}
 		seg[si++] = line[i];
 	}
 	if (si > 0) {
 		seg[si] = 0;
 		struct text_color c = seg_is_link ? linkc : normal;
-		if (seg_is_link) c.fg = seg_link_color;
+		c.fg = seg_st.fg_xrgb;
+		if (seg_st.has_bg) {
+			fill_rect_u32(fb->pixels, fb->stride, seg_x, y, (uint32_t)si * 8u, 16u, seg_st.bg_xrgb);
+		}
 		draw_text_u32(fb->pixels, fb->stride, seg_x, y, seg, c);
+		if (seg_st.bold) {
+			draw_text_u32(fb->pixels, fb->stride, seg_x + 1, y, seg, c);
+		}
 	}
 }
 
@@ -214,6 +271,7 @@ static void draw_body_wrapped(struct shm_fb *fb,
 				     uint32_t h_px,
 				     const char *text,
 				     const struct html_links *links,
+				     const struct html_spans *spans,
 				     struct text_color tc,
 				     struct text_color linkc,
 				     uint32_t scroll_rows)
@@ -236,7 +294,7 @@ static void draw_body_wrapped(struct shm_fb *fb,
 		size_t start = 0;
 		int r = text_layout_next_line_ex(text, &pos, max_cols, line, sizeof(line), &start);
 		if (r != 0) return;
-		draw_line_with_links(fb, x, y + row * 16u, line, start, links, tc, linkc);
+		draw_line_with_links(fb, x, y + row * 16u, line, start, links, spans, tc, linkc);
 	}
 }
 
@@ -257,7 +315,7 @@ static void render_page(struct shm_fb *fb,
 	uint32_t y0 = UI_CONTENT_Y0;
 	uint32_t h_px = (fb->height > y0) ? (fb->height - y0) : 0;
 	if (!visible_text) visible_text = "";
-	draw_body_wrapped(fb, 8, y0, w_px, h_px, visible_text, links, dim, linkc, scroll_rows);
+	draw_body_wrapped(fb, 8, y0, w_px, h_px, visible_text, links, &g_spans, dim, linkc, scroll_rows);
 	fb->hdr->frame_counter++;
 }
 
@@ -343,6 +401,7 @@ static void do_https_status(struct shm_fb *fb, char host[HOST_BUF_LEN], char pat
 	body[0] = 0;
 	g_status_bar[0] = 0;
 	g_links.n = 0;
+	g_spans.n = 0;
 	g_scroll_rows = 0;
 	g_have_page = 0;
 
@@ -448,7 +507,7 @@ static void do_https_status(struct shm_fb *fb, char host[HOST_BUF_LEN], char pat
 
 	/* Render extracted visible text (best-effort). */
 	if (body_len > 0) {
-		(void)html_visible_text_extract_links(body, body_len, g_visible, sizeof(g_visible), &g_links);
+		(void)html_visible_text_extract_links_and_spans(body, body_len, g_visible, sizeof(g_visible), &g_links, &g_spans);
 	}
 	(void)c_strlcpy_s(g_url_bar, sizeof(g_url_bar), url_bar);
 	(void)c_strlcpy_s(g_active_host, sizeof(g_active_host), host);

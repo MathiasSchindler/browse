@@ -1,4 +1,5 @@
 #include "html_text.h"
+#include "style_attr.h"
 
 static int is_ascii_space(uint8_t c)
 {
@@ -52,48 +53,76 @@ static int ieq_attr(const uint8_t *s, size_t n, const char *lit)
 	return lit[n] == 0;
 }
 
-static int hex_nibble(uint8_t c, uint8_t *out)
+static uint32_t tag_id(const uint8_t *name_buf, size_t nb)
 {
-	if (!out) return -1;
-	if (c >= '0' && c <= '9') { *out = (uint8_t)(c - '0'); return 0; }
-	if (c >= 'a' && c <= 'f') { *out = (uint8_t)(10 + (c - 'a')); return 0; }
-	if (c >= 'A' && c <= 'F') { *out = (uint8_t)(10 + (c - 'A')); return 0; }
-	return -1;
+	/* Best-effort identifier: length + first up to 3 letters. */
+	uint32_t id = ((uint32_t)nb & 0xffu) << 24;
+	if (nb > 0) id |= (uint32_t)name_buf[0];
+	if (nb > 1) id |= (uint32_t)name_buf[1] << 8;
+	if (nb > 2) id |= (uint32_t)name_buf[2] << 16;
+	return id;
 }
 
-static int parse_css_color_from_style(const uint8_t *v, size_t vlen, uint32_t *out_xrgb)
+static int style_is_default(const struct style_attr *st)
 {
-	/* Very small parser: find "color" then parse #RRGGBB. */
-	if (!v || !out_xrgb) return -1;
-	for (size_t i = 0; i + 5 < vlen; i++) {
-		/* case-insensitive match "color" */
-		uint8_t c0 = to_lower(v[i + 0]);
-		uint8_t c1 = to_lower(v[i + 1]);
-		uint8_t c2 = to_lower(v[i + 2]);
-		uint8_t c3 = to_lower(v[i + 3]);
-		uint8_t c4 = to_lower(v[i + 4]);
-		if (!(c0 == 'c' && c1 == 'o' && c2 == 'l' && c3 == 'o' && c4 == 'r')) continue;
-		size_t j = i + 5;
-		while (j < vlen && (v[j] == ' ' || v[j] == '\t')) j++;
-		if (j >= vlen || v[j] != ':') continue;
-		j++;
-		while (j < vlen && (v[j] == ' ' || v[j] == '\t')) j++;
-		if (j + 7 > vlen || v[j] != '#') continue;
-		uint8_t r1, r2, g1, g2, b1, b2;
-		if (hex_nibble(v[j + 1], &r1) != 0) continue;
-		if (hex_nibble(v[j + 2], &r2) != 0) continue;
-		if (hex_nibble(v[j + 3], &g1) != 0) continue;
-		if (hex_nibble(v[j + 4], &g2) != 0) continue;
-		if (hex_nibble(v[j + 5], &b1) != 0) continue;
-		if (hex_nibble(v[j + 6], &b2) != 0) continue;
-		uint32_t rr = (uint32_t)((r1 << 4) | r2);
-		uint32_t gg = (uint32_t)((g1 << 4) | g2);
-		uint32_t bb = (uint32_t)((b1 << 4) | b2);
-		*out_xrgb = 0xff000000u | (rr << 16) | (gg << 8) | bb;
-		return 0;
-	}
-	return -1;
+	if (!st) return 1;
+	return (!st->has_color && !st->has_bg && !st->bold);
 }
+
+static int style_eq(const struct style_attr *a, const struct style_attr *b)
+{
+	if (a == b) return 1;
+	if (!a || !b) return 0;
+	if (a->has_color != b->has_color) return 0;
+	if (a->has_bg != b->has_bg) return 0;
+	if (a->bold != b->bold) return 0;
+	if (a->has_color && a->color_xrgb != b->color_xrgb) return 0;
+	if (a->has_bg && a->bg_xrgb != b->bg_xrgb) return 0;
+	return 1;
+}
+
+static void spans_emit(struct html_spans *out_spans, uint32_t start, uint32_t end, const struct style_attr *st)
+{
+	if (!out_spans || !st) return;
+	if (start >= end) return;
+	if (style_is_default(st)) return;
+	if (out_spans->n >= HTML_MAX_SPANS) return;
+	struct html_span *sp = &out_spans->spans[out_spans->n++];
+	sp->start = start;
+	sp->end = end;
+	sp->has_fg = st->has_color;
+	sp->fg_xrgb = st->color_xrgb;
+	sp->has_bg = st->has_bg;
+	sp->bg_xrgb = st->bg_xrgb;
+	sp->bold = st->bold;
+}
+
+static void spans_switch(struct html_spans *out_spans,
+				 size_t o,
+				 int *io_span_active,
+				 uint32_t *io_span_start,
+				 struct style_attr *io_span_style,
+				 const struct style_attr *new_style)
+{
+	if (!out_spans || !io_span_active || !io_span_start || !io_span_style || !new_style) return;
+	uint32_t oi = (o > 0xffffffffu) ? 0xffffffffu : (uint32_t)o;
+	int new_active = !style_is_default(new_style);
+	if (!*io_span_active) {
+		if (new_active) {
+			*io_span_active = 1;
+			*io_span_start = oi;
+			*io_span_style = *new_style;
+		}
+		return;
+	}
+	/* span is active */
+	if (style_eq(io_span_style, new_style)) return;
+	spans_emit(out_spans, *io_span_start, oi, io_span_style);
+	*io_span_active = new_active;
+	*io_span_start = oi;
+	*io_span_style = *new_style;
+}
+
 
 static int append_char(char *out, size_t out_len, size_t *io, char c)
 {
@@ -221,7 +250,8 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 					 size_t html_len,
 					 char *out,
 					 size_t out_len,
-					 struct html_links *out_links)
+					 struct html_links *out_links,
+					 struct html_spans *out_spans)
 {
 	if (!out || out_len == 0) return -1;
 	out[0] = 0;
@@ -233,7 +263,22 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 			out_links->links[i].end = 0;
 			out_links->links[i].fg_xrgb = 0;
 			out_links->links[i].has_fg = 0;
+			out_links->links[i].bg_xrgb = 0;
+			out_links->links[i].has_bg = 0;
+			out_links->links[i].bold = 0;
 			out_links->links[i].href[0] = 0;
+		}
+	}
+	if (out_spans) {
+		out_spans->n = 0;
+		for (size_t i = 0; i < HTML_MAX_SPANS; i++) {
+			out_spans->spans[i].start = 0;
+			out_spans->spans[i].end = 0;
+			out_spans->spans[i].fg_xrgb = 0;
+			out_spans->spans[i].has_fg = 0;
+			out_spans->spans[i].bg_xrgb = 0;
+			out_spans->spans[i].has_bg = 0;
+			out_spans->spans[i].bold = 0;
 		}
 	}
 
@@ -248,6 +293,20 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 	a_href[0] = 0;
 	uint32_t a_fg_xrgb = 0;
 	uint8_t a_has_fg = 0;
+	uint32_t a_bg_xrgb = 0;
+	uint8_t a_has_bg = 0;
+	uint8_t a_bold = 0;
+
+	/* Inline style spans (subset) for non-link content. */
+	struct style_attr cur_style;
+	c_memset(&cur_style, 0, sizeof(cur_style));
+	struct style_attr style_stack[16];
+	uint32_t tag_stack[16];
+	uint32_t style_depth = 0;
+	int span_active = 0;
+	uint32_t span_start = 0;
+	struct style_attr span_style;
+	c_memset(&span_style, 0, sizeof(span_style));
 
 	for (size_t i = 0; i < html_len; i++) {
 		uint8_t c = html[i];
@@ -316,18 +375,24 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 						ln->end = (o > 0xffffffffu) ? 0xffffffffu : (uint32_t)o;
 						ln->fg_xrgb = a_fg_xrgb;
 						ln->has_fg = a_has_fg;
+						ln->bg_xrgb = a_bg_xrgb;
+						ln->has_bg = a_has_bg;
+						ln->bold = a_bold;
 						cpy_str_trunc(ln->href, sizeof(ln->href), a_href);
 					}
 					in_a = 0;
 					a_href[0] = 0;
 					a_has_fg = 0;
 					a_fg_xrgb = 0;
+					a_has_bg = 0;
+					a_bg_xrgb = 0;
+					a_bold = 0;
 				} else {
 					/* Parse href=... within the tag. */
 					char href_tmp[HTML_HREF_MAX];
 					href_tmp[0] = 0;
-					uint32_t fg_tmp = 0;
-					uint8_t has_fg_tmp = 0;
+					struct style_attr st;
+					c_memset(&st, 0, sizeof(st));
 					size_t k = j;
 					while (k < html_len && html[k] != '>') {
 						while (k < html_len && is_ascii_space(html[k])) k++;
@@ -368,9 +433,7 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 								href_tmp[w] = 0;
 							}
 							if (ieq_attr(html + an, alen, "style") && vlen > 0) {
-								if (parse_css_color_from_style(html + vs, vlen, &fg_tmp) == 0) {
-									has_fg_tmp = 1;
-								}
+								(void)style_attr_parse_inline(html + vs, vlen, &st);
 							}
 						}
 						if (k < html_len && html[k] != '>') k++;
@@ -379,8 +442,76 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 						in_a = 1;
 						a_start = (o > 0xffffffffu) ? 0xffffffffu : (uint32_t)o;
 						cpy_str_trunc(a_href, sizeof(a_href), href_tmp);
-							a_has_fg = has_fg_tmp;
-							a_fg_xrgb = fg_tmp;
+						a_has_fg = st.has_color;
+						a_fg_xrgb = st.color_xrgb;
+						a_has_bg = st.has_bg;
+						a_bg_xrgb = st.bg_xrgb;
+						a_bold = st.bold;
+					}
+				}
+			}
+
+			/* Non-link inline styles (subset): capture ranges for style="..." and <b>/<strong>. */
+			if (out_spans && !(nb == 1 && name_buf[0] == 'a')) {
+				uint32_t id = tag_id(name_buf, nb);
+				if (is_end) {
+					if (style_depth > 0 && tag_stack[style_depth - 1] == id) {
+						cur_style = style_stack[style_depth - 1];
+						style_depth--;
+						spans_switch(out_spans, o, &span_active, &span_start, &span_style, &cur_style);
+					}
+				} else {
+					struct style_attr st;
+					c_memset(&st, 0, sizeof(st));
+					int have_any = 0;
+					/* Bold tags without style attribute. */
+					if ((nb == 1 && name_buf[0] == 'b') || (nb == 6 && ieq_lit_n(name_buf, nb, "strong"))) {
+						st.bold = 1;
+						have_any = 1;
+					}
+					/* Parse style=... within the tag. */
+					size_t k = j;
+					while (k < html_len && html[k] != '>') {
+						while (k < html_len && is_ascii_space(html[k])) k++;
+						size_t an = k;
+						while (k < html_len && (is_alpha(html[k]) || html[k] == '-' || html[k] == '_')) k++;
+						size_t alen = k - an;
+						while (k < html_len && is_ascii_space(html[k])) k++;
+						if (alen == 0) {
+							k++;
+							continue;
+						}
+						if (k < html_len && html[k] == '=') {
+							k++;
+							while (k < html_len && is_ascii_space(html[k])) k++;
+							uint8_t q = 0;
+							if (k < html_len && (html[k] == '"' || html[k] == '\'')) {
+								q = html[k];
+								k++;
+							}
+							size_t vs = k;
+							if (q) {
+								while (k < html_len && html[k] != q) k++;
+							} else {
+								while (k < html_len && !is_ascii_space(html[k]) && html[k] != '>') k++;
+							}
+							size_t vlen = (k > vs) ? (k - vs) : 0;
+							if (ieq_attr(html + an, alen, "style") && vlen > 0) {
+								(void)style_attr_parse_inline(html + vs, vlen, &st);
+								have_any = 1;
+							}
+						}
+						if (k < html_len && html[k] != '>') k++;
+					}
+					if (have_any && style_depth < (sizeof(style_stack) / sizeof(style_stack[0]))) {
+						/* Push current style, then apply overrides. */
+						style_stack[style_depth] = cur_style;
+						tag_stack[style_depth] = id;
+						style_depth++;
+						if (st.has_color) { cur_style.has_color = 1; cur_style.color_xrgb = st.color_xrgb; }
+						if (st.has_bg) { cur_style.has_bg = 1; cur_style.bg_xrgb = st.bg_xrgb; }
+						if (st.bold) { cur_style.bold = 1; }
+						spans_switch(out_spans, o, &span_active, &span_start, &span_style, &cur_style);
 					}
 				}
 			}
@@ -398,10 +529,21 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 							if (out_links) {
 								out_links->n = 0;
 							}
+							if (out_spans) {
+								out_spans->n = 0;
+							}
+							span_active = 0;
+							span_start = 0;
+							c_memset(&cur_style, 0, sizeof(cur_style));
+							c_memset(&span_style, 0, sizeof(span_style));
+							style_depth = 0;
 							in_a = 0;
 							a_href[0] = 0;
 							a_has_fg = 0;
 							a_fg_xrgb = 0;
+							a_has_bg = 0;
+							a_bg_xrgb = 0;
+							a_bold = 0;
 						}
 						seen_main = 1;
 						in_main = 1;
@@ -487,15 +629,43 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 	while (o > 0 && (out[o - 1] == ' ' || out[o - 1] == '\n')) {
 		out[--o] = 0;
 	}
+
+	/* Close any open span and clamp spans to the final trimmed length. */
+	if (out_spans) {
+		if (span_active) {
+			spans_emit(out_spans, span_start, (o > 0xffffffffu) ? 0xffffffffu : (uint32_t)o, &span_style);
+			span_active = 0;
+		}
+		uint32_t end = (o > 0xffffffffu) ? 0xffffffffu : (uint32_t)o;
+		uint32_t w = 0;
+		for (uint32_t r = 0; r < out_spans->n && r < HTML_MAX_SPANS; r++) {
+			struct html_span sp = out_spans->spans[r];
+			if (sp.start >= end) continue;
+			if (sp.end > end) sp.end = end;
+			if (sp.start >= sp.end) continue;
+			out_spans->spans[w++] = sp;
+		}
+		out_spans->n = w;
+	}
 	return 0;
 }
 
 int html_visible_text_extract(const uint8_t *html, size_t html_len, char *out, size_t out_len)
 {
-	return html_visible_text_extract_impl(html, html_len, out, out_len, 0);
+	return html_visible_text_extract_impl(html, html_len, out, out_len, 0, 0);
 }
 
 int html_visible_text_extract_links(const uint8_t *html, size_t html_len, char *out, size_t out_len, struct html_links *out_links)
 {
-	return html_visible_text_extract_impl(html, html_len, out, out_len, out_links);
+	return html_visible_text_extract_impl(html, html_len, out, out_len, out_links, 0);
+}
+
+int html_visible_text_extract_links_and_spans(const uint8_t *html,
+					  size_t html_len,
+					  char *out,
+					  size_t out_len,
+					  struct html_links *out_links,
+					  struct html_spans *out_spans)
+{
+	return html_visible_text_extract_impl(html, html_len, out, out_len, out_links, out_spans);
 }

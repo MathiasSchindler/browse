@@ -162,6 +162,11 @@ Tests
 - `tools/test_style_attr.c`:
   - parse `color` and apply to span range
 
+Status
+- Implemented `src/browser/style_attr.h/.c` with a forgiving parser for `color`, `background-color`, and `font-weight:bold`.
+- Wired `<a style="...">` extraction to capture `fg_xrgb`/`bg_xrgb`/`bold` into the link table; renderer now respects link `background-color` and emulates bold by double-drawing.
+- Extended extraction/rendering to support non-link inline styles as spans (e.g. `<p style="...">`, `<span style="...">`, `<b>/<strong>`), with deterministic tests.
+
 ### Step 4.2: Support `<style>` blocks (tiny CSS parser)
 Implement a tiny CSS tokenizer/parser:
 - selectors: tag selectors only (`p`, `a`, `h1`)
