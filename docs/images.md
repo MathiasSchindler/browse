@@ -157,6 +157,17 @@ Outcome
 
 ## Phase 4 — JPEG (baseline)
 
+### Phase 4.0 — JPEG header only (dimensions first)
+Before decoding pixels, implement a tiny JPEG header parser that can extract
+width/height from SOF markers. Use this to improve placeholders (e.g. show
+`800x600`, and later drive better layout reservation).
+
+Where
+- `src/browser/image/jpeg.h/.c`
+
+Outcome
+- Better placeholders without committing to full JPEG decode yet.
+
 Why
 - Photographs on Wikimedia are overwhelmingly JPEG.
 
@@ -164,7 +175,7 @@ Scope
 - Baseline DCT JPEG (no progressive, no CMYK initially).
 
 Implementation
-- New module: `src/browser/jpeg.h/.c`
+- New module: `src/browser/image/jpeg.h/.c`
 - Huffman decode + IDCT.
 - Convert YCbCr to RGB.
 
@@ -207,10 +218,12 @@ Future refinement
 
 ## Proposed file/module layout
 
+- `src/browser/image/` — image-related modules (sniffing, parsers, decoders)
+
 - `src/browser/image_cache.h/.c` — URL→image handle, state machine, memory caps
 - `src/browser/deflate.h/.c` — zlib/deflate decompressor
 - `src/browser/png.h/.c` — PNG parser + unfilter + RGBA→XRGB
-- `src/browser/jpeg.h/.c` — baseline JPEG decoder
+- `src/browser/image/jpeg.h/.c` — JPEG header parser + later baseline JPEG decoder
 - `src/browser/flow.h/.c` — HTML extraction output as flow items (TEXT/IMAGE)
 - `src/browser/text_layout.c` — accept flow items; produce draw ops for placeholders/images
 - `src/browser/main.c` — drive fetch/decode steps and rerender on completion

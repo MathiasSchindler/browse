@@ -9,6 +9,8 @@
 #include "html_text.h"
 #include "text_layout.h"
 
+#include "image/jpeg.h"
+
 #define FB_W 1920u
 #define FB_H 1080u
 
@@ -18,8 +20,8 @@
 
 enum {
 	HOST_BUF_LEN = 128,
-	PATH_BUF_LEN = 512,
-	URL_BUF_LEN = 640,
+	PATH_BUF_LEN = 2048,
+	URL_BUF_LEN = 2304,
 };
 
 static char g_visible[512 * 1024];
@@ -44,11 +46,16 @@ struct img_sniff_cache_entry {
 	uint8_t used;
 	uint8_t state; /* 0=empty, 1=pending, 2=done */
 	enum img_fmt fmt;
+	uint8_t has_dims;
+	uint16_t w;
+	uint16_t h;
 	uint32_t hash;
 	char key[256]; /* usually "host|/path" (truncated) */
 };
 
 static struct img_sniff_cache_entry g_img_sniff_cache[32];
+
+static uint8_t g_img_sniff_buf[4096];
 
 static uint32_t hash32_fnv1a(const char *s)
 {
@@ -124,6 +131,31 @@ static const char *img_fmt_token(enum img_fmt fmt)
 		case IMG_FMT_SVG: return "SVG";
 		default: return "?";
 	}
+}
+
+static struct img_sniff_cache_entry *img_cache_find_done(const char *active_host, const char *url)
+{
+	if (!active_host || !active_host[0] || !url || !url[0]) return 0;
+	char host[HOST_BUF_LEN];
+	char path[PATH_BUF_LEN];
+	if (url_apply_location(active_host, url, host, sizeof(host), path, sizeof(path)) != 0) return 0;
+
+	char key[256];
+	key[0] = 0;
+	(void)c_strlcpy_s(key, sizeof(key), host);
+	{
+		size_t o = c_strnlen_s(key, sizeof(key));
+		if (o + 1 < sizeof(key)) key[o++] = '|';
+		for (size_t i = 0; path[i] && o + 1 < sizeof(key); i++) key[o++] = path[i];
+		key[o] = 0;
+	}
+	uint32_t h = hash32_fnv1a(key);
+	for (size_t i = 0; i < sizeof(g_img_sniff_cache) / sizeof(g_img_sniff_cache[0]); i++) {
+		struct img_sniff_cache_entry *e = &g_img_sniff_cache[i];
+		if (!e->used || e->state != 2) continue;
+		if (e->hash == h && streq(e->key, key)) return e;
+	}
+	return 0;
 }
 
 static int https_get_prefix_follow_redirects(const char *host_in, const char *path_in, uint8_t *out, size_t out_cap, size_t *out_len)
@@ -242,6 +274,9 @@ static enum img_fmt img_cache_get_or_mark_pending(const char *active_host, const
 			e->used = 1;
 			e->state = 1;
 			e->fmt = IMG_FMT_UNKNOWN;
+			e->has_dims = 0;
+			e->w = 0;
+			e->h = 0;
 			e->hash = h;
 			(void)c_strlcpy_s(e->key, sizeof(e->key), key);
 			break;
@@ -255,6 +290,9 @@ static int img_sniff_pump_one(void)
 	for (size_t i = 0; i < sizeof(g_img_sniff_cache) / sizeof(g_img_sniff_cache[0]); i++) {
 		struct img_sniff_cache_entry *e = &g_img_sniff_cache[i];
 		if (!e->used || e->state != 1) continue;
+		e->has_dims = 0;
+		e->w = 0;
+		e->h = 0;
 
 		char host[HOST_BUF_LEN];
 		char path[PATH_BUF_LEN];
@@ -264,14 +302,21 @@ static int img_sniff_pump_one(void)
 			return 1;
 		}
 
-		uint8_t prefix[96];
 		size_t got = 0;
-		if (https_get_prefix_follow_redirects(host, path, prefix, sizeof(prefix), &got) != 0) {
+		if (https_get_prefix_follow_redirects(host, path, g_img_sniff_buf, sizeof(g_img_sniff_buf), &got) != 0) {
 			e->fmt = IMG_FMT_UNKNOWN;
 			e->state = 2;
 			return 1;
 		}
-		e->fmt = img_fmt_from_sniff(prefix, got);
+		e->fmt = img_fmt_from_sniff(g_img_sniff_buf, got);
+		if (e->fmt == IMG_FMT_JPG) {
+			uint32_t w = 0, h = 0;
+			if (jpeg_get_dimensions(g_img_sniff_buf, got, &w, &h) == 0) {
+				e->has_dims = 1;
+				e->w = (w > 0xffffu) ? 0xffffu : (uint16_t)w;
+				e->h = (h > 0xffffu) ? 0xffffu : (uint16_t)h;
+			}
+		}
 		e->state = 2;
 		return 1;
 	}
@@ -557,11 +602,12 @@ static void draw_body_wrapped(struct shm_fb *fb,
 
 	struct {
 		uint32_t rows_left;
+		struct img_sniff_cache_entry *entry;
 	} img_box = {0};
 
 	/* Skip scroll_rows lines by running the layout forward. */
 	size_t pos = 0;
-	char line[256];
+	char line[1024];
 	for (uint32_t s = 0; s < scroll_rows; s++) {
 		int r = text_layout_next_line(text, &pos, max_cols, line, sizeof(line));
 		if (r != 0) break;
@@ -604,6 +650,7 @@ static void draw_body_wrapped(struct shm_fb *fb,
 				}
 			}
 			enum img_fmt sniffed = img_cache_get_or_mark_pending(active_host, url ? url : "");
+			img_box.entry = img_cache_find_done(active_host, url ? url : "");
 			const char *fmt = img_fmt_token(sniffed);
 			if (rows < 2u) rows = 2u;
 			if (rows > 10u) rows = 10u;
@@ -644,6 +691,23 @@ static void draw_body_wrapped(struct shm_fb *fb,
 				draw_text_u32(fb->pixels, fb->stride, label_x, row_y + 6u, fmt, fmtc);
 				label_x += 8u * 5u; /* fmt + space */
 				label_w = (label_w > 8u * 5u) ? (label_w - 8u * 5u) : 0u;
+			}
+			if (img_box.entry && img_box.entry->has_dims && label_w >= 8u * 6u) {
+				char wdec[11];
+				char hdec[11];
+				u32_to_dec(wdec, (uint32_t)img_box.entry->w);
+				u32_to_dec(hdec, (uint32_t)img_box.entry->h);
+				char dims[32];
+				size_t di = 0;
+				for (size_t ii = 0; wdec[ii] && di + 1 < sizeof(dims); ii++) dims[di++] = wdec[ii];
+				if (di + 1 < sizeof(dims)) dims[di++] = 'x';
+				for (size_t ii = 0; hdec[ii] && di + 1 < sizeof(dims); ii++) dims[di++] = hdec[ii];
+				if (di + 1 < sizeof(dims)) dims[di++] = ' ';
+				dims[di] = 0;
+				draw_text_u32(fb->pixels, fb->stride, label_x, row_y + 6u, dims, fmtc);
+				uint32_t adv = (uint32_t)di * 8u;
+				label_x += adv;
+				label_w = (label_w > adv) ? (label_w - adv) : 0u;
 			}
 			draw_text_clipped_u32(fb->pixels, fb->stride, label_x, row_y + 6u, label_w, label, tc);
 			img_box.rows_left = (rows > 0) ? (rows - 1u) : 0u;
@@ -890,9 +954,9 @@ int main(void)
 		}
 	}
 
-	char host[128];
-	char path[512];
-	char url_bar[640];
+	char host[HOST_BUF_LEN];
+	char path[PATH_BUF_LEN];
+	char url_bar[URL_BUF_LEN];
 	(void)c_strlcpy_s(host, sizeof(host), "de.wikipedia.org");
 	(void)c_strlcpy_s(path, sizeof(path), "/");
 	compose_url_bar(url_bar, sizeof(url_bar), host, path);

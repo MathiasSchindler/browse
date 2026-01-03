@@ -36,6 +36,29 @@ int text_layout_next_line_ex(const char *text,
 	while (text[pos] == '\r') pos++;
 	if (out_src_start) *out_src_start = pos;
 
+	/* Special non-text rows (e.g. image placeholder markers) must not be wrapped
+	 * at max_cols, because they may contain an out-of-band payload (like a URL)
+	 * used by the renderer.
+	 */
+	if (text[pos] == (char)0x1e) {
+		size_t src_i = pos;
+		size_t o = 0;
+		while (text[src_i] != 0 && text[src_i] != '\n') {
+			char c = text[src_i];
+			if (c == '\r') {
+				src_i++;
+				continue;
+			}
+			if (o + 1 >= out_cap) break;
+			out_line[o++] = c;
+			src_i++;
+		}
+		out_line[o] = 0;
+		if (text[src_i] == '\n') src_i++;
+		*io_pos = src_i;
+		return 0;
+	}
+
 	uint32_t cols = 0;
 	size_t src_i = pos;
 	size_t last_space_src = (size_t)-1;

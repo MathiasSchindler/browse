@@ -1102,8 +1102,8 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 			 */
 			if (allow_output && !is_end && nb == 3 && ieq_lit_n(name_buf, nb, "img")) {
 				char alt_tmp[64];
-				char src_tmp[128];
-				char srcset_tmp[256];
+				char src_tmp[512];
+				char srcset_tmp[512];
 				uint32_t img_w = 0;
 				uint32_t img_h = 0;
 				alt_tmp[0] = 0;
@@ -1189,7 +1189,7 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 				 * future hook once decoding exists.
 				 */
 				if (srcset_tmp[0] != 0) {
-					char picked[128];
+					char picked[512];
 					picked[0] = 0;
 					img_pick_from_srcset((const uint8_t *)srcset_tmp, c_strlen(srcset_tmp), picked, sizeof(picked));
 					if (picked[0] != 0) {
