@@ -61,7 +61,7 @@ TLS_SRCS := \
 	src/tls/gcm.c \
 	src/tls/selftest.c
 
-BROWSER_SRCS := src/core/start.S src/browser/main.c src/browser/http.c src/browser/tls13_client.c $(TLS_SRCS)
+BROWSER_SRCS := src/core/start.S src/browser/main.c src/browser/http.c src/browser/tls13_client.c src/browser/html_text.c $(TLS_SRCS)
 BROWSER_BIN := build/browser
 BROWSER_CFLAGS := $(CORE_CFLAGS) -DTEXT_LOG_MISSING_GLYPHS
 
@@ -113,13 +113,14 @@ TEST_X25519_BIN := build/test_x25519
 TEST_HTTP_BIN := build/test_http
 TEST_HTTP_PARSE_BIN := build/test_http_parse
 TEST_CHUNKED_BIN := build/test_chunked
+TEST_VISIBLE_TEXT_BIN := build/test_visible_text
 TEST_TEXT_FONT_BIN := build/test_text_font
 TEST_REDIRECT_BIN := build/test_redirect
 
 # Build (but do not run) all test binaries.
-tests: build $(TEST_CRYPTO_BIN) $(TEST_NET_IPV6_BIN) $(TEST_HTTP_BIN) $(TEST_HTTP_PARSE_BIN) $(TEST_CHUNKED_BIN) $(TEST_TEXT_FONT_BIN) $(TEST_X25519_BIN) $(TEST_REDIRECT_BIN)
+tests: build $(TEST_CRYPTO_BIN) $(TEST_NET_IPV6_BIN) $(TEST_HTTP_BIN) $(TEST_HTTP_PARSE_BIN) $(TEST_CHUNKED_BIN) $(TEST_VISIBLE_TEXT_BIN) $(TEST_TEXT_FONT_BIN) $(TEST_X25519_BIN) $(TEST_REDIRECT_BIN)
 
-test: test-crypto test-net-ipv6 test-http test-http-parse test-chunked test-text-font test-redirect
+test: test-crypto test-net-ipv6 test-http test-http-parse test-chunked test-visible-text test-text-font test-redirect
 
 test-x25519: build $(TEST_X25519_BIN)
 	./$(TEST_X25519_BIN)
@@ -167,6 +168,14 @@ $(TEST_CHUNKED_BIN): tools/test_chunked.c src/browser/http_parse.h src/browser/u
 
 $(TEST_CHUNKED_BIN): FORCE
 
+test-visible-text: build $(TEST_VISIBLE_TEXT_BIN)
+	./$(TEST_VISIBLE_TEXT_BIN)
+
+$(TEST_VISIBLE_TEXT_BIN): tools/test_visible_text.c src/browser/html_text.c src/browser/html_text.h src/browser/util.h src/core/syscall.h
+	$(CC) $(CFLAGS_COMMON) -Isrc -o $@ tools/test_visible_text.c src/browser/html_text.c
+
+$(TEST_VISIBLE_TEXT_BIN): FORCE
+
 test-text-font: build $(TEST_TEXT_FONT_BIN)
 	./$(TEST_TEXT_FONT_BIN)
 
@@ -194,7 +203,7 @@ clean:
 	rm -f $(CORE_BIN) $(CORE_BIN).debug
 	rm -f $(BROWSER_BIN) $(BROWSER_BIN).debug
 	rm -f $(INPUTD_BIN) $(INPUTD_BIN).debug
-	rm -f $(TEST_CRYPTO_BIN) $(TEST_NET_IPV6_BIN) $(TEST_HTTP_BIN) $(TEST_HTTP_PARSE_BIN) $(TEST_CHUNKED_BIN) $(TEST_X25519_BIN) $(TEST_TEXT_FONT_BIN) $(TEST_REDIRECT_BIN)
+	rm -f $(TEST_CRYPTO_BIN) $(TEST_NET_IPV6_BIN) $(TEST_HTTP_BIN) $(TEST_HTTP_PARSE_BIN) $(TEST_CHUNKED_BIN) $(TEST_VISIBLE_TEXT_BIN) $(TEST_X25519_BIN) $(TEST_TEXT_FONT_BIN) $(TEST_REDIRECT_BIN)
 	rm -f build/*.debug
 	rm -f $(VIEWER_BIN)
 	@true

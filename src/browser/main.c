@@ -6,6 +6,7 @@
 
 #include "../tls/selftest.h"
 #include "tls13_client.h"
+#include "html_text.h"
 
 #define FB_W 1920u
 #define FB_H 1080u
@@ -105,6 +106,55 @@ static void draw_ui(struct shm_fb *fb, const char *active_host, const char *url_
 	draw_text_u32(fb->pixels, fb->stride, 8, 72, line3, dim);
 }
 
+static void draw_body_wrapped(struct shm_fb *fb, uint32_t x, uint32_t y, uint32_t w_px, uint32_t h_px, const char *text, struct text_color tc)
+{
+	if (!fb || !text) return;
+	uint32_t max_cols = (w_px / 8u);
+	uint32_t max_rows = (h_px / 16u);
+	if (max_cols == 0 || max_rows == 0) return;
+	if (max_cols > 255) max_cols = 255;
+
+	uint32_t row = 0;
+	uint32_t col = 0;
+	char line[256];
+	uint32_t li = 0;
+	for (size_t i = 0; text[i] != 0; i++) {
+		char c = text[i];
+		if (c == '\r') continue;
+		if (c == '\n') {
+			line[li] = 0;
+			draw_text_u32(fb->pixels, fb->stride, x, y + row * 16u, line, tc);
+			row++;
+			col = 0;
+			li = 0;
+			if (row >= max_rows) return;
+			continue;
+		}
+		if (li + 1 >= sizeof(line)) {
+			line[li] = 0;
+			draw_text_u32(fb->pixels, fb->stride, x, y + row * 16u, line, tc);
+			row++;
+			col = 0;
+			li = 0;
+			if (row >= max_rows) return;
+		}
+		line[li++] = c;
+		col++;
+		if (col >= max_cols) {
+			line[li] = 0;
+			draw_text_u32(fb->pixels, fb->stride, x, y + row * 16u, line, tc);
+			row++;
+			col = 0;
+			li = 0;
+			if (row >= max_rows) return;
+		}
+	}
+	if (li > 0 && row < max_rows) {
+		line[li] = 0;
+		draw_text_u32(fb->pixels, fb->stride, x, y + row * 16u, line, tc);
+	}
+}
+
 enum ui_action {
 	UI_NONE = 0,
 	UI_GO_EN = 1,
@@ -147,6 +197,15 @@ static void compose_url_bar(char *out, size_t out_len, const char *host, const c
 
 static void do_https_status(struct shm_fb *fb, char host[HOST_BUF_LEN], char path[PATH_BUF_LEN], char url_bar[URL_BUF_LEN])
 {
+	static uint8_t body[96 * 1024];
+	static char visible[64 * 1024];
+	size_t body_len = 0;
+	uint64_t content_len = 0;
+	char final_status[128];
+	final_status[0] = 0;
+	visible[0] = 0;
+	body[0] = 0;
+
 	for (int step = 0; step < 6; step++) {
 		compose_url_bar(url_bar, URL_BUF_LEN, host, path);
 		draw_ui(fb, host, url_bar, "Resolving AAAA via Google DNS v6 ...", host, path);
@@ -194,7 +253,18 @@ static void do_https_status(struct shm_fb *fb, char host[HOST_BUF_LEN], char pat
 		char status[128];
 		char location[512];
 		int status_code = -1;
-		int rc = tls13_https_get_status_and_location(sock, host, path, status, sizeof(status), &status_code, location, sizeof(location));
+		int rc = tls13_https_get_status_location_and_body(sock,
+									 host,
+									 path,
+									 status,
+									 sizeof(status),
+									 &status_code,
+									 location,
+									 sizeof(location),
+									 body,
+									 sizeof(body),
+									 &body_len,
+									 &content_len);
 		sys_close(sock);
 
 		if (rc != 0) {
@@ -215,6 +285,8 @@ static void do_https_status(struct shm_fb *fb, char host[HOST_BUF_LEN], char pat
 
 		compose_url_bar(url_bar, URL_BUF_LEN, host, path);
 		draw_ui(fb, host, url_bar, line1, status, (location[0] ? location : path));
+		/* If this is not a redirect, keep the body we just fetched. */
+		(void)c_strlcpy_s(final_status, sizeof(final_status), status);
 		fb->hdr->frame_counter++;
 
 		int is_redirect = (status_code == 301 || status_code == 302 || status_code == 303 || status_code == 307 || status_code == 308);
@@ -231,6 +303,19 @@ static void do_https_status(struct shm_fb *fb, char host[HOST_BUF_LEN], char pat
 		(void)c_strlcpy_s(path, PATH_BUF_LEN, new_path);
 	}
 	compose_url_bar(url_bar, URL_BUF_LEN, host, path);
+
+	/* Render extracted visible text (best-effort). */
+	if (body_len > 0) {
+		(void)html_visible_text_extract(body, body_len, visible, sizeof(visible));
+	}
+	struct text_color dim = { .fg = 0xffb0b0b0u, .bg = 0, .opaque_bg = 0 };
+	draw_ui(fb, host, url_bar, "HTTP done", final_status[0] ? final_status : "", (visible[0] ? "Rendering visible text..." : "(no body)"));
+	/* Clear body area below status lines and draw content. */
+	fill_rect_u32(fb->pixels, fb->stride, 0, 88, fb->width, (fb->height > 88) ? (fb->height - 88) : 0, 0xff101014u);
+	uint32_t w_px = (fb->width > 16) ? (fb->width - 16) : 0;
+	uint32_t h_px = (fb->height > 96) ? (fb->height - 96) : 0;
+	draw_body_wrapped(fb, 8, 96, w_px, h_px, visible, dim);
+	fb->hdr->frame_counter++;
 }
 
 int main(void)
