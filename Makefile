@@ -29,12 +29,13 @@ TLS_SRCS := \
 	src/tls/gcm.c \
 	src/tls/selftest.c
 
-BROWSER_SRCS := src/core/start.S src/browser/main.c $(TLS_SRCS)
+BROWSER_SRCS := src/core/start.S src/browser/main.c src/browser/http.c $(TLS_SRCS)
 BROWSER_BIN := build/browser
 BROWSER_CFLAGS := $(CORE_CFLAGS) -DTEXT_LOG_MISSING_GLYPHS
 
 .PHONY: all core browser test test-crypto clean clean-all viewer
 .PHONY: test-x25519
+.PHONY: test-http
 
 .PHONY: FORCE
 FORCE:
@@ -57,8 +58,9 @@ $(BROWSER_BIN): $(BROWSER_SRCS)
 TEST_CRYPTO_BIN := build/test_crypto
 TEST_NET_IPV6_BIN := build/test_net_ipv6
 TEST_X25519_BIN := build/test_x25519
+TEST_HTTP_BIN := build/test_http
 
-test: test-crypto test-net-ipv6
+test: test-crypto test-net-ipv6 test-http
 
 test-x25519: build $(TEST_X25519_BIN)
 	./$(TEST_X25519_BIN)
@@ -81,6 +83,14 @@ $(TEST_NET_IPV6_BIN): tools/test_net_ipv6.c
 	$(CC) $(CFLAGS_COMMON) -o $@ $<
 
 $(TEST_NET_IPV6_BIN): FORCE
+
+test-http: build $(TEST_HTTP_BIN)
+	./$(TEST_HTTP_BIN)
+
+$(TEST_HTTP_BIN): tools/test_http.c src/browser/http.c src/browser/http.h
+	$(CC) $(CFLAGS_COMMON) -Isrc -o $@ tools/test_http.c src/browser/http.c
+
+$(TEST_HTTP_BIN): FORCE
 
 # Optional dev viewer: needs libsdl2-dev
 VIEWER_BIN := build/viewer
