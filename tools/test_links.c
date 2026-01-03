@@ -68,6 +68,16 @@ int main(void)
 		if (links.links[0].bg_xrgb != 0xff0011aau) return 1;
 		if (!links.links[0].bold) return 1;
 	}
+	{
+		char out[256];
+		memset(out, 0, sizeof(out));
+		struct html_links links;
+		memset(&links, 0, sizeof(links));
+		const char *html = "<a href=\"/x\" style=\"text-decoration:underline\">X</a>";
+		if (html_visible_text_extract_links((const uint8_t *)html, strlen(html), out, sizeof(out), &links) != 0) return 1;
+		if (links.n != 1) return 1;
+		if (!links.links[0].underline) return 1;
+	}
 
 	puts("links selftest: OK");
 	return 0;

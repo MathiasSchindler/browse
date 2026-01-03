@@ -12,7 +12,8 @@ static int expect_span(const char *name,
 		       uint32_t expect_fg,
 		       int expect_has_bg,
 		       uint32_t expect_bg,
-		       int expect_bold)
+		       int expect_bold,
+		       int expect_underline)
 {
 	char out[256];
 	memset(out, 0, sizeof(out));
@@ -54,6 +55,10 @@ static int expect_span(const char *name,
 		printf("spans %s: FAIL (bold)\n", name);
 		return 1;
 	}
+	if ((int)sp.underline != expect_underline) {
+		printf("spans %s: FAIL (underline)\n", name);
+		return 1;
+	}
 	return 0;
 }
 
@@ -65,6 +70,7 @@ int main(void)
 			0, 5,
 			1, 0xff112233u,
 			0, 0,
+			0,
 			0)) return 1;
 
 	if (expect_span("style_block_tag_rule",
@@ -73,6 +79,7 @@ int main(void)
 			0, 5,
 			1, 0xff112233u,
 			0, 0,
+			0,
 			0)) return 1;
 
 	if (expect_span("b_bold",
@@ -81,6 +88,25 @@ int main(void)
 			0, 2,
 			0, 0,
 			0, 0,
+			1,
+			0)) return 1;
+
+	if (expect_span("underline_inline",
+			"<span style=\"text-decoration: underline\">Hi</span>",
+			"Hi",
+			0, 2,
+			0, 0,
+			0, 0,
+			0,
+			1)) return 1;
+
+	if (expect_span("underline_class_rule",
+			"<style>.u{text-decoration:underline}</style><span class=\"u\">Hi</span>",
+			"Hi",
+			0, 2,
+			0, 0,
+			0, 0,
+			0,
 			1)) return 1;
 
 	puts("spans selftest: OK");

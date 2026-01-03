@@ -145,25 +145,30 @@ static int links_contains_index(const struct html_links *links, uint32_t idx)
 
 struct link_style {
 	uint32_t fg_xrgb;
+	uint8_t has_fg;
 	uint32_t bg_xrgb;
 	uint8_t has_bg;
 	uint8_t bold;
+	uint8_t underline;
 };
 
 static struct link_style spans_style_at_index(const struct html_spans *spans, uint32_t idx, uint32_t default_fg_xrgb)
 {
 	struct link_style st;
 	st.fg_xrgb = default_fg_xrgb;
+	st.has_fg = 0;
 	st.bg_xrgb = 0;
 	st.has_bg = 0;
 	st.bold = 0;
+	st.underline = 0;
 	if (!spans) return st;
 	for (uint32_t i = 0; i < spans->n && i < HTML_MAX_SPANS; i++) {
 		const struct html_span *sp = &spans->spans[i];
 		if (idx >= sp->start && idx < sp->end) {
-			if (sp->has_fg) st.fg_xrgb = sp->fg_xrgb;
+			if (sp->has_fg) { st.has_fg = 1; st.fg_xrgb = sp->fg_xrgb; }
 			if (sp->has_bg) { st.has_bg = 1; st.bg_xrgb = sp->bg_xrgb; }
 			st.bold = sp->bold;
+			st.underline = sp->underline;
 			return st;
 		}
 	}
@@ -174,16 +179,19 @@ static struct link_style links_style_at_index(const struct html_links *links, ui
 {
 	struct link_style st;
 	st.fg_xrgb = default_fg_xrgb;
+	st.has_fg = 0;
 	st.bg_xrgb = 0;
 	st.has_bg = 0;
 	st.bold = 0;
+	st.underline = 0;
 	if (!links) return st;
 	for (uint32_t i = 0; i < links->n && i < HTML_MAX_LINKS; i++) {
 		const struct html_link *l = &links->links[i];
 		if (idx >= l->start && idx < l->end) {
-			if (l->has_fg) st.fg_xrgb = l->fg_xrgb;
+			if (l->has_fg) { st.has_fg = 1; st.fg_xrgb = l->fg_xrgb; }
 			if (l->has_bg) { st.has_bg = 1; st.bg_xrgb = l->bg_xrgb; }
 			st.bold = l->bold;
+			st.underline = l->underline;
 			return st;
 		}
 	}
@@ -217,9 +225,11 @@ static void draw_line_with_links(struct shm_fb *fb,
 	int seg_is_link = 0;
 	struct link_style seg_st;
 	seg_st.fg_xrgb = linkc.fg;
+	seg_st.has_fg = 0;
 	seg_st.bg_xrgb = 0;
 	seg_st.has_bg = 0;
 	seg_st.bold = 0;
+	seg_st.underline = 0;
 	uint32_t si = 0;
 	for (uint32_t i = 0; line[i] != 0; i++) {
 		uint32_t idx = (base_index > 0xffffffffu) ? 0xffffffffu : (uint32_t)(base_index + (size_t)i);
@@ -231,17 +241,25 @@ static void draw_line_with_links(struct shm_fb *fb,
 		}
 		if (i == 0) { seg_is_link = is_link; seg_st = st; }
 		if (is_link != seg_is_link ||
-		    (is_link && (st.fg_xrgb != seg_st.fg_xrgb || st.has_bg != seg_st.has_bg || st.bg_xrgb != seg_st.bg_xrgb || st.bold != seg_st.bold)) ||
+		    (is_link && (st.fg_xrgb != seg_st.fg_xrgb || st.has_bg != seg_st.has_bg || st.bg_xrgb != seg_st.bg_xrgb || st.bold != seg_st.bold || st.underline != seg_st.underline)) ||
+		    (!is_link && (st.fg_xrgb != seg_st.fg_xrgb || st.has_bg != seg_st.has_bg || st.bg_xrgb != seg_st.bg_xrgb || st.bold != seg_st.bold || st.underline != seg_st.underline)) ||
 		    si + 2 >= sizeof(seg)) {
 			seg[si] = 0;
 			struct text_color c = seg_is_link ? linkc : normal;
 			c.fg = seg_st.fg_xrgb;
+			if (seg_st.bold && !seg_is_link && !seg_st.has_fg) {
+				/* Make bold stand out even when the default text color is dim. */
+				c.fg = 0xffffffffu;
+			}
 			if (seg_st.has_bg) {
 				fill_rect_u32(fb->pixels, fb->stride, seg_x, y, (uint32_t)si * 8u, 16u, seg_st.bg_xrgb);
 			}
 			draw_text_u32(fb->pixels, fb->stride, seg_x, y, seg, c);
 			if (seg_st.bold) {
 				draw_text_u32(fb->pixels, fb->stride, seg_x + 1, y, seg, c);
+			}
+			if (seg_st.underline) {
+				fill_rect_u32(fb->pixels, fb->stride, seg_x, y + 15u, (uint32_t)si * 8u, 1u, c.fg);
 			}
 			seg_x += (uint32_t)si * 8u;
 			si = 0;
@@ -254,12 +272,19 @@ static void draw_line_with_links(struct shm_fb *fb,
 		seg[si] = 0;
 		struct text_color c = seg_is_link ? linkc : normal;
 		c.fg = seg_st.fg_xrgb;
+		if (seg_st.bold && !seg_is_link && !seg_st.has_fg) {
+			/* Make bold stand out even when the default text color is dim. */
+			c.fg = 0xffffffffu;
+		}
 		if (seg_st.has_bg) {
 			fill_rect_u32(fb->pixels, fb->stride, seg_x, y, (uint32_t)si * 8u, 16u, seg_st.bg_xrgb);
 		}
 		draw_text_u32(fb->pixels, fb->stride, seg_x, y, seg, c);
 		if (seg_st.bold) {
 			draw_text_u32(fb->pixels, fb->stride, seg_x + 1, y, seg, c);
+		}
+		if (seg_st.underline) {
+			fill_rect_u32(fb->pixels, fb->stride, seg_x, y + 15u, (uint32_t)si * 8u, 1u, c.fg);
 		}
 	}
 }

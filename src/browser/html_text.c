@@ -64,6 +64,51 @@ static int ieq_attr(const uint8_t *s, size_t n, const char *lit)
 	return lit[n] == 0;
 }
 
+static int is_class_char(uint8_t c)
+{
+	return is_alpha(c) || is_digit(c) || c == '_' || c == '-';
+}
+
+static void parse_class_tokens(const uint8_t *v,
+			      size_t vlen,
+			      char classes[CSS_MAX_CLASSES_PER_NODE][CSS_MAX_CLASS_LEN + 1],
+			      uint32_t *io_class_count)
+{
+	if (!v || !io_class_count) return;
+	uint32_t n = *io_class_count;
+	if (n >= CSS_MAX_CLASSES_PER_NODE) return;
+	size_t i = 0;
+	while (i < vlen && n < CSS_MAX_CLASSES_PER_NODE) {
+		while (i < vlen && is_ascii_space(v[i])) i++;
+		if (i >= vlen) break;
+		char tmp[CSS_MAX_CLASS_LEN + 1];
+		size_t o = 0;
+		while (i < vlen && !is_ascii_space(v[i])) {
+			uint8_t c = v[i++];
+			if (!is_class_char(c)) continue;
+			if (o + 1 < sizeof(tmp)) tmp[o++] = (char)to_lower(c);
+		}
+		tmp[o] = 0;
+		if (o > 0) {
+			/* de-dup within the node (best-effort) */
+			int dup = 0;
+			for (uint32_t k = 0; k < n; k++) {
+				int eq = 1;
+				for (size_t t = 0;; t++) {
+					if (classes[k][t] != tmp[t]) { eq = 0; break; }
+					if (tmp[t] == 0) break;
+				}
+				if (eq) { dup = 1; break; }
+			}
+			if (!dup) {
+				for (size_t t = 0; t <= o && t < sizeof(classes[n]); t++) classes[n][t] = tmp[t];
+				n++;
+			}
+		}
+	}
+	*io_class_count = n;
+}
+
 static uint32_t tag_id(const uint8_t *name_buf, size_t nb)
 {
 	/* Best-effort identifier: length + first up to 3 letters. */
@@ -77,7 +122,7 @@ static uint32_t tag_id(const uint8_t *name_buf, size_t nb)
 static int style_is_default(const struct style_attr *st)
 {
 	if (!st) return 1;
-	return (!st->has_color && !st->has_bg && !st->bold);
+	return (!st->has_color && !st->has_bg && !st->bold && !(st->has_underline && st->underline));
 }
 
 static int style_eq(const struct style_attr *a, const struct style_attr *b)
@@ -87,6 +132,8 @@ static int style_eq(const struct style_attr *a, const struct style_attr *b)
 	if (a->has_color != b->has_color) return 0;
 	if (a->has_bg != b->has_bg) return 0;
 	if (a->bold != b->bold) return 0;
+	if (a->has_underline != b->has_underline) return 0;
+	if (a->has_underline && a->underline != b->underline) return 0;
 	if (a->has_color && a->color_xrgb != b->color_xrgb) return 0;
 	if (a->has_bg && a->bg_xrgb != b->bg_xrgb) return 0;
 	return 1;
@@ -106,6 +153,7 @@ static void spans_emit(struct html_spans *out_spans, uint32_t start, uint32_t en
 	sp->has_bg = st->has_bg;
 	sp->bg_xrgb = st->bg_xrgb;
 	sp->bold = st->bold;
+	sp->underline = (st->has_underline && st->underline) ? 1 : 0;
 }
 
 static void spans_switch(struct html_spans *out_spans,
@@ -315,6 +363,7 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 			out_links->links[i].bg_xrgb = 0;
 			out_links->links[i].has_bg = 0;
 			out_links->links[i].bold = 0;
+			out_links->links[i].underline = 0;
 			out_links->links[i].href[0] = 0;
 		}
 	}
@@ -328,12 +377,15 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 			out_spans->spans[i].bg_xrgb = 0;
 			out_spans->spans[i].has_bg = 0;
 			out_spans->spans[i].bold = 0;
+			out_spans->spans[i].underline = 0;
 		}
 	}
 
 	size_t o = 0;
 	int last_was_space = 1;
 	int skip_mode = 0; /* 0=none, 1=script, 2=style, 3=noscript */
+	uint32_t hidden_depth = 0;
+	uint32_t hidden_tag_stack[16];
 	struct css_sheet css;
 	css_sheet_init(&css);
 	size_t style_start = 0;
@@ -350,6 +402,7 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 	uint32_t a_bg_xrgb = 0;
 	uint8_t a_has_bg = 0;
 	uint8_t a_bold = 0;
+	uint8_t a_underline = 0;
 
 	/* Inline style spans (subset) for non-link content. */
 	struct style_attr cur_style;
@@ -396,6 +449,46 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 			continue;
 		}
 
+		if (hidden_depth != 0) {
+			/* Ignore everything until we close the hidden element(s). */
+			if (c == '<') {
+				size_t j = i + 1;
+				while (j < html_len && is_ascii_space(html[j])) j++;
+				int is_end = 0;
+				if (j < html_len && html[j] == '/') {
+					is_end = 1;
+					j++;
+					while (j < html_len && is_ascii_space(html[j])) j++;
+				}
+				size_t name_start = j;
+				if (j < html_len && is_alpha(html[j])) {
+					j++;
+					while (j < html_len && is_tag_name_char(html[j])) j++;
+				}
+				size_t name_len = j - name_start;
+				uint8_t name_buf[16];
+				size_t nb = min_sz(name_len, sizeof(name_buf) - 1);
+				for (size_t k = 0; k < nb; k++) name_buf[k] = to_lower(html[name_start + k]);
+				name_buf[nb] = 0;
+				uint32_t id = tag_id(name_buf, nb);
+				if (!is_end) {
+					if (hidden_depth < (sizeof(hidden_tag_stack) / sizeof(hidden_tag_stack[0]))) {
+						hidden_tag_stack[hidden_depth++] = id;
+					}
+				} else {
+					if (hidden_depth > 0 && hidden_tag_stack[hidden_depth - 1] == id) {
+						hidden_depth--;
+						if (hidden_depth == 0) {
+							append_space_collapse(out, out_len, &o, &last_was_space);
+						}
+					}
+				}
+				while (j < html_len && html[j] != '>') j++;
+				i = j;
+			}
+			continue;
+		}
+
 		if (c == '<') {
 			/* comment */
 			if (i + 3 < html_len && html[i + 1] == '!' && html[i + 2] == '-' && html[i + 3] == '-') {
@@ -432,6 +525,57 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 			for (size_t k = 0; k < nb; k++) name_buf[k] = to_lower(html[name_start + k]);
 			name_buf[nb] = 0;
 
+			char classes[CSS_MAX_CLASSES_PER_NODE][CSS_MAX_CLASS_LEN + 1];
+			for (uint32_t ci = 0; ci < CSS_MAX_CLASSES_PER_NODE; ci++) classes[ci][0] = 0;
+			uint32_t class_count = 0;
+			if (!is_end) {
+				/* Parse class=... within the tag (best-effort). */
+				size_t k = j;
+				while (k < html_len && html[k] != '>') {
+					while (k < html_len && is_ascii_space(html[k])) k++;
+					size_t an = k;
+					while (k < html_len && (is_alpha(html[k]) || is_digit(html[k]) || html[k] == '-' || html[k] == '_')) k++;
+					size_t alen = k - an;
+					while (k < html_len && is_ascii_space(html[k])) k++;
+					if (alen == 0) {
+						k++;
+						continue;
+					}
+					if (k < html_len && html[k] == '=') {
+						k++;
+						while (k < html_len && is_ascii_space(html[k])) k++;
+						uint8_t q = 0;
+						if (k < html_len && (html[k] == '"' || html[k] == '\'')) {
+							q = html[k];
+							k++;
+						}
+						size_t vs = k;
+						if (q) {
+							while (k < html_len && html[k] != q) k++;
+						} else {
+							while (k < html_len && !is_ascii_space(html[k]) && html[k] != '>') k++;
+						}
+						size_t vlen = (k > vs) ? (k - vs) : 0;
+						if (ieq_attr(html + an, alen, "class") && vlen > 0) {
+							parse_class_tokens(html + vs, vlen, classes, &class_count);
+						}
+					}
+					if (k < html_len && html[k] != '>') k++;
+				}
+			}
+
+			struct css_computed comp;
+			css_sheet_compute(&css, name_buf, nb, classes, class_count, &comp);
+			if (!is_end && comp.has_display && comp.display == CSS_DISPLAY_NONE) {
+				uint32_t id = tag_id(name_buf, nb);
+				if (hidden_depth < (sizeof(hidden_tag_stack) / sizeof(hidden_tag_stack[0]))) {
+					hidden_tag_stack[hidden_depth++] = id;
+				}
+				while (j < html_len && html[j] != '>') j++;
+				i = j;
+				continue;
+			}
+
 			/* Link open/close tracking (<a href="...">...</a>) */
 			if (out_links && nb == 1 && name_buf[0] == 'a') {
 				if (is_end) {
@@ -444,6 +588,7 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 						ln->bg_xrgb = a_bg_xrgb;
 						ln->has_bg = a_has_bg;
 						ln->bold = a_bold;
+						ln->underline = a_underline;
 						cpy_str_trunc(ln->href, sizeof(ln->href), a_href);
 					}
 					in_a = 0;
@@ -453,6 +598,7 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 					a_has_bg = 0;
 					a_bg_xrgb = 0;
 					a_bold = 0;
+					a_underline = 0;
 				} else {
 					/* Parse href=... within the tag. */
 					char href_tmp[HTML_HREF_MAX];
@@ -508,11 +654,18 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 						in_a = 1;
 						a_start = (o > 0xffffffffu) ? 0xffffffffu : (uint32_t)o;
 						cpy_str_trunc(a_href, sizeof(a_href), href_tmp);
-						a_has_fg = st.has_color;
-						a_fg_xrgb = st.color_xrgb;
-						a_has_bg = st.has_bg;
-						a_bg_xrgb = st.bg_xrgb;
-						a_bold = st.bold;
+						/* Start with CSS defaults for this tag/class. */
+						a_has_fg = comp.style.has_color;
+						a_fg_xrgb = comp.style.color_xrgb;
+						a_has_bg = comp.style.has_bg;
+						a_bg_xrgb = comp.style.bg_xrgb;
+						a_bold = comp.style.bold;
+						a_underline = (comp.style.has_underline && comp.style.underline) ? 1 : 0;
+						/* Inline style overrides. */
+						if (st.has_color) { a_has_fg = 1; a_fg_xrgb = st.color_xrgb; }
+						if (st.has_bg) { a_has_bg = 1; a_bg_xrgb = st.bg_xrgb; }
+						if (st.bold) a_bold = 1;
+						if (st.has_underline) a_underline = st.underline ? 1 : 0;
 					}
 				}
 			}
@@ -528,16 +681,8 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 					}
 				} else {
 					struct style_attr st;
-					c_memset(&st, 0, sizeof(st));
-					int have_any = 0;
-					/* Apply <style> tag selector rules as defaults for this tag. */
-					struct css_tag_rule tr;
-					c_memset(&tr, 0, sizeof(tr));
-					if (css_sheet_get_tag_rule(&css, name_buf, nb, &tr)) {
-						if (tr.style.has_color) { st.has_color = 1; st.color_xrgb = tr.style.color_xrgb; have_any = 1; }
-						if (tr.style.has_bg) { st.has_bg = 1; st.bg_xrgb = tr.style.bg_xrgb; have_any = 1; }
-						if (tr.style.bold) { st.bold = 1; have_any = 1; }
-					}
+					st = comp.style;
+					int have_any = (st.has_color || st.has_bg || st.bold || (st.has_underline && st.underline));
 					/* Bold tags without style attribute. */
 					if ((nb == 1 && name_buf[0] == 'b') || (nb == 6 && ieq_lit_n(name_buf, nb, "strong"))) {
 						st.bold = 1;
@@ -576,8 +721,12 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 							}
 							size_t vlen = (k > vs) ? (k - vs) : 0;
 							if (ieq_attr(html + an, alen, "style") && vlen > 0) {
-								(void)style_attr_parse_inline(html + vs, vlen, &st);
-								have_any = 1;
+								struct style_attr inl;
+								(void)style_attr_parse_inline(html + vs, vlen, &inl);
+								if (inl.has_color) { st.has_color = 1; st.color_xrgb = inl.color_xrgb; have_any = 1; }
+								if (inl.has_bg) { st.has_bg = 1; st.bg_xrgb = inl.bg_xrgb; have_any = 1; }
+								if (inl.bold) { st.bold = 1; have_any = 1; }
+								if (inl.has_underline) { st.has_underline = 1; st.underline = inl.underline; have_any = 1; }
 							}
 						}
 						if (k < html_len && html[k] != '>') k++;
@@ -590,6 +739,7 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 						if (st.has_color) { cur_style.has_color = 1; cur_style.color_xrgb = st.color_xrgb; }
 						if (st.has_bg) { cur_style.has_bg = 1; cur_style.bg_xrgb = st.bg_xrgb; }
 						if (st.bold) { cur_style.bold = 1; }
+						if (st.has_underline) { cur_style.has_underline = 1; cur_style.underline = st.underline; }
 						spans_switch(out_spans, o, &span_active, &span_start, &span_style, &cur_style);
 					}
 				}
@@ -623,6 +773,7 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 							a_has_bg = 0;
 							a_bg_xrgb = 0;
 							a_bold = 0;
+							a_underline = 0;
 						}
 						seen_main = 1;
 						in_main = 1;
@@ -653,6 +804,7 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 								a_has_bg = 0;
 								a_bg_xrgb = 0;
 								a_bold = 0;
+								a_underline = 0;
 							}
 							seen_article = 1;
 							in_article = 1;
@@ -678,9 +830,9 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 			if (seen_main) allow_output = in_main;
 			else if (seen_article) allow_output = in_article;
 			int is_block = tag_is_block_break(name_buf, nb);
-			struct css_tag_rule tr;
-			if (css_sheet_get_tag_rule(&css, name_buf, nb, &tr) && tr.has_display) {
-				is_block = (tr.display == CSS_DISPLAY_BLOCK);
+			if (comp.has_display) {
+				if (comp.display == CSS_DISPLAY_BLOCK) is_block = 1;
+				else if (comp.display == CSS_DISPLAY_INLINE) is_block = 0;
 			}
 			int is_heading = (nb == 2 && name_buf[0] == 'h' && name_buf[1] >= '1' && name_buf[1] <= '6');
 			int is_li = (nb == 2 && name_buf[0] == 'l' && name_buf[1] == 'i');

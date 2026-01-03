@@ -50,12 +50,31 @@ static int lit_eq_ci(const uint8_t *s, size_t n, const char *lit)
 	return lit[n] == 0;
 }
 
+static int contains_lit_ci(const uint8_t *s, size_t n, const char *lit)
+{
+	if (!s || !lit) return 0;
+	size_t lit_len = 0;
+	for (; lit[lit_len]; lit_len++) {}
+	if (lit_len == 0) return 0;
+	if (n < lit_len) return 0;
+	for (size_t i = 0; i + lit_len <= n; i++) {
+		int ok = 1;
+		for (size_t j = 0; j < lit_len; j++) {
+			if (to_lower_u8(s[i + j]) != (uint8_t)lit[j]) { ok = 0; break; }
+		}
+		if (ok) return 1;
+	}
+	return 0;
+}
+
 int style_attr_parse_inline(const uint8_t *s, size_t n, struct style_attr *out)
 {
 	if (!out) return -1;
 	out->has_color = 0;
 	out->has_bg = 0;
 	out->bold = 0;
+	out->has_underline = 0;
+	out->underline = 0;
 	out->color_xrgb = 0;
 	out->bg_xrgb = 0;
 	if (!s || n == 0) return 0;
@@ -101,6 +120,13 @@ int style_attr_parse_inline(const uint8_t *s, size_t n, struct style_attr *out)
 			if (v_len == 4 && lit_eq_ci(s + v_start, v_len, "bold")) {
 				out->bold = 1;
 			}
+		}
+		if (name_len == 15 && lit_eq_ci(s + name_start, name_len, "text-decoration")) {
+			/* best-effort: recognize underline/none anywhere in the value */
+			out->has_underline = 1;
+			if (contains_lit_ci(s + v_start, v_len, "underline")) out->underline = 1;
+			else if (contains_lit_ci(s + v_start, v_len, "none")) out->underline = 0;
+			else out->underline = 0;
 		}
 
 		i = j;

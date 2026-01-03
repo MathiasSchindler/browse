@@ -25,6 +25,7 @@ struct html_link {
 	uint32_t bg_xrgb;
 	uint8_t has_bg;
 	uint8_t bold;
+	uint8_t underline;
 	char href[HTML_HREF_MAX];
 };
 
@@ -45,6 +46,7 @@ struct html_span {
 	uint32_t bg_xrgb;
 	uint8_t has_bg;
 	uint8_t bold;
+	uint8_t underline;
 };
 
 struct html_spans {

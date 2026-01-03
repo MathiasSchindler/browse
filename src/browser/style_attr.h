@@ -6,6 +6,8 @@ struct style_attr {
 	uint8_t has_color;
 	uint8_t has_bg;
 	uint8_t bold;
+	uint8_t has_underline;
+	uint8_t underline;
 	uint32_t color_xrgb;
 	uint32_t bg_xrgb;
 };
@@ -14,6 +16,7 @@ struct style_attr {
  * - color: #RRGGBB
  * - background-color: #RRGGBB
  * - font-weight: bold
+ * - text-decoration: underline|none
  *
  * Returns 0 on success (even if nothing recognized), -1 on invalid args.
  */

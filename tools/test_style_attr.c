@@ -9,7 +9,9 @@ static int expect(const char *name,
 		  uint32_t expect_color,
 		  int expect_has_bg,
 		  uint32_t expect_bg,
-		  int expect_bold)
+		  int expect_bold,
+		  int expect_has_underline,
+		  int expect_underline)
 {
 	struct style_attr st;
 	memset(&st, 0, sizeof(st));
@@ -35,20 +37,29 @@ static int expect(const char *name,
 		printf("  expect: bold=%d\n", expect_bold);
 		return 1;
 	}
+	if ((int)st.has_underline != expect_has_underline || (expect_has_underline && (int)st.underline != expect_underline)) {
+		printf("style_attr %s: FAIL (underline)\n", name);
+		printf("  got:    has=%d underline=%d\n", st.has_underline, st.underline);
+		printf("  expect: has=%d underline=%d\n", expect_has_underline, expect_underline);
+		return 1;
+	}
 	return 0;
 }
 
 int main(void)
 {
-	if (expect("empty", "", 0, 0, 0, 0, 0)) return 1;
-	if (expect("color", "color:#ff0000", 1, 0xffff0000u, 0, 0, 0)) return 1;
-	if (expect("bg", "background-color:#00ff00", 0, 0, 1, 0xff00ff00u, 0)) return 1;
-	if (expect("bold", "font-weight:bold", 0, 0, 0, 0, 1)) return 1;
+	if (expect("empty", "", 0, 0, 0, 0, 0, 0, 0)) return 1;
+	if (expect("color", "color:#ff0000", 1, 0xffff0000u, 0, 0, 0, 0, 0)) return 1;
+	if (expect("bg", "background-color:#00ff00", 0, 0, 1, 0xff00ff00u, 0, 0, 0)) return 1;
+	if (expect("bold", "font-weight:bold", 0, 0, 0, 0, 1, 0, 0)) return 1;
+	if (expect("underline", "text-decoration: underline", 0, 0, 0, 0, 0, 1, 1)) return 1;
+	if (expect("underline_none", "text-decoration: none", 0, 0, 0, 0, 0, 1, 0)) return 1;
 	if (expect("mixed_ws_case",
 		   " COLOR : #112233 ; background-color : #445566 ; font-weight : BOLD ",
 		   1, 0xff112233u,
 		   1, 0xff445566u,
-		   1)) return 1;
+		   1,
+		   0, 0)) return 1;
 
 	puts("style_attr selftest: OK");
 	return 0;
