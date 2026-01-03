@@ -23,6 +23,7 @@ typedef uint32_t socklen_t;
 enum {
 	SOL_SOCKET = 1,
 	SO_RCVTIMEO = 20,
+	SO_SNDTIMEO = 21,
 };
 
 struct timeval {

@@ -2,6 +2,7 @@
 
 #include "aes128.h"
 #include "gcm.h"
+#include "tls13_kdf.h"
 #include "x25519.h"
 
 /* Test vectors from RFC 4231 (HMAC-SHA-256), RFC 5869 (HKDF-SHA-256), and
@@ -78,6 +79,35 @@ static int test_hkdf_rfc5869_case1(void)
 	if (!crypto_memeq(okm, okm_expect, sizeof(okm))) return 0;
 
 	return 1;
+}
+
+static int test_tls13_derive_secret_rfc8448_derived(void)
+{
+	/* RFC 8448, Section 3 (1-RTT Handshake), early secret -> tls13 derived.
+	 *
+	 * early_secret = HKDF-Extract(0, 0..0)
+	 * (no PSK => PSK is Hash.length zeros)
+	 * derived_secret = Derive-Secret(early_secret, "derived", SHA256(""))
+	 */
+	static const uint8_t sha256_empty[32] = {
+		0xe3,0xb0,0xc4,0x42,0x98,0xfc,0x1c,0x14,0x9a,0xfb,0xf4,0xc8,0x99,0x6f,0xb9,0x24,
+		0x27,0xae,0x41,0xe4,0x64,0x9b,0x93,0x4c,0xa4,0x95,0x99,0x1b,0x78,0x52,0xb8,0x55,
+	};
+	static const uint8_t expect[32] = {
+		0x6f,0x26,0x15,0xa1,0x08,0xc7,0x02,0xc5,0x67,0x8f,0x54,0xfc,0x9d,0xba,0xb6,0x97,
+		0x16,0xc0,0x76,0x18,0x9c,0x48,0x25,0x0c,0xeb,0xea,0xc3,0x57,0x6c,0x36,0x11,0xba,
+	};
+	static const uint8_t psk_zeros[32] = {0};
+
+	uint8_t early_secret[32];
+	hkdf_extract_sha256(NULL, 0, psk_zeros, sizeof(psk_zeros), early_secret);
+
+	uint8_t out[32];
+	if (tls13_derive_secret_sha256(early_secret, "derived", sha256_empty, out) != 0) return 0;
+	int ok = crypto_memeq(out, expect, 32);
+	crypto_memset(early_secret, 0, sizeof(early_secret));
+	crypto_memset(out, 0, sizeof(out));
+	return ok;
 }
 
 static int hexval(char c)
@@ -157,6 +187,7 @@ int tls_crypto_selftest_detail(int *failed_step)
 	step++; if (!test_sha256_abc()) { if (failed_step) *failed_step = step; return 0; }
 	step++; if (!test_hmac_rfc4231_case1()) { if (failed_step) *failed_step = step; return 0; }
 	step++; if (!test_hkdf_rfc5869_case1()) { if (failed_step) *failed_step = step; return 0; }
+	step++; if (!test_tls13_derive_secret_rfc8448_derived()) { if (failed_step) *failed_step = step; return 0; }
 
 	/* AES-128 single-block test: key=0, pt=0 -> 66e94bd4ef8a2c3b884cfa59ca342b2e */
 	step++;

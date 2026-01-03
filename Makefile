@@ -24,12 +24,13 @@ TLS_SRCS := \
 	src/tls/sha256.c \
 	src/tls/hmac_sha256.c \
 	src/tls/hkdf_sha256.c \
+	src/tls/tls13_kdf.c \
 	src/tls/x25519.c \
 	src/tls/aes128.c \
 	src/tls/gcm.c \
 	src/tls/selftest.c
 
-BROWSER_SRCS := src/core/start.S src/browser/main.c src/browser/http.c $(TLS_SRCS)
+BROWSER_SRCS := src/core/start.S src/browser/main.c src/browser/http.c src/browser/tls13_client.c $(TLS_SRCS)
 BROWSER_BIN := build/browser
 BROWSER_CFLAGS := $(CORE_CFLAGS) -DTEXT_LOG_MISSING_GLYPHS
 
@@ -59,8 +60,9 @@ TEST_CRYPTO_BIN := build/test_crypto
 TEST_NET_IPV6_BIN := build/test_net_ipv6
 TEST_X25519_BIN := build/test_x25519
 TEST_HTTP_BIN := build/test_http
+TEST_TEXT_FONT_BIN := build/test_text_font
 
-test: test-crypto test-net-ipv6 test-http
+test: test-crypto test-net-ipv6 test-http test-text-font
 
 test-x25519: build $(TEST_X25519_BIN)
 	./$(TEST_X25519_BIN)
@@ -91,6 +93,14 @@ $(TEST_HTTP_BIN): tools/test_http.c src/browser/http.c src/browser/http.h
 	$(CC) $(CFLAGS_COMMON) -Isrc -o $@ tools/test_http.c src/browser/http.c
 
 $(TEST_HTTP_BIN): FORCE
+
+test-text-font: build $(TEST_TEXT_FONT_BIN)
+	./$(TEST_TEXT_FONT_BIN)
+
+$(TEST_TEXT_FONT_BIN): tools/test_text_font.c src/core/start.S src/core/text.h src/core/syscall.h
+	$(CC) $(CORE_CFLAGS) $(CORE_LDFLAGS) -o $@ src/core/start.S tools/test_text_font.c
+
+$(TEST_TEXT_FONT_BIN): FORCE
 
 # Optional dev viewer: needs libsdl2-dev
 VIEWER_BIN := build/viewer

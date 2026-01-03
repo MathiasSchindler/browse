@@ -4,6 +4,7 @@
 #include "net_tcp.h"
 
 #include "../tls/selftest.h"
+#include "tls13_client.h"
 
 #define FB_W 1920u
 #define FB_H 1080u
@@ -47,8 +48,8 @@ int main(void)
 		}
 	}
 
-	const char *host = "wikipedia.org";
-	draw_ui(&fb, "CRYPTO SELFTEST: OK", "Resolving wikipedia.org (AAAA via Google DNS v6) ...", "TLS next");
+	const char *host = "de.wikipedia.org";
+	draw_ui(&fb, "CRYPTO SELFTEST: OK", "Resolving de.wikipedia.org (AAAA via Google DNS v6) ...", "TLS 1.3 next");
 	fb.hdr->frame_counter++;
 
 	uint8_t ip6[16];
@@ -64,7 +65,7 @@ int main(void)
 	char line1[96];
 	/* Compose a simple status line without snprintf. */
 	c_memset(line1, 0, sizeof(line1));
-	const char *pfx = "DNS AAAA wikipedia.org = ";
+	const char *pfx = "DNS AAAA de.wikipedia.org = ";
 	size_t o = 0;
 	for (size_t i = 0; pfx[i] && o + 1 < sizeof(line1); i++) line1[o++] = pfx[i];
 	for (size_t i = 0; ip_str[i] && o + 1 < sizeof(line1); i++) line1[o++] = ip_str[i];
@@ -78,11 +79,19 @@ int main(void)
 		sock = tcp6_connect(ip6, 443);
 	}
 
-	const char *line2 = (sock >= 0) ? "TCP connect OK (TLS next)" : "TCP connect FAILED";
-	draw_ui(&fb, line1, line2, "Next milestone: TLS 1.3 ClientHello + SNI + HTTP/1.1 GET");
+	const char *line2 = (sock >= 0) ? "TCP connect OK (TLS 1.3 handshake ...)" : "TCP connect FAILED";
+	draw_ui(&fb, line1, line2, "Sending ClientHello + SNI + HTTP/1.1 GET");
 	fb.hdr->frame_counter++;
 
 	if (sock >= 0) {
+		char status[128];
+		int rc = tls13_https_get_status_line(sock, host, "/", status, sizeof(status));
+		if (rc == 0) {
+			draw_ui(&fb, line1, "TLS+HTTP OK", status);
+		} else {
+			draw_ui(&fb, line1, "TLS+HTTP FAILED", "(no cert validation yet; handshake bring-up) ");
+		}
+		fb.hdr->frame_counter++;
 		sys_close(sock);
 	}
 
