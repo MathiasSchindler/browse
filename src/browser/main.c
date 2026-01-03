@@ -12,6 +12,7 @@
 #include "image/jpeg.h"
 #include "image/png.h"
 #include "image/gif.h"
+#include "image/gif_decode.h"
 
 #define FB_W 1920u
 #define FB_H 1080u
@@ -51,6 +52,10 @@ struct img_sniff_cache_entry {
 	uint8_t has_dims;
 	uint16_t w;
 	uint16_t h;
+	uint8_t has_pixels;
+	uint32_t pix_off; /* offset into g_img_pixel_pool */
+	uint16_t pix_w;
+	uint16_t pix_h;
 	uint32_t hash;
 	char key[256]; /* usually "host|/path" (truncated) */
 };
@@ -58,6 +63,58 @@ struct img_sniff_cache_entry {
 static struct img_sniff_cache_entry g_img_sniff_cache[32];
 
 static uint8_t g_img_sniff_buf[4096];
+static uint8_t g_img_fetch_buf[256 * 1024];
+
+/* Extremely small pixel pool for the first real decoder (GIF).
+ * Bump-allocated; reset on page navigation/reload.
+ */
+static uint32_t g_img_pixel_pool[1024 * 1024]; /* 1M px = 4 MiB */
+static uint32_t g_img_pixel_pool_used;
+
+static int img_pixel_alloc(uint32_t n_pixels, uint32_t *out_off)
+{
+	if (!out_off) return -1;
+	*out_off = 0;
+	if (n_pixels == 0) return -1;
+	if (n_pixels > (uint32_t)(sizeof(g_img_pixel_pool) / sizeof(g_img_pixel_pool[0]))) return -1;
+	uint32_t cap = (uint32_t)(sizeof(g_img_pixel_pool) / sizeof(g_img_pixel_pool[0]));
+	if (g_img_pixel_pool_used > cap) g_img_pixel_pool_used = cap;
+	if (cap - g_img_pixel_pool_used < n_pixels) return -1;
+	*out_off = g_img_pixel_pool_used;
+	g_img_pixel_pool_used += n_pixels;
+	return 0;
+}
+
+static void blit_xrgb_clipped(struct shm_fb *fb,
+			     uint32_t dst_x,
+			     uint32_t dst_y,
+			     uint32_t dst_w,
+			     uint32_t dst_h,
+			     const uint32_t *src,
+			     uint32_t src_w,
+			     uint32_t src_h)
+{
+	if (!fb || !src) return;
+	if (dst_w == 0 || dst_h == 0 || src_w == 0 || src_h == 0) return;
+	if (dst_x >= fb->width || dst_y >= fb->height) return;
+
+	uint32_t max_w = fb->width - dst_x;
+	uint32_t max_h = fb->height - dst_y;
+	uint32_t w = dst_w;
+	uint32_t h = dst_h;
+	if (w > max_w) w = max_w;
+	if (h > max_h) h = max_h;
+	if (w > src_w) w = src_w;
+	if (h > src_h) h = src_h;
+
+	for (uint32_t y = 0; y < h; y++) {
+		uint32_t *row = pixel_ptr(fb->pixels, fb->stride, dst_x, dst_y + y);
+		const uint32_t *srow = src + (size_t)y * (size_t)src_w;
+		for (uint32_t x = 0; x < w; x++) {
+			row[x] = srow[x];
+		}
+	}
+}
 
 static uint32_t hash32_fnv1a(const char *s)
 {
@@ -279,6 +336,10 @@ static enum img_fmt img_cache_get_or_mark_pending(const char *active_host, const
 			e->has_dims = 0;
 			e->w = 0;
 			e->h = 0;
+				e->has_pixels = 0;
+				e->pix_off = 0;
+				e->pix_w = 0;
+				e->pix_h = 0;
 			e->hash = h;
 			(void)c_strlcpy_s(e->key, sizeof(e->key), key);
 			break;
@@ -295,6 +356,10 @@ static int img_sniff_pump_one(void)
 		e->has_dims = 0;
 		e->w = 0;
 		e->h = 0;
+		e->has_pixels = 0;
+		e->pix_off = 0;
+		e->pix_w = 0;
+		e->pix_h = 0;
 
 		char host[HOST_BUF_LEN];
 		char path[PATH_BUF_LEN];
@@ -331,6 +396,41 @@ static int img_sniff_pump_one(void)
 				e->has_dims = 1;
 				e->w = (w > 0xffffu) ? 0xffffu : (uint16_t)w;
 				e->h = (h > 0xffffu) ? 0xffffu : (uint16_t)h;
+			}
+			/* First real decoder: decode first frame for small-ish GIFs. */
+			if (e->has_dims) {
+				uint32_t px = (uint32_t)e->w * (uint32_t)e->h;
+				if (e->w <= 512u && e->h <= 512u && px <= (uint32_t)(sizeof(g_img_pixel_pool) / sizeof(g_img_pixel_pool[0]))) {
+					/* Try a larger body fetch for actual decode (GIFs are rarely complete in 4KB). */
+					const uint8_t *gif_data = g_img_sniff_buf;
+					size_t gif_len = got;
+					{
+						size_t got_full = 0;
+						if (https_get_prefix_follow_redirects(host, path, g_img_fetch_buf, sizeof(g_img_fetch_buf), &got_full) == 0 && got_full > 0) {
+							gif_data = g_img_fetch_buf;
+							gif_len = got_full;
+						}
+					}
+
+					uint32_t old_used = g_img_pixel_pool_used;
+					uint32_t off = 0;
+					if (img_pixel_alloc(px, &off) == 0) {
+						uint32_t dw = 0, dh = 0;
+						if (gif_decode_first_frame_xrgb(gif_data,
+									      gif_len,
+									      &g_img_pixel_pool[off],
+									      (size_t)px,
+									      &dw,
+									      &dh) == 0) {
+							e->has_pixels = 1;
+							e->pix_off = off;
+							e->pix_w = (dw > 0xffffu) ? 0xffffu : (uint16_t)dw;
+							e->pix_h = (dh > 0xffffu) ? 0xffffu : (uint16_t)dh;
+						} else {
+							g_img_pixel_pool_used = old_used;
+						}
+					}
+				}
 			}
 		}
 		e->state = 2;
@@ -734,6 +834,16 @@ static void draw_body_wrapped(struct shm_fb *fb,
 				label_w = (label_w > adv) ? (label_w - adv) : 0u;
 			}
 			draw_text_clipped_u32(fb->pixels, fb->stride, label_x, row_y + 6u, label_w, label, tc);
+
+			/* If we have decoded pixels, blit them inside the box (below the label row). */
+			if (img_box.entry && img_box.entry->has_pixels) {
+				uint32_t inner_x = x + 1u;
+				uint32_t inner_y = row_y + 16u; /* keep first row for label */
+				uint32_t inner_w = (box_w > 2u) ? (box_w - 2u) : 0u;
+				uint32_t inner_h = (box_h > 17u) ? (box_h - 17u) : 0u;
+				const uint32_t *src = &g_img_pixel_pool[img_box.entry->pix_off];
+				blit_xrgb_clipped(fb, inner_x, inner_y, inner_w, inner_h, src, img_box.entry->pix_w, img_box.entry->pix_h);
+			}
 			img_box.rows_left = (rows > 0) ? (rows - 1u) : 0u;
 			continue;
 		}
@@ -848,6 +958,12 @@ static void do_https_status(struct shm_fb *fb, char host[HOST_BUF_LEN], char pat
 	g_spans.n = 0;
 	g_scroll_rows = 0;
 	g_have_page = 0;
+	/* Reset image decode/sniff state for the new page to avoid stale pixel pool offsets. */
+	g_img_pixel_pool_used = 0;
+	for (size_t i = 0; i < sizeof(g_img_sniff_cache) / sizeof(g_img_sniff_cache[0]); i++) {
+		g_img_sniff_cache[i].used = 0;
+		g_img_sniff_cache[i].state = 0;
+	}
 
 	for (int step = 0; step < 6; step++) {
 		compose_url_bar(url_bar, URL_BUF_LEN, host, path);
