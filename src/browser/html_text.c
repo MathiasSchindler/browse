@@ -1,5 +1,6 @@
 #include "html_text.h"
 #include "style_attr.h"
+#include "css_tiny.h"
 
 static int is_ascii_space(uint8_t c)
 {
@@ -143,6 +144,11 @@ static void append_space_collapse(char *out, size_t out_len, size_t *io, int *la
 
 static void append_newline_collapse(char *out, size_t out_len, size_t *io, int *last_was_space)
 {
+	if (!io || *io == 0) {
+		/* Avoid leading empty lines from a block tag at the start. */
+		if (last_was_space) *last_was_space = 1;
+		return;
+	}
 	/* Use '\n' as a hard break; avoid multiple in a row. */
 	if (*io > 0 && out[*io - 1] == '\n') {
 		*last_was_space = 1;
@@ -150,6 +156,16 @@ static void append_newline_collapse(char *out, size_t out_len, size_t *io, int *
 	}
 	(void)append_char(out, out_len, io, '\n');
 	*last_was_space = 1;
+}
+
+static void append_blankline_collapse(char *out, size_t out_len, size_t *io, int *last_was_space)
+{
+	/* Ensure we get a visually separated paragraph ("\n\n") without leading empty lines. */
+	append_newline_collapse(out, out_len, io, last_was_space);
+	if (!io || *io == 0) return;
+	if (*io > 0 && out[*io - 1] != '\n') return;
+	(void)append_char(out, out_len, io, '\n');
+	if (last_was_space) *last_was_space = 1;
 }
 
 static int decode_entity(const uint8_t *s, size_t n, char *out_ch)
@@ -285,8 +301,13 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 	size_t o = 0;
 	int last_was_space = 1;
 	int skip_mode = 0; /* 0=none, 1=script, 2=style, 3=noscript */
+	struct css_sheet css;
+	css_sheet_init(&css);
+	size_t style_start = 0;
 	int seen_main = 0;
 	int in_main = 0;
+	int seen_article = 0;
+	int in_article = 0;
 	int in_a = 0;
 	uint32_t a_start = 0;
 	char a_href[HTML_HREF_MAX];
@@ -319,6 +340,12 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 				size_t name_start = j;
 				while (j < html_len && is_alpha(html[j])) j++;
 				size_t name_len = j - name_start;
+				if (skip_mode == 2 && ieq_lit_n(html + name_start, name_len, "style")) {
+					/* Parse CSS inside <style>...</style> (best-effort). */
+					if (style_start < i) {
+						(void)css_parse_style_block(html + style_start, i - style_start, &css);
+					}
+				}
 				if ((skip_mode == 1 && ieq_lit_n(html + name_start, name_len, "script")) ||
 				    (skip_mode == 2 && ieq_lit_n(html + name_start, name_len, "style")) ||
 				    (skip_mode == 3 && ieq_lit_n(html + name_start, name_len, "noscript"))) {
@@ -464,8 +491,21 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 					struct style_attr st;
 					c_memset(&st, 0, sizeof(st));
 					int have_any = 0;
+					/* Apply <style> tag selector rules as defaults for this tag. */
+					struct css_tag_rule tr;
+					c_memset(&tr, 0, sizeof(tr));
+					if (css_sheet_get_tag_rule(&css, name_buf, nb, &tr)) {
+						if (tr.style.has_color) { st.has_color = 1; st.color_xrgb = tr.style.color_xrgb; have_any = 1; }
+						if (tr.style.has_bg) { st.has_bg = 1; st.bg_xrgb = tr.style.bg_xrgb; have_any = 1; }
+						if (tr.style.bold) { st.bold = 1; have_any = 1; }
+					}
 					/* Bold tags without style attribute. */
 					if ((nb == 1 && name_buf[0] == 'b') || (nb == 6 && ieq_lit_n(name_buf, nb, "strong"))) {
+						st.bold = 1;
+						have_any = 1;
+					}
+					/* Headings: make them bold by default (readability). */
+					if (nb == 2 && name_buf[0] == 'h' && name_buf[1] >= '1' && name_buf[1] <= '6') {
 						st.bold = 1;
 						have_any = 1;
 					}
@@ -516,7 +556,7 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 				}
 			}
 
-				/* Semantic main: if <main> exists, prefer it as the primary content flow.
+				/* Semantic main/article: if <main> or <article> exists, prefer it as the primary content flow.
 				 * This is not Wikipedia-specific and helps avoid rendering nav/sidebar first.
 				 */
 				if (nb == 4 && ieq_lit_n(name_buf, nb, "main")) {
@@ -551,16 +591,70 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 						if (seen_main) in_main = 0;
 					}
 				}
+				if (nb == 7 && ieq_lit_n(name_buf, nb, "article")) {
+					/* Only use <article> as primary if <main> was not detected. */
+					if (!seen_main) {
+						if (!is_end) {
+							if (!seen_article) {
+								/* Discard pre-article boilerplate. */
+								o = 0;
+								out[0] = 0;
+								last_was_space = 1;
+								if (out_links) out_links->n = 0;
+								if (out_spans) out_spans->n = 0;
+								span_active = 0;
+								span_start = 0;
+								c_memset(&cur_style, 0, sizeof(cur_style));
+								c_memset(&span_style, 0, sizeof(span_style));
+								style_depth = 0;
+								in_a = 0;
+								a_href[0] = 0;
+								a_has_fg = 0;
+								a_fg_xrgb = 0;
+								a_has_bg = 0;
+								a_bg_xrgb = 0;
+								a_bold = 0;
+							}
+							seen_article = 1;
+							in_article = 1;
+						} else {
+							if (seen_article) in_article = 0;
+						}
+					}
+				}
 
 			if (!is_end) {
 				if (ieq_lit_n(name_buf, nb, "script")) skip_mode = 1;
-				else if (ieq_lit_n(name_buf, nb, "style")) skip_mode = 2;
+				else if (ieq_lit_n(name_buf, nb, "style")) {
+					skip_mode = 2;
+					/* Remember where the CSS content starts (just after '>'). */
+					style_start = j;
+					if (style_start < html_len && html[style_start] == '>') style_start++;
+					while (style_start < html_len && (html[style_start] == '\r' || html[style_start] == '\n')) style_start++;
+				}
 				else if (ieq_lit_n(name_buf, nb, "noscript")) skip_mode = 3;
 			}
 
-			int allow_output = (!seen_main || in_main);
-			if (allow_output && tag_is_block_break(name_buf, nb)) {
+			int allow_output = 1;
+			if (seen_main) allow_output = in_main;
+			else if (seen_article) allow_output = in_article;
+			int is_block = tag_is_block_break(name_buf, nb);
+			struct css_tag_rule tr;
+			if (css_sheet_get_tag_rule(&css, name_buf, nb, &tr) && tr.has_display) {
+				is_block = (tr.display == CSS_DISPLAY_BLOCK);
+			}
+			int is_heading = (nb == 2 && name_buf[0] == 'h' && name_buf[1] >= '1' && name_buf[1] <= '6');
+			int is_li = (nb == 2 && name_buf[0] == 'l' && name_buf[1] == 'i');
+			if (allow_output && is_heading) {
+				append_blankline_collapse(out, out_len, &o, &last_was_space);
+			} else if (allow_output && is_block) {
 				append_newline_collapse(out, out_len, &o, &last_was_space);
+			}
+			if (allow_output && !is_end && is_li && is_block) {
+				/* Simple list semantics: render bullet prefix at <li>. */
+				(void)append_char(out, out_len, &o, '-');
+				(void)append_char(out, out_len, &o, ' ');
+				last_was_space = 1;
 			}
 
 			/* skip until '>' */
@@ -592,7 +686,9 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 			/* fallback: treat '&' as normal char */
 		}
 
-		int allow_output = (!seen_main || in_main);
+		int allow_output = 1;
+		if (seen_main) allow_output = in_main;
+		else if (seen_article) allow_output = in_article;
 		if (!allow_output) {
 			continue;
 		}

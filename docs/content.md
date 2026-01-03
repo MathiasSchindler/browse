@@ -181,6 +181,10 @@ Tests
   - parse a few rules
   - ensure correct rule picked
 
+Status
+- Implemented a tiny style-block parser in `src/browser/css_tiny.h/.c` for tag selectors and a small property subset.
+- Integrated `<style>` parsing into HTML extraction: tag rules apply to generated spans; `display:block/inline` influences block/newline behavior.
+
 ### Step 4.3: Add basic layout semantics using CSS-ish model
 Introduce a minimal “layout node” representation:
 - block nodes start new lines and add vertical spacing
@@ -190,6 +194,10 @@ Tests
 - Extend visible-text fixture tests to ensure:
   - headings have blank line separation
   - list items show bullets or dashes
+
+Status
+- Implemented minimal layout semantics in the HTML→text stage (no DOM): headings get extra vertical separation, and list items render with a simple `- ` prefix.
+- Headings default to bold via the span styling layer.
 
 ---
 

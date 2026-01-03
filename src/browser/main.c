@@ -22,7 +22,7 @@ enum {
 	URL_BUF_LEN = 640,
 };
 
-static char g_visible[64 * 1024];
+static char g_visible[512 * 1024];
 static char g_status_bar[128];
 static char g_url_bar[URL_BUF_LEN];
 static char g_active_host[HOST_BUF_LEN];
@@ -392,7 +392,7 @@ static void compose_url_bar(char *out, size_t out_len, const char *host, const c
 
 static void do_https_status(struct shm_fb *fb, char host[HOST_BUF_LEN], char path[PATH_BUF_LEN], char url_bar[URL_BUF_LEN])
 {
-	static uint8_t body[96 * 1024];
+	static uint8_t body[512 * 1024];
 	size_t body_len = 0;
 	uint64_t content_len = 0;
 	char final_status[128];
@@ -557,7 +557,7 @@ int main(void)
 		if (wc != last_wheel_counter) {
 			last_wheel_counter = wc;
 			int32_t dy = cfb_wheel_delta_y(fb.hdr);
-			uint32_t step = 3u;
+			uint32_t step = 12u;
 			if (dy > 0) {
 				uint32_t dec = (uint32_t)dy * step;
 				g_scroll_rows = (g_scroll_rows > dec) ? (g_scroll_rows - dec) : 0u;

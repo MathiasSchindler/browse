@@ -25,6 +25,8 @@ int main(void)
 	if (expect_eq("basic", "<html><body>Hello <b>world</b>!</body></html>", "Hello world!")) return 1;
 	if (expect_eq("entities", "A&amp;B &lt; C &nbsp; D", "A&B < C D")) return 1;
 	if (expect_eq("blocks", "A<p>B<br/>C</p>D", "A\nB\nC\nD")) return 1;
+	if (expect_eq("heading_spacing", "<h1>Title</h1><p>Body</p>", "Title\n\nBody")) return 1;
+	if (expect_eq("list_bullets", "<ul><li>A</li><li>B</li></ul>", "- A\n- B")) return 1;
 	if (expect_eq("skip_script", "X<script>alert(1)</script>Y", "X Y")) return 1;
 	if (expect_eq("comment", "A<!-- hidden -->B", "A B")) return 1;
 	if (expect_eq("numeric", "A&#32;B&#x20;C", "A B C")) return 1;

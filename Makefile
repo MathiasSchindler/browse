@@ -61,11 +61,11 @@ TLS_SRCS := \
 	src/tls/gcm.c \
 	src/tls/selftest.c
 
-BROWSER_SRCS := src/core/start.S src/browser/main.c src/browser/http.c src/browser/tls13_client.c src/browser/html_text.c src/browser/text_layout.c src/browser/style_attr.c $(TLS_SRCS)
+BROWSER_SRCS := src/core/start.S src/browser/main.c src/browser/http.c src/browser/tls13_client.c src/browser/html_text.c src/browser/text_layout.c src/browser/style_attr.c src/browser/css_tiny.c $(TLS_SRCS)
 BROWSER_BIN := build/browser
 BROWSER_CFLAGS := $(CORE_CFLAGS) -DTEXT_LOG_MISSING_GLYPHS
 
-.PHONY: all core browser inputd tests test test-crypto test-net-ipv6 test-http test-text-layout test-links test-style-attr test-spans test-text-font clean clean-all viewer
+.PHONY: all core browser inputd tests test test-crypto test-net-ipv6 test-http test-text-layout test-links test-style-attr test-spans test-css-parser test-text-font clean clean-all viewer
 .PHONY: test-x25519
 .PHONY: test-http
 
@@ -118,13 +118,14 @@ TEST_TEXT_LAYOUT_BIN := build/test_text_layout
 TEST_LINKS_BIN := build/test_links
 TEST_STYLE_ATTR_BIN := build/test_style_attr
 TEST_SPANS_BIN := build/test_spans
+TEST_CSS_PARSER_BIN := build/test_css_parser
 TEST_TEXT_FONT_BIN := build/test_text_font
 TEST_REDIRECT_BIN := build/test_redirect
 
 # Build (but do not run) all test binaries.
-tests: build $(TEST_CRYPTO_BIN) $(TEST_NET_IPV6_BIN) $(TEST_HTTP_BIN) $(TEST_HTTP_PARSE_BIN) $(TEST_CHUNKED_BIN) $(TEST_VISIBLE_TEXT_BIN) $(TEST_TEXT_LAYOUT_BIN) $(TEST_LINKS_BIN) $(TEST_STYLE_ATTR_BIN) $(TEST_SPANS_BIN) $(TEST_TEXT_FONT_BIN) $(TEST_X25519_BIN) $(TEST_REDIRECT_BIN)
+tests: build $(TEST_CRYPTO_BIN) $(TEST_NET_IPV6_BIN) $(TEST_HTTP_BIN) $(TEST_HTTP_PARSE_BIN) $(TEST_CHUNKED_BIN) $(TEST_VISIBLE_TEXT_BIN) $(TEST_TEXT_LAYOUT_BIN) $(TEST_LINKS_BIN) $(TEST_STYLE_ATTR_BIN) $(TEST_SPANS_BIN) $(TEST_CSS_PARSER_BIN) $(TEST_TEXT_FONT_BIN) $(TEST_X25519_BIN) $(TEST_REDIRECT_BIN)
 
-test: test-crypto test-net-ipv6 test-http test-http-parse test-chunked test-visible-text test-text-layout test-links test-style-attr test-spans test-text-font test-redirect
+test: test-crypto test-net-ipv6 test-http test-http-parse test-chunked test-visible-text test-text-layout test-links test-style-attr test-spans test-css-parser test-text-font test-redirect
 
 test-x25519: build $(TEST_X25519_BIN)
 	./$(TEST_X25519_BIN)
@@ -176,7 +177,7 @@ test-visible-text: build $(TEST_VISIBLE_TEXT_BIN)
 	./$(TEST_VISIBLE_TEXT_BIN)
 
 $(TEST_VISIBLE_TEXT_BIN): tools/test_visible_text.c src/browser/html_text.c src/browser/html_text.h src/browser/util.h src/core/syscall.h
-	$(CC) $(CFLAGS_COMMON) -Isrc -o $@ tools/test_visible_text.c src/browser/html_text.c src/browser/style_attr.c
+	$(CC) $(CFLAGS_COMMON) -Isrc -o $@ tools/test_visible_text.c src/browser/html_text.c src/browser/style_attr.c src/browser/css_tiny.c
 
 $(TEST_VISIBLE_TEXT_BIN): FORCE
 
@@ -192,7 +193,7 @@ test-links: build $(TEST_LINKS_BIN)
 	./$(TEST_LINKS_BIN)
 
 $(TEST_LINKS_BIN): tools/test_links.c src/browser/html_text.c src/browser/html_text.h src/browser/util.h src/core/syscall.h
-	$(CC) $(CFLAGS_COMMON) -Isrc -o $@ tools/test_links.c src/browser/html_text.c src/browser/style_attr.c
+	$(CC) $(CFLAGS_COMMON) -Isrc -o $@ tools/test_links.c src/browser/html_text.c src/browser/style_attr.c src/browser/css_tiny.c
 
 $(TEST_LINKS_BIN): FORCE
 
@@ -208,9 +209,17 @@ test-spans: build $(TEST_SPANS_BIN)
 	./$(TEST_SPANS_BIN)
 
 $(TEST_SPANS_BIN): tools/test_spans.c src/browser/html_text.c src/browser/html_text.h src/browser/style_attr.c src/browser/style_attr.h src/browser/util.h src/core/syscall.h
-	$(CC) $(CFLAGS_COMMON) -Isrc -o $@ tools/test_spans.c src/browser/html_text.c src/browser/style_attr.c
+	$(CC) $(CFLAGS_COMMON) -Isrc -o $@ tools/test_spans.c src/browser/html_text.c src/browser/style_attr.c src/browser/css_tiny.c
 
 $(TEST_SPANS_BIN): FORCE
+
+test-css-parser: build $(TEST_CSS_PARSER_BIN)
+	./$(TEST_CSS_PARSER_BIN)
+
+$(TEST_CSS_PARSER_BIN): tools/test_css_parser.c src/browser/css_tiny.c src/browser/css_tiny.h src/browser/style_attr.c src/browser/style_attr.h
+	$(CC) $(CFLAGS_COMMON) -Isrc -o $@ tools/test_css_parser.c src/browser/css_tiny.c src/browser/style_attr.c
+
+$(TEST_CSS_PARSER_BIN): FORCE
 
 test-text-font: build $(TEST_TEXT_FONT_BIN)
 	./$(TEST_TEXT_FONT_BIN)

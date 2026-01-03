@@ -67,6 +67,14 @@ int main(void)
 			0, 0,
 			0)) return 1;
 
+	if (expect_span("style_block_tag_rule",
+			"<style>p{color:#112233}</style><p>Hello</p>",
+			"Hello",
+			0, 5,
+			1, 0xff112233u,
+			0, 0,
+			0)) return 1;
+
 	if (expect_span("b_bold",
 			"<b>Hi</b>",
 			"Hi",
