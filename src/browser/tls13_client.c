@@ -39,6 +39,177 @@ static int write_full(int fd, const uint8_t *buf, size_t n)
 	return 0;
 }
 
+struct http_resp_feed_ctx {
+	char *status_line;
+	size_t status_line_len;
+	int *status_code_out;
+
+	char *location_out;
+	size_t location_out_len;
+
+	uint8_t *body;
+	size_t body_cap;
+
+	char *line;
+	size_t line_cap;
+	size_t line_len;
+
+	uint8_t *header_buf;
+	size_t header_cap;
+	size_t header_len;
+
+	int got_status;
+	int got_headers_end;
+
+	uint64_t content_len;
+	int have_content_len;
+	int is_chunked;
+	int peer_close;
+
+	struct http_chunked_dec *chunked;
+	int chunked_done;
+
+	uint64_t body_total_read;
+	size_t body_stored;
+};
+
+static int http_resp_feed_body(struct http_resp_feed_ctx *ctx, const uint8_t *in, size_t in_len)
+{
+	if (!ctx || !in) return -1;
+
+	if (ctx->is_chunked) {
+		size_t off = 0;
+		while (off < in_len) {
+			size_t in_used = 0;
+			size_t wrote = 0;
+			uint8_t *outp = (ctx->body && ctx->body_stored < ctx->body_cap) ? (ctx->body + ctx->body_stored) : 0;
+			size_t out_cap2 = (ctx->body && ctx->body_stored < ctx->body_cap) ? (ctx->body_cap - ctx->body_stored) : 0;
+			int r = http_chunked_feed(ctx->chunked,
+						in + off, in_len - off, &in_used,
+						outp, out_cap2, &wrote);
+			ctx->body_stored += wrote;
+			ctx->body_total_read += wrote;
+			if (r < 0) return -1;
+			if (r == 1) ctx->chunked_done = 1;
+			if (in_used == 0) return -1;
+			off += in_used;
+			if (ctx->chunked_done) break;
+		}
+		return 0;
+	}
+
+	size_t can_read = in_len;
+	if (ctx->have_content_len) {
+		if (ctx->body_total_read >= ctx->content_len) return 0;
+		uint64_t remain = ctx->content_len - ctx->body_total_read;
+		if ((uint64_t)can_read > remain) can_read = (size_t)remain;
+	}
+
+	if (ctx->body && ctx->body_stored < ctx->body_cap) {
+		size_t cap = ctx->body_cap - ctx->body_stored;
+		size_t to_store = (can_read < cap) ? can_read : cap;
+		if (to_store) {
+			crypto_memcpy(ctx->body + ctx->body_stored, in, to_store);
+			ctx->body_stored += to_store;
+		}
+	}
+	ctx->body_total_read += (uint64_t)can_read;
+	return 0;
+}
+
+static int http_resp_feed(struct http_resp_feed_ctx *ctx, const uint8_t *in, size_t in_len, size_t *out_used)
+{
+	if (!ctx || !in) return -1;
+
+	size_t used = 0;
+	while (used < in_len) {
+		uint8_t b = in[used];
+
+		if (!ctx->got_headers_end) {
+			if (ctx->header_len >= ctx->header_cap) return -1;
+			ctx->header_buf[ctx->header_len++] = b;
+
+			if (ctx->line_len + 1 < ctx->line_cap) {
+				ctx->line[ctx->line_len++] = (char)b;
+				ctx->line[ctx->line_len] = 0;
+			}
+
+			if (b == '\n') {
+				if (!ctx->got_status) {
+					size_t n = ctx->line_len;
+					while (n > 0 && (ctx->line[n - 1] == '\n' || ctx->line[n - 1] == '\r')) n--;
+					size_t w = 0;
+					for (; w < n && w + 1 < ctx->status_line_len; w++) ctx->status_line[w] = ctx->line[w];
+					ctx->status_line[w] = 0;
+					if (ctx->status_code_out) *ctx->status_code_out = http_parse_status_code(ctx->status_line);
+					ctx->got_status = 1;
+				} else {
+					if (!ctx->have_content_len) {
+						uint64_t v = 0;
+						if (http_parse_content_length_line(ctx->line, &v) == 0) {
+							ctx->have_content_len = 1;
+							ctx->content_len = v;
+						}
+					}
+					if (!ctx->is_chunked) {
+						char tmp[256];
+						if (http_header_extract_value(ctx->line, "Transfer-Encoding", tmp, sizeof(tmp)) == 0) {
+							if (http_value_has_token_ci(tmp, "chunked")) ctx->is_chunked = 1;
+						}
+					}
+					if (!ctx->peer_close) {
+						char tmp[256];
+						if (http_header_extract_value(ctx->line, "Connection", tmp, sizeof(tmp)) == 0) {
+							if (http_value_has_token_ci(tmp, "close")) ctx->peer_close = 1;
+						}
+					}
+					if (ctx->location_out && ctx->location_out_len && ctx->location_out[0] == 0) {
+						char tmp[512];
+						if (http_header_extract_value(ctx->line, "Location", tmp, sizeof(tmp)) == 0) {
+							(void)c_strlcpy_s(ctx->location_out, ctx->location_out_len, tmp);
+						}
+					}
+				}
+				ctx->line_len = 0;
+				ctx->line[0] = 0;
+			}
+
+			size_t hdr_end = 0;
+			if (http_find_header_end(ctx->header_buf, ctx->header_len, &hdr_end) == 0) {
+				ctx->got_headers_end = 1;
+				/* Flush any bytes already beyond header end as body. */
+				size_t pre_body = ctx->header_len - hdr_end;
+				if (pre_body) {
+					const uint8_t *pb = ctx->header_buf + hdr_end;
+					if (http_resp_feed_body(ctx, pb, pre_body) != 0) return -1;
+				}
+			}
+		} else {
+			/* Body */
+			if (http_resp_feed_body(ctx, &b, 1) != 0) return -1;
+		}
+
+		used++;
+
+		if (ctx->got_headers_end) {
+			if (ctx->is_chunked) {
+				if (ctx->chunked_done) break;
+			} else if (ctx->have_content_len) {
+				if (ctx->body_total_read >= ctx->content_len) break;
+			} else {
+				/* No framing known; only safe to keep-alive if peer closes. */
+				break;
+			}
+		}
+	}
+
+	if (out_used) *out_used = used;
+	if (!ctx->got_headers_end) return 0;
+	if (ctx->is_chunked) return ctx->chunked_done ? 1 : 0;
+	if (ctx->have_content_len) return (ctx->body_total_read >= ctx->content_len) ? 1 : 0;
+	return 1;
+}
+
 static void sha256_ctx_digest(const struct sha256_ctx *ctx, uint8_t out[32])
 {
 	struct sha256_ctx tmp = *ctx;
@@ -77,16 +248,377 @@ static uint32_t get_u24(const uint8_t *p)
 	return ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | (uint32_t)p[2];
 }
 
-struct tls13_aead {
-	uint8_t key[16];
-	uint8_t iv[12];
-	uint64_t seq;
-	int valid;
-};
-
 static void tls13_aead_reset(struct tls13_aead *a)
 {
 	a->seq = 0;
+}
+
+static void tls13_aead_invalidate(struct tls13_aead *a)
+{
+	if (!a) return;
+	a->seq = 0;
+	a->valid = 0;
+	crypto_memset(a->key, 0, sizeof(a->key));
+	crypto_memset(a->iv, 0, sizeof(a->iv));
+}
+
+static int build_client_hello(const char *host,
+			    uint8_t out_hs[1024], size_t *out_hs_len,
+			    uint8_t priv[X25519_KEY_SIZE], uint8_t pub[X25519_KEY_SIZE]);
+static int send_plain_handshake_record(int fd, const uint8_t *hs, size_t hs_len);
+static int tls_read_record(int fd, uint8_t hdr[5], uint8_t *payload, size_t payload_cap, size_t *payload_len);
+static int parse_server_hello(const uint8_t *hs, size_t hs_len, uint8_t server_pub[X25519_KEY_SIZE]);
+static int derive_hs_traffic(const struct sha256_ctx *transcript,
+			     const uint8_t shared[X25519_KEY_SIZE],
+			     uint8_t c_hs_traffic[32], uint8_t s_hs_traffic[32],
+			     struct tls13_aead *out_tx_hs, struct tls13_aead *out_rx_hs);
+static int tls13_open_record(struct tls13_aead *rx,
+			    const uint8_t hdr[5],
+			    const uint8_t *payload, size_t payload_len,
+			    uint8_t *out, size_t out_cap,
+			    uint8_t *out_type, size_t *out_len);
+static int derive_app_traffic(const struct sha256_ctx *transcript,
+			      const uint8_t shared[X25519_KEY_SIZE],
+			      uint8_t c_ap_traffic[32], uint8_t s_ap_traffic[32],
+			      struct tls13_aead *out_tx_app, struct tls13_aead *out_rx_app);
+static int tls13_seal_record(int fd, struct tls13_aead *tx,
+			    uint8_t inner_type,
+			    const uint8_t *in, size_t in_len);
+static int tls_read_record_stream(int fd,
+				 uint8_t hdr[5],
+				 uint8_t *payload, size_t payload_cap,
+				 size_t *payload_len);
+
+static int tls13_handshake_to_app(int sock, const char *host, struct tls13_aead *out_tx_app, struct tls13_aead *out_rx_app)
+{
+	if (!host || !out_tx_app || !out_rx_app) return -1;
+	*out_tx_app = (struct tls13_aead){0};
+	*out_rx_app = (struct tls13_aead){0};
+
+	/* Avoid hanging forever during bring-up. */
+	{
+		struct timeval tv;
+		tv.tv_sec = 3;
+		tv.tv_usec = 0;
+		(void)sys_setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, (uint32_t)sizeof(tv));
+		(void)sys_setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, (uint32_t)sizeof(tv));
+	}
+
+	struct sha256_ctx transcript;
+	sha256_init(&transcript);
+
+	uint8_t priv[X25519_KEY_SIZE];
+	uint8_t pub[X25519_KEY_SIZE];
+	uint8_t ch_hs[1024];
+	size_t ch_hs_len = 0;
+	if (build_client_hello(host, ch_hs, &ch_hs_len, priv, pub) != 0) return -1;
+
+	/* Send ClientHello */
+	if (send_plain_handshake_record(sock, ch_hs, ch_hs_len) != 0) return -1;
+	sha256_update(&transcript, ch_hs, ch_hs_len);
+
+	/* Read until ServerHello */
+	uint8_t hdr[5];
+	uint8_t payload[TLS13_MAX_RECORD];
+	size_t payload_len = 0;
+	uint8_t server_pub[X25519_KEY_SIZE];
+	uint8_t sh_hs[1024];
+	size_t sh_hs_len = 0;
+	for (;;) {
+		if (tls_read_record(sock, hdr, payload, sizeof(payload), &payload_len) != 0) return -1;
+		uint8_t typ = hdr[0];
+		if (typ == 0x14) {
+			/* ChangeCipherSpec: ignore. */
+			continue;
+		}
+		if (typ != 0x16) return -1;
+		if (payload_len < 4) return -1;
+		uint8_t hs_type = payload[0];
+		uint32_t body_len = get_u24(&payload[1]);
+		if (hs_type != 0x02) return -1;
+		if ((size_t)body_len + 4u > payload_len) return -1;
+		sh_hs_len = (size_t)body_len + 4u;
+		crypto_memcpy(sh_hs, payload, sh_hs_len);
+		break;
+	}
+
+	if (parse_server_hello(sh_hs, sh_hs_len, server_pub) != 0) return -1;
+	sha256_update(&transcript, sh_hs, sh_hs_len);
+
+	uint8_t shared[32];
+	x25519(shared, priv, server_pub);
+	crypto_memset(priv, 0, sizeof(priv));
+	crypto_memset(pub, 0, sizeof(pub));
+	crypto_memset(server_pub, 0, sizeof(server_pub));
+
+	struct tls13_aead tx_hs = (struct tls13_aead){0};
+	struct tls13_aead rx_hs = (struct tls13_aead){0};
+	struct tls13_aead tx_app = (struct tls13_aead){0};
+	struct tls13_aead rx_app = (struct tls13_aead){0};
+	uint8_t c_hs_traffic[32];
+	uint8_t s_hs_traffic[32];
+	if (derive_hs_traffic(&transcript, shared, c_hs_traffic, s_hs_traffic, &tx_hs, &rx_hs) != 0) return -1;
+
+	/* Process encrypted handshake messages until server Finished. */
+	uint8_t got_server_finished = 0;
+	uint8_t server_finished_verify[32];
+	crypto_memset(server_finished_verify, 0, sizeof(server_finished_verify));
+
+	uint8_t dec[TLS13_MAX_RECORD];
+	uint8_t dec_type = 0;
+	size_t dec_len = 0;
+
+	for (;;) {
+		if (tls_read_record(sock, hdr, payload, sizeof(payload), &payload_len) != 0) return -1;
+		uint8_t typ = hdr[0];
+		if (typ == 0x14) continue;
+		if (typ != 0x17) return -1;
+
+		if (tls13_open_record(&rx_hs, hdr, payload, payload_len, dec, sizeof(dec), &dec_type, &dec_len) != 0) return -1;
+		if (dec_type != 0x16) {
+			continue;
+		}
+
+		size_t off = 0;
+		while (off + 4u <= dec_len) {
+			uint8_t hs_type = dec[off];
+			uint32_t bl = get_u24(&dec[off + 1]);
+			if (off + 4u + (size_t)bl > dec_len) return -1;
+			const uint8_t *hs_msg = &dec[off];
+			size_t hs_msg_len = 4u + (size_t)bl;
+
+			if (hs_type == 0x14) {
+				uint8_t finished_key[32];
+				if (tls13_hkdf_expand_label_sha256(s_hs_traffic, "finished", NULL, 0, finished_key, 32) != 0) return -1;
+				uint8_t th[32];
+				sha256_ctx_digest(&transcript, th);
+				hmac_sha256(finished_key, 32, th, 32, server_finished_verify);
+				crypto_memset(finished_key, 0, sizeof(finished_key));
+				crypto_memset(th, 0, sizeof(th));
+				if (bl != 32u) return -1;
+				if (!crypto_memeq(server_finished_verify, hs_msg + 4, 32)) return -1;
+				sha256_update(&transcript, hs_msg, hs_msg_len);
+				got_server_finished = 1;
+				break;
+			}
+
+			sha256_update(&transcript, hs_msg, hs_msg_len);
+			off += hs_msg_len;
+		}
+
+		if (got_server_finished) break;
+	}
+
+	/* Derive application traffic secrets using transcript up to server Finished. */
+	uint8_t c_ap_traffic[32];
+	uint8_t s_ap_traffic[32];
+	if (derive_app_traffic(&transcript, shared, c_ap_traffic, s_ap_traffic, &tx_app, &rx_app) != 0) return -1;
+
+	/* Server may start using application keys after Finished. */
+	tls13_aead_reset(&rx_app);
+
+	/* Send client Finished under handshake keys. */
+	uint8_t client_finished_key[32];
+	if (tls13_hkdf_expand_label_sha256(c_hs_traffic, "finished", NULL, 0, client_finished_key, 32) != 0) return -1;
+	uint8_t th[32];
+	sha256_ctx_digest(&transcript, th);
+	uint8_t verify[32];
+	hmac_sha256(client_finished_key, 32, th, 32, verify);
+	crypto_memset(client_finished_key, 0, sizeof(client_finished_key));
+	crypto_memset(th, 0, sizeof(th));
+
+	uint8_t fin_hs[4 + 32];
+	fin_hs[0] = 0x14;
+	put_u24(&fin_hs[1], 32);
+	crypto_memcpy(&fin_hs[4], verify, 32);
+	crypto_memset(verify, 0, sizeof(verify));
+
+	if (tls13_seal_record(sock, &tx_hs, 0x16, fin_hs, sizeof(fin_hs)) != 0) return -1;
+	sha256_update(&transcript, fin_hs, sizeof(fin_hs));
+	crypto_memset(fin_hs, 0, sizeof(fin_hs));
+
+	/* Now use application write keys. */
+	tls13_aead_reset(&tx_app);
+
+	/* Export app keys and clear sensitive temporaries. */
+	*out_tx_app = tx_app;
+	*out_rx_app = rx_app;
+
+	crypto_memset(shared, 0, sizeof(shared));
+	crypto_memset(c_hs_traffic, 0, sizeof(c_hs_traffic));
+	crypto_memset(s_hs_traffic, 0, sizeof(s_hs_traffic));
+	crypto_memset(c_ap_traffic, 0, sizeof(c_ap_traffic));
+	crypto_memset(s_ap_traffic, 0, sizeof(s_ap_traffic));
+	crypto_memset(server_finished_verify, 0, sizeof(server_finished_verify));
+	crypto_memset(dec, 0, sizeof(dec));
+	crypto_memset(payload, 0, sizeof(payload));
+	return 0;
+}
+
+int tls13_https_conn_open(struct tls13_https_conn *c, int sock, const char *host)
+{
+	if (!c || sock < 0 || !host || !host[0]) return -1;
+	c->sock = sock;
+	c->alive = 0;
+	c->stash_len = 0;
+	(void)c_strlcpy_s(c->host, sizeof(c->host), host);
+	tls13_aead_invalidate(&c->tx_app);
+	tls13_aead_invalidate(&c->rx_app);
+	if (tls13_handshake_to_app(sock, host, &c->tx_app, &c->rx_app) != 0) {
+		return -1;
+	}
+	c->alive = 1;
+	return 0;
+}
+
+void tls13_https_conn_close(struct tls13_https_conn *c)
+{
+	if (!c) return;
+	if (c->alive && c->sock >= 0) {
+		sys_close(c->sock);
+	}
+	c->sock = -1;
+	c->alive = 0;
+	c->stash_len = 0;
+	tls13_aead_invalidate(&c->tx_app);
+	tls13_aead_invalidate(&c->rx_app);
+}
+
+int tls13_https_conn_get_status_location_and_body(struct tls13_https_conn *c,
+						const char *path,
+						char *status_line,
+						size_t status_line_len,
+						int *status_code_out,
+						char *location_out,
+						size_t location_out_len,
+						uint8_t *body,
+						size_t body_cap,
+						size_t *body_len_out,
+						uint64_t *content_length_out,
+						int keep_alive_request,
+						int *out_peer_wants_close)
+{
+	if (!c || !c->alive || c->sock < 0 || !path || !status_line || status_line_len == 0) return -1;
+	status_line[0] = 0;
+	if (status_code_out) *status_code_out = -1;
+	if (location_out && location_out_len) location_out[0] = 0;
+	if (body_len_out) *body_len_out = 0;
+	if (content_length_out) *content_length_out = 0;
+	if (out_peer_wants_close) *out_peer_wants_close = 0;
+
+	char req[768];
+	int req_len = http_format_get_ex(req, sizeof(req), c->host, path, keep_alive_request ? 1 : 0);
+	if (req_len < 0) return -1;
+	if (tls13_seal_record(c->sock, &c->tx_app, 0x17, (const uint8_t *)req, (size_t)req_len) != 0) return -1;
+	crypto_memset(req, 0, sizeof(req));
+
+	char line[512];
+	uint8_t header_buf[8192];
+	struct http_chunked_dec chunked;
+	http_chunked_init(&chunked);
+
+	struct http_resp_feed_ctx feed;
+	feed.status_line = status_line;
+	feed.status_line_len = status_line_len;
+	feed.status_code_out = status_code_out;
+	feed.location_out = location_out;
+	feed.location_out_len = location_out_len;
+	feed.body = body;
+	feed.body_cap = body_cap;
+	feed.line = line;
+	feed.line_cap = sizeof(line);
+	feed.line_len = 0;
+	feed.header_buf = header_buf;
+	feed.header_cap = sizeof(header_buf);
+	feed.header_len = 0;
+	feed.got_status = 0;
+	feed.got_headers_end = 0;
+	feed.content_len = 0;
+	feed.have_content_len = 0;
+	feed.is_chunked = 0;
+	feed.peer_close = 0;
+	feed.chunked = &chunked;
+	feed.chunked_done = 0;
+	feed.body_total_read = 0;
+	feed.body_stored = 0;
+
+	uint8_t hdr[5];
+	uint8_t payload[TLS13_MAX_RECORD];
+	size_t payload_len = 0;
+	uint8_t dec[TLS13_MAX_RECORD];
+	uint8_t dec_type = 0;
+	size_t dec_len = 0;
+
+	/* Consume any stashed plaintext bytes first. */
+	if (c->stash_len) {
+		size_t used = 0;
+		int done = http_resp_feed(&feed, c->stash, c->stash_len, &used);
+		if (done < 0) return -1;
+		if (used < c->stash_len) {
+			/* shift remaining */
+			size_t rem = c->stash_len - used;
+			for (size_t i = 0; i < rem; i++) c->stash[i] = c->stash[used + i];
+			c->stash_len = rem;
+		} else {
+			c->stash_len = 0;
+		}
+		if (done == 1) {
+			goto out_done;
+		}
+	}
+
+	for (;;) {
+		int rr = tls_read_record_stream(c->sock, hdr, payload, sizeof(payload), &payload_len);
+		if (rr == 1) {
+			/* EOF */
+			feed.peer_close = 1;
+			break;
+		}
+		if (rr != 0) return -1;
+		uint8_t typ = hdr[0];
+		if (typ == 0x14) continue;
+		if (typ != 0x17) continue;
+		if (tls13_open_record(&c->rx_app, hdr, payload, payload_len, dec, sizeof(dec), &dec_type, &dec_len) != 0) return -1;
+		if (dec_type == 0x15) {
+			feed.peer_close = 1;
+			break;
+		}
+		if (dec_type != 0x17) continue;
+
+		size_t used = 0;
+		int done = http_resp_feed(&feed, dec, dec_len, &used);
+		if (done < 0) return -1;
+		if (done == 1) {
+			/* Stash any remaining plaintext for the next response. */
+			if (used < dec_len) {
+				size_t rem = dec_len - used;
+				if (rem <= sizeof(c->stash)) {
+					/* Replace stash (no pipelining expected). */
+					for (size_t i = 0; i < rem; i++) c->stash[i] = dec[used + i];
+					c->stash_len = rem;
+				} else {
+					c->stash_len = 0;
+				}
+			}
+			break;
+		}
+	}
+
+out_done:
+	if (body_len_out) *body_len_out = feed.body_stored;
+	if (content_length_out) *content_length_out = (!feed.is_chunked && feed.have_content_len) ? feed.content_len : 0;
+
+	/* Decide whether the connection can be safely reused. */
+	if (!keep_alive_request) {
+		/* Legacy callers can close; no requirement to be reusable. */
+		if (out_peer_wants_close) *out_peer_wants_close = 1;
+		return 0;
+	}
+
+	if (!feed.got_headers_end) feed.peer_close = 1;
+	if (!feed.is_chunked && !feed.have_content_len) feed.peer_close = 1;
+	if (feed.peer_close && out_peer_wants_close) *out_peer_wants_close = 1;
+	return 0;
 }
 
 static int tls_read_record(int fd, uint8_t hdr[5], uint8_t *payload, size_t payload_cap, size_t *payload_len)

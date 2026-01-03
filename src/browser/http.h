@@ -11,3 +11,8 @@
  * (e.g. buffer too small).
  */
 int http_format_get(char *out, size_t out_len, const char *host, const char *path);
+
+/* Like http_format_get, but allows choosing Connection: keep-alive vs close.
+ * keep_alive=1 emits "Connection: keep-alive".
+ */
+int http_format_get_ex(char *out, size_t out_len, const char *host, const char *path, int keep_alive);

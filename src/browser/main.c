@@ -432,6 +432,93 @@ static int https_get_prefix_follow_redirects(const char *host_in, const char *pa
 	return -1;
 }
 
+static int https_conn_open_host(struct tls13_https_conn *c, const char *host)
+{
+	if (!c || !host || !host[0]) return -1;
+	tls13_https_conn_close(c);
+
+	uint8_t ip6[16];
+	c_memset(ip6, 0, sizeof(ip6));
+	if (dns_resolve_aaaa_google(host, ip6) != 0) return -1;
+
+	int sock = tcp6_connect(ip6, 443);
+	if (sock < 0) return -1;
+
+	if (tls13_https_conn_open(c, sock, host) != 0) {
+		sys_close(sock);
+		c->sock = -1;
+		c->alive = 0;
+		return -1;
+	}
+	return 0;
+}
+
+static int https_get_prefix_follow_redirects_keepalive(struct tls13_https_conn *c,
+						const char *host_in,
+						const char *path_in,
+						uint8_t *out,
+						size_t out_cap,
+						size_t *out_len)
+{
+	if (!c || !out || out_cap == 0 || !out_len) return -1;
+	*out_len = 0;
+
+	char host[HOST_BUF_LEN];
+	char path[PATH_BUF_LEN];
+	(void)c_strlcpy_s(host, sizeof(host), host_in ? host_in : "");
+	(void)c_strlcpy_s(path, sizeof(path), path_in ? path_in : "/");
+
+	for (int step = 0; step < 4; step++) {
+		if (!c->alive || c->sock < 0 || !streq(c->host, host)) {
+			if (https_conn_open_host(c, host) != 0) return -1;
+		}
+
+		char status[128];
+		char location[512];
+		int status_code = -1;
+		size_t body_len = 0;
+		int peer_close = 0;
+
+		int rc = -1;
+		for (int attempt = 0; attempt < 2; attempt++) {
+			peer_close = 0;
+			rc = tls13_https_conn_get_status_location_and_body(c,
+								 path,
+								 status,
+								 sizeof(status),
+								 &status_code,
+								 location,
+								 sizeof(location),
+								 out,
+								 out_cap,
+								 &body_len,
+								 0,
+								 1,
+								 &peer_close);
+			if (rc == 0) break;
+			/* Retry once with a fresh connection. */
+			tls13_https_conn_close(c);
+			if (https_conn_open_host(c, host) != 0) return -1;
+		}
+
+		if (peer_close) tls13_https_conn_close(c);
+		if (rc != 0) return -1;
+
+		int is_redirect = (status_code == 301 || status_code == 302 || status_code == 303 || status_code == 307 || status_code == 308);
+		if (!is_redirect || location[0] == 0) {
+			*out_len = (body_len > out_cap) ? out_cap : (size_t)body_len;
+			return 0;
+		}
+
+		char new_host[HOST_BUF_LEN];
+		char new_path[PATH_BUF_LEN];
+		if (url_apply_location(host, location, new_host, sizeof(new_host), new_path, sizeof(new_path)) != 0) return -1;
+		(void)c_strlcpy_s(host, sizeof(host), new_host);
+		(void)c_strlcpy_s(path, sizeof(path), new_path);
+	}
+	return -1;
+}
+
 static int split_host_path_from_key(const char *key, char *host_out, size_t host_out_len, char *path_out, size_t path_out_len)
 {
 	if (!key || !host_out || !path_out || host_out_len == 0 || path_out_len == 0) return -1;
@@ -563,6 +650,9 @@ static void img_worker_loop(uint32_t wi)
 {
 	if (!g_img_workers || wi >= IMG_WORKERS) sys_exit(1);
 	struct img_worker_shm *w = &g_img_workers[wi];
+	struct tls13_https_conn conn;
+	c_memset(&conn, 0, sizeof(conn));
+	conn.sock = -1;
 	struct timespec req;
 	req.tv_sec = 0;
 	req.tv_nsec = 1 * 1000 * 1000;
@@ -592,7 +682,7 @@ static void img_worker_loop(uint32_t wi)
 
 		uint8_t sniff_buf[4096];
 		size_t got = 0;
-		if (https_get_prefix_follow_redirects(host, path, sniff_buf, sizeof(sniff_buf), &got) != 0 || got == 0) {
+		if (https_get_prefix_follow_redirects_keepalive(&conn, host, path, sniff_buf, sizeof(sniff_buf), &got) != 0 || got == 0) {
 			w->rc = -1;
 			w->state = 2u;
 			continue;
@@ -627,7 +717,7 @@ static void img_worker_loop(uint32_t wi)
 			if (pw > 0 && ph > 0 && pw <= IMG_WORKER_MAX_W && ph <= IMG_WORKER_MAX_H && px <= IMG_WORKER_MAX_PX) {
 				uint8_t fetch_buf[512 * 1024];
 				size_t got_full = 0;
-				if (https_get_prefix_follow_redirects(host, path, fetch_buf, sizeof(fetch_buf), &got_full) == 0 && got_full > 0) {
+				if (https_get_prefix_follow_redirects_keepalive(&conn, host, path, fetch_buf, sizeof(fetch_buf), &got_full) == 0 && got_full > 0) {
 					uint32_t dw = 0, dh = 0;
 					int dec_ok = -1;
 					if ((enum img_fmt)w->fmt == IMG_FMT_JPG) {

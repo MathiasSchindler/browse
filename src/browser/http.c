@@ -19,7 +19,7 @@ static int append_cstr(char *out, size_t out_len, size_t *off, const char *s)
 	return 0;
 }
 
-int http_format_get(char *out, size_t out_len, const char *host, const char *path)
+int http_format_get_ex(char *out, size_t out_len, const char *host, const char *path, int keep_alive)
 {
 	if (!out || out_len == 0 || !host || !path) return -1;
 
@@ -46,11 +46,16 @@ int http_format_get(char *out, size_t out_len, const char *host, const char *pat
 
 	if (append_cstr(out, out_len, &off, "Accept: */*\r\n") != 0) return -1;
 	if (append_cstr(out, out_len, &off, "Accept-Language: en,de;q=0.9\r\n") != 0) return -1;
-	if (append_cstr(out, out_len, &off, "Connection: close\r\n") != 0) return -1;
+	if (append_cstr(out, out_len, &off, keep_alive ? "Connection: keep-alive\r\n" : "Connection: close\r\n") != 0) return -1;
 	if (append_cstr(out, out_len, &off, "\r\n") != 0) return -1;
 
 	/* NUL-terminate for convenience/debugging, but length excludes it. */
 	if (off >= out_len) return -1;
 	out[off] = 0;
 	return (int)off;
+}
+
+int http_format_get(char *out, size_t out_len, const char *host, const char *path)
+{
+	return http_format_get_ex(out, out_len, host, path, 0);
 }
