@@ -1,4 +1,6 @@
-# Syscall-only framebuffer core + dev viewer
+#+#+#+#+# browse
+
+Syscall-only framebuffer core + dev viewer (and a syscall-only HTTPS browser experiment).
 
 Goal: develop a C renderer that uses **only Linux syscalls** (no libc) while still iterating inside GNOME/VS Code.
 
