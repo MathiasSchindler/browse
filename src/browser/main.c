@@ -10,6 +10,8 @@
 #include "text_layout.h"
 
 #include "image/jpeg.h"
+#include "image/png.h"
+#include "image/gif.h"
 
 #define FB_W 1920u
 #define FB_H 1080u
@@ -312,6 +314,20 @@ static int img_sniff_pump_one(void)
 		if (e->fmt == IMG_FMT_JPG) {
 			uint32_t w = 0, h = 0;
 			if (jpeg_get_dimensions(g_img_sniff_buf, got, &w, &h) == 0) {
+				e->has_dims = 1;
+				e->w = (w > 0xffffu) ? 0xffffu : (uint16_t)w;
+				e->h = (h > 0xffffu) ? 0xffffu : (uint16_t)h;
+			}
+		} else if (e->fmt == IMG_FMT_PNG) {
+			uint32_t w = 0, h = 0;
+			if (png_get_dimensions(g_img_sniff_buf, got, &w, &h) == 0) {
+				e->has_dims = 1;
+				e->w = (w > 0xffffu) ? 0xffffu : (uint16_t)w;
+				e->h = (h > 0xffffu) ? 0xffffu : (uint16_t)h;
+			}
+		} else if (e->fmt == IMG_FMT_GIF) {
+			uint32_t w = 0, h = 0;
+			if (gif_get_dimensions(g_img_sniff_buf, got, &w, &h) == 0) {
 				e->has_dims = 1;
 				e->w = (w > 0xffffu) ? 0xffffu : (uint16_t)w;
 				e->h = (h > 0xffffu) ? 0xffffu : (uint16_t)h;
@@ -670,6 +686,14 @@ static void draw_body_wrapped(struct shm_fb *fb,
 			if (box_h > remaining_h) box_h = remaining_h;
 			uint32_t box_w = w_px;
 			if (box_w > max_w) box_w = max_w;
+			if (img_box.entry && img_box.entry->has_dims) {
+				uint32_t want_w = (uint32_t)img_box.entry->w + 2u;
+				uint32_t want_h = (uint32_t)img_box.entry->h + 2u;
+				if (want_w < 32u) want_w = 32u;
+				if (want_h < 32u) want_h = 32u;
+				if (want_w < box_w) box_w = want_w;
+				if (want_h < box_h) box_h = want_h;
+			}
 			uint32_t stroke = 1u;
 			uint32_t col = 0xff505058u;
 			/* Top + bottom */
