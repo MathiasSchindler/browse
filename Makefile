@@ -86,11 +86,15 @@ $(CORE_BIN): $(CORE_SRCS)
 	$(CC) $(CORE_CFLAGS) $(CORE_LDFLAGS) -o $@ $(CORE_SRCS)
 	$(POST_LINK)
 
+$(CORE_BIN): FORCE
+
 browser: build $(BROWSER_BIN)
 
 $(BROWSER_BIN): $(BROWSER_SRCS)
 	$(CC) $(BROWSER_CFLAGS) $(CORE_LDFLAGS) -o $@ $(BROWSER_SRCS)
 	$(POST_LINK)
+
+$(BROWSER_BIN): FORCE
 
 TEST_CRYPTO_BIN := build/test_crypto
 TEST_NET_IPV6_BIN := build/test_net_ipv6

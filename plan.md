@@ -1,5 +1,18 @@
 # Framebuffer HTTPS Browser — Implementation Plan
 
+## Current status (as of 2026-01-03)
+- Syscall-only, freestanding `browser` renders into `/dev/shm/cfb0` (XRGB8888) and idles so the UI stays visible.
+- Dev-only SDL2 `viewer` can display `/dev/shm/cfb0`.
+- IPv6-only networking works (AAAA-only DNS + IPv6 TCP).
+- Crypto primitives implemented + regression tested: SHA-256, HMAC-SHA256, HKDF-SHA256, AES-128, AES-128-GCM, X25519.
+- HTTP/1.1 request formatting implemented with required User-Agent `browse (+https://github.com/MathiasSchindler/browse)`.
+- TLS 1.3 bring-up is functional enough to connect to `de.wikipedia.org` and reach a real HTTP status line (currently `HTTP/1.1 301 Moved Permanently`).
+- Certificate validation is not implemented yet (bring-up mode).
+- Build discipline improvements:
+   - `make all` builds `core`, `browser`, all test binaries, and (if SDL2 is available) `viewer`.
+   - `make clean` removes all produced binaries (including split debug files).
+   - Optional size flags: `SIZE=1` (smaller code) and `STRIP=1` (split debug symbols).
+
 Constraints / goals
 - Target: Ubuntu x86-64, gcc-15
 - Output: always render into the shared framebuffer `/dev/shm/cfb0` (viewer stays running)
@@ -59,9 +72,11 @@ Deliverable
 
 ## 2) Build + size discipline (Milestone: reproducible tiny binaries)
 1. Add build profiles
-   - `make debug`: symbols, asserts, logging.
-   - `make release`: `-O2/-Os`, `-ffunction-sections -fdata-sections`, `-Wl,--gc-sections`, strip.
-   - `-static` for release (evaluate glibc static size vs. a minimal no-libc runtime; prefer smallest viable approach).
+   - Current knobs:
+     - `SIZE=1`: uses `-Os` plus `-ffunction-sections -fdata-sections` and link-time `--gc-sections`.
+     - `STRIP=1`: splits debug info into `build/*.debug` and strips the main binaries while keeping a debug link.
+   - Keep bugfixability: default builds keep `-g`; `STRIP=1` preserves debug info separately.
+   - Static linking: the freestanding binaries already use `-nostdlib -nodefaultlibs -nostartfiles`.
 
 2. Add a size report target
    - `size build/browser` + map file generation.
@@ -75,7 +90,7 @@ Deliverable
 
 ---
 
-## 2) Graphics + text baseline (Milestone: readable text and boxes)
+## 3) Graphics + text baseline (Milestone: readable text and boxes)
 1. Framebuffer integration
    - Keep using `/dev/shm/cfb0` backend as the primary dev target.
    - Add a “real fbdev” backend as a compile-time switch (already started) but treat it as deployment-only.
@@ -98,7 +113,7 @@ Deliverable
 
 ---
 
-## 3) Input + navigation UX (Milestone: interactive shell browser)
+## 4) Input + navigation UX (Milestone: interactive shell browser)
 1. Input
    - Read keyboard/mouse via `/dev/input/event*` (syscalls only), map to internal events.
    - Support: typing in URL bar, Enter to navigate, PageUp/Down, arrows, mouse wheel.
@@ -115,13 +130,19 @@ Deliverable
 
 ---
 
-## 3) Minimal HTTPS to Wikipedia (Milestone: TLS 1.3 + HTTP/1.1 GET to `wikipedia.org`)
+## 5) Minimal HTTPS to Wikipedia (Milestone: TLS 1.3 + HTTP/1.1 GET)
 Goal
 - Fetch and display a readable, text-only version of Wikipedia content over HTTPS using only syscalls + in-tree code.
 
+Current state
+- TLS 1.3 bring-up connects to `de.wikipedia.org` over IPv6 and can extract the first HTTP status line.
+- Currently observed: `HTTP/1.1 301 Moved Permanently`.
+- No redirect following yet.
+- No certificate validation yet.
+
 1. Networking prerequisites (syscalls-only)
-   - DNS resolver: parse `/etc/resolv.conf`, send UDP DNS queries (AAAA only).
-   - TCP client: IPv6 sockets only (`AF_INET6`), non-blocking + `epoll`.
+   - DNS resolver: AAAA-only, IPv6-only; resolvers are hardcoded to Google IPv6 DNS (per requirement).
+   - TCP client: IPv6 sockets only (`AF_INET6`).
    - No IPv4 parsing, no A-record lookup, no dual-stack connect attempts.
 
 2. HTTP/1.1 client (over TLS)
@@ -130,10 +151,14 @@ Goal
    - Redirect handling (Wikipedia will redirect; follow to final `https://*.wikipedia.org/`).
    - Start by sending `Accept-Encoding: identity` to avoid decompression.
 
+   Next concrete steps
+   - Parse headers and implement redirect following (301/302/307/308) with a redirect limit.
+   - Keep `Accept-Encoding: identity` until decompression exists.
+
 3. TLS 1.3 client-only stack
    - CSPRNG via `getrandom()`.
    - Crypto: SHA-256, HMAC, HKDF; X25519; AEAD (prefer ChaCha20-Poly1305 first).
-   - Certificate parsing/verification: minimal X.509 chain validation with a bundled CA set.
+   - Certificate parsing/verification: minimal X.509 chain validation with a bundled CA set (not implemented yet).
    - SNI support for `wikipedia.org`.
    - ALPN not required initially (HTTP/1.1 is acceptable); keep scope minimal.
 
@@ -142,7 +167,7 @@ Deliverable
 
 ---
 
-## 4) Networking baseline (Milestone: robust HTTP plumbing)
+## 6) Networking baseline (Milestone: robust HTTP plumbing)
 1. DNS
    - Minimal resolver: read `/etc/resolv.conf`, send UDP DNS queries (AAAA only).
    - Cache AAAA responses.
@@ -165,7 +190,7 @@ Deliverable
 
 ---
 
-## 5) TLS 1.3 hardening (Milestone: broader HTTPS compatibility)
+## 7) TLS 1.3 hardening (Milestone: broader HTTPS compatibility)
 1. Crypto primitives (no deps)
    - SHA-256, HMAC, HKDF
    - X25519 key exchange
@@ -191,7 +216,7 @@ Deliverable
 
 ---
 
-## 6) HTML parsing + DOM (Milestone: real pages render as readable documents)
+## 8) HTML parsing + DOM (Milestone: real pages render as readable documents)
 1. HTML tokenizer/parser (pragmatic subset)
    - Handle common tags: `html`, `head`, `body`, `div`, `span`, `p`, `a`, `img`, `ul/ol/li`, `h1..h6`, `pre`, `code`, `br`, `hr`.
    - Handle entity decoding for common entities.
@@ -209,7 +234,7 @@ Deliverable
 
 ---
 
-## 7) CSS subset + layout engine (Milestone: looks “web-like”)
+## 9) CSS subset + layout engine (Milestone: looks “web-like”)
 1. CSS parsing
    - `style` tags and inline `style` attributes.
    - Minimal selector support: tag, class, id; descendant.
@@ -235,7 +260,7 @@ Deliverable
 
 ---
 
-## 8) JavaScript (Milestone: navigation works on modern sites)
+## 10) JavaScript (Milestone: navigation works on modern sites)
 1. Strategy: incremental JS capability
    - Phase A: no JS; show noscript fallback.
    - Phase B: minimal interpreter to run trivial scripts.
@@ -261,7 +286,7 @@ Deliverable
 
 ---
 
-## 9) Performance + memory (Milestone: fast and stable)
+## 11) Performance + memory (Milestone: fast and stable)
 1. Profiling hooks
    - Frame time, layout time, paint time.
 
@@ -277,7 +302,7 @@ Deliverable
 
 ---
 
-## 10) Hardening + “useful browser” features
+## 12) Hardening + “useful browser” features
 1. Basic security
    - TLS verification defaults on.
    - Same-origin basics.
@@ -297,6 +322,7 @@ Deliverable
 1. UI + input (URL bar, scrolling text pane)
 2. HTTP/1.1 over plain TCP to a local test server
 3. TLS 1.3 + HTTPS GET to a couple of stable sites
-4. HTML parsing and simple layout (readable articles)
-5. CSS subset for “web-like” appearance
-6. JS incrementally, only as needed for target sites
+4. HTTP response headers + redirect following (reach final 200, no compression)
+5. HTML parsing and simple layout (readable articles)
+6. CSS subset for “web-like” appearance
+7. JS incrementally, only as needed for target sites
