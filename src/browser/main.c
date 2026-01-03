@@ -1223,6 +1223,14 @@ static void draw_body_wrapped(struct shm_fb *fb,
 		struct img_sniff_cache_entry *entry;
 	} img_box = {0};
 
+	struct {
+		uint8_t active;
+		uint32_t rows_total;
+		uint32_t row_in_box; /* 1..=pixel rows (label row is rendered on marker row) */
+		uint32_t cols_total; /* total box width in text columns */
+		struct img_sniff_cache_entry *entry;
+	} float_box = {0};
+
 	/* Skip scroll_rows lines by running the layout forward.
 	 * Track whether we are currently inside an image placeholder so that
 	 * scrolling into the middle of an image still renders the correct slice.
@@ -1230,7 +1238,18 @@ static void draw_body_wrapped(struct shm_fb *fb,
 	size_t pos = 0;
 	char line[1024];
 	for (uint32_t s = 0; s < scroll_rows; s++) {
-		int r = text_layout_next_line(text, &pos, max_cols, line, sizeof(line));
+		uint32_t use_cols = max_cols;
+		if (float_box.active) {
+			uint32_t fcols = float_box.cols_total;
+			if (max_cols > 12u) {
+				if (fcols > max_cols - 10u) fcols = max_cols - 10u;
+			} else {
+				if (fcols > max_cols - 1u) fcols = max_cols - 1u;
+			}
+			use_cols = (max_cols > (fcols + 1u)) ? (max_cols - fcols - 1u) : 1u;
+			if (use_cols < 1u) use_cols = 1u;
+		}
+		int r = text_layout_next_line(text, &pos, use_cols, line, sizeof(line));
 		if (r != 0) break;
 		if (img_box.active) {
 			img_box.row_in_box++;
@@ -1246,6 +1265,19 @@ static void draw_body_wrapped(struct shm_fb *fb,
 				rows = rows * 10u + (uint32_t)(line[p] - '0');
 				p++;
 			}
+			while (line[p] == ' ') p++;
+			char *tok = &line[p];
+			while (line[p] && line[p] != ' ' && (uint8_t)line[p] != 0x1f) p++;
+			char tok_end = line[p];
+			line[p] = 0;
+			int is_float = (tok[0] == 'F' && tok[1] == 'R');
+			uint32_t fcols = 0;
+			if (is_float) {
+				for (size_t k = 2; tok[k] >= '0' && tok[k] <= '9'; k++) {
+					fcols = fcols * 10u + (uint32_t)(tok[k] - '0');
+				}
+			}
+			line[p] = tok_end;
 			if (rows < 2u) rows = 2u;
 			if (rows > 200u) rows = 200u;
 			/* Find URL payload to get cache entry (best-effort). */
@@ -1256,16 +1288,60 @@ static void draw_body_wrapped(struct shm_fb *fb,
 					break;
 				}
 			}
-			img_box.entry = img_cache_find_done(active_host, url ? url : "");
-			img_box.active = 1;
-			img_box.rows_total = rows;
-			img_box.row_in_box = 1; /* marker row was skipped */
+			if (is_float && fcols > 0) {
+				float_box.entry = img_cache_find_done(active_host, url ? url : "");
+				float_box.active = 1;
+				float_box.rows_total = rows;
+				if (fcols < 6u) fcols = 6u;
+				if (fcols > 80u) fcols = 80u;
+				float_box.cols_total = fcols;
+				float_box.row_in_box = 0;
+
+				/* The renderer draws the float label row and also consumes the next
+				 * wrapped text line in the *same* visual row. Mirror that here so
+				 * scrolling keeps pos aligned with what is actually displayed.
+				 */
+				uint32_t use_cols2 = max_cols;
+				{
+					uint32_t f2 = float_box.cols_total;
+					if (max_cols > 12u) {
+						if (f2 > max_cols - 10u) f2 = max_cols - 10u;
+					} else {
+						if (f2 > max_cols - 1u) f2 = max_cols - 1u;
+					}
+					use_cols2 = (max_cols > (f2 + 1u)) ? (max_cols - f2 - 1u) : 1u;
+					if (use_cols2 < 1u) use_cols2 = 1u;
+				}
+				(void)text_layout_next_line(text, &pos, use_cols2, line, sizeof(line));
+			} else {
+				img_box.entry = img_cache_find_done(active_host, url ? url : "");
+				img_box.active = 1;
+				img_box.rows_total = rows;
+				img_box.row_in_box = 1; /* marker row was skipped */
+			}
+		}
+		if (float_box.active) {
+			float_box.row_in_box++;
+			if (float_box.row_in_box >= float_box.rows_total) {
+				float_box.active = 0;
+			}
 		}
 	}
 
 	for (uint32_t row = 0; row < max_rows; row++) {
 		size_t start = 0;
-		int r = text_layout_next_line_ex(text, &pos, max_cols, line, sizeof(line), &start);
+		uint32_t use_cols = max_cols;
+		if (float_box.active) {
+			uint32_t fcols = float_box.cols_total;
+			if (max_cols > 12u) {
+				if (fcols > max_cols - 10u) fcols = max_cols - 10u;
+			} else {
+				if (fcols > max_cols - 1u) fcols = max_cols - 1u;
+			}
+			use_cols = (max_cols > (fcols + 1u)) ? (max_cols - fcols - 1u) : 1u;
+			if (use_cols < 1u) use_cols = 1u;
+		}
+		int r = text_layout_next_line_ex(text, &pos, use_cols, line, sizeof(line), &start);
 		if (r != 0) return;
 		uint32_t row_y = y + row * 16u;
 
@@ -1327,8 +1403,64 @@ static void draw_body_wrapped(struct shm_fb *fb,
 			continue;
 		}
 
+		/* If a float is active for this row, draw its pixel slice on the right.
+		 * (The label row is drawn when we encounter the marker line.)
+		 */
+		if (float_box.active) {
+			uint32_t rows_total = float_box.rows_total;
+			uint32_t rbox = float_box.row_in_box;
+			uint32_t content_bottom = y + h_px;
+			if (fb->height < content_bottom) content_bottom = fb->height;
+			uint32_t remaining_h = (content_bottom > row_y) ? (content_bottom - row_y) : 0u;
+			uint32_t row_h = (remaining_h > 16u) ? 16u : remaining_h;
+			uint32_t max_w = (fb->width > x) ? (fb->width - x) : 0u;
+			if (row_h != 0u && max_w != 0u && rows_total >= 2u && rbox >= 1u) {
+				uint32_t fcols = float_box.cols_total;
+				if (max_cols > 12u) {
+					if (fcols > max_cols - 10u) fcols = max_cols - 10u;
+				} else if (fcols > max_cols - 1u) {
+					fcols = max_cols - 1u;
+				}
+				uint32_t box_w = fcols * 8u;
+				if (box_w > w_px) box_w = w_px;
+				if (box_w > max_w) box_w = max_w;
+				/* Optional width shrink based on known dimensions. */
+				if (float_box.entry && float_box.entry->has_dims) {
+					uint32_t want_w = (uint32_t)float_box.entry->w + 2u;
+					if (want_w < 32u) want_w = 32u;
+					if (want_w < box_w) box_w = want_w;
+				}
+				/* Cap floats to at most half the content width. */
+				if (box_w > w_px / 2u) box_w = w_px / 2u;
+				if (box_w >= 2u) {
+					uint32_t fx = x + ((w_px > box_w) ? (w_px - box_w) : 0u);
+					uint32_t col = 0xff505058u;
+					fill_rect_u32(fb->pixels, fb->stride, fx, row_y, 1u, row_h, col);
+					fill_rect_u32(fb->pixels, fb->stride, fx + box_w - 1u, row_y, 1u, row_h, col);
+					if (rbox + 1u == rows_total && row_h > 0u) {
+						fill_rect_u32(fb->pixels, fb->stride, fx, row_y + row_h - 1u, box_w, 1u, col);
+					}
+					if (float_box.entry && float_box.entry->has_pixels) {
+						uint32_t inner_x = fx + 1u;
+						uint32_t inner_w = (box_w > 2u) ? (box_w - 2u) : 0u;
+						uint32_t dst_h = row_h;
+						if (rbox + 1u == rows_total && dst_h > 0u) {
+							dst_h = (dst_h > 1u) ? (dst_h - 1u) : 0u;
+						}
+						uint32_t src_y0 = (rbox - 1u) * 16u;
+						if (dst_h != 0u && src_y0 < (uint32_t)float_box.entry->pix_h) {
+							const uint32_t *src = &g_img_pixel_pool[float_box.entry->pix_off] + (size_t)src_y0 * (size_t)float_box.entry->pix_w;
+							uint32_t src_h = (uint32_t)float_box.entry->pix_h - src_y0;
+							blit_xrgb_clipped(fb, inner_x, row_y, inner_w, dst_h, src, float_box.entry->pix_w, src_h);
+						}
+					}
+				}
+			}
+		}
+
 		/* Image placeholder marker row: draw real lines in framebuffer.
-		 * Marker format: 0x1e "IMG <rows> ? <label>" 0x1f "<url>".
+		 * Marker format: 0x1e "IMG <rows> <token> <label>" 0x1f "<url>".
+		 * Token is either "?" (block placeholder) or "FR<cols>" (float-right).
 		 * Format is sniffed from the first bytes of the URL.
 		 */
 		if (line[0] == (char)0x1e && line[1] == 'I' && line[2] == 'M' && line[3] == 'G' && line[4] == ' ') {
@@ -1341,8 +1473,19 @@ static void draw_body_wrapped(struct shm_fb *fb,
 				p++;
 			}
 			while (line[p] == ' ') p++;
-			/* Skip placeholder format token (renderer sniffs actual format). */
+			/* Parse placeholder token (renderer still sniffs actual image format). */
+			char *tok = &line[p];
 			while (line[p] && line[p] != ' ' && (uint8_t)line[p] != 0x1f) p++;
+			char tok_end = line[p];
+			line[p] = 0;
+			int is_float = (tok[0] == 'F' && tok[1] == 'R');
+			uint32_t fcols = 0;
+			if (is_float) {
+				for (size_t k = 2; tok[k] >= '0' && tok[k] <= '9'; k++) {
+					fcols = fcols * 10u + (uint32_t)(tok[k] - '0');
+				}
+			}
+			line[p] = tok_end;
 			while (line[p] == ' ') p++;
 			char *label = &line[p];
 			char *url = 0;
@@ -1354,71 +1497,156 @@ static void draw_body_wrapped(struct shm_fb *fb,
 				}
 			}
 			enum img_fmt sniffed = img_cache_get_or_mark_pending(active_host, url ? url : "");
-			img_box.entry = img_cache_find_done(active_host, url ? url : "");
+			struct img_sniff_cache_entry *entry = img_cache_find_done(active_host, url ? url : "");
 			const char *fmt = img_fmt_token(sniffed);
 			if (rows < 2u) rows = 2u;
 			if (rows > 200u) rows = 200u;
-
-			/* Draw only the marker row (top border + label). The following reserved
-			 * blank lines will be rendered row-by-row so scrolling into the middle
-			 * of an image still shows pixels.
-			 */
-			uint32_t content_bottom = y + h_px;
-			if (fb->height < content_bottom) content_bottom = fb->height;
-			uint32_t remaining_h = (content_bottom > row_y) ? (content_bottom - row_y) : 0u;
-			uint32_t row_h = (remaining_h > 16u) ? 16u : remaining_h;
-			uint32_t max_w = (fb->width > x) ? (fb->width - x) : 0u;
-			uint32_t box_w = w_px;
-			if (box_w > max_w) box_w = max_w;
-			if (img_box.entry && img_box.entry->has_dims) {
-				uint32_t want_w = (uint32_t)img_box.entry->w + 2u;
-				if (want_w < 32u) want_w = 32u;
-				if (want_w < box_w) box_w = want_w;
-			}
-			uint32_t col = 0xff505058u;
-			if (row_h != 0u && box_w != 0u) {
-				/* Top border for this row */
-				fill_rect_u32(fb->pixels, fb->stride, x, row_y, box_w, 1u, col);
-				/* Left + right borders for this row */
-				if (box_w >= 2u) {
-					fill_rect_u32(fb->pixels, fb->stride, x, row_y, 1u, row_h, col);
-					fill_rect_u32(fb->pixels, fb->stride, x + box_w - 1u, row_y, 1u, row_h, col);
+			if (is_float && fcols > 0) {
+				/* Float-right marker row: draw only the label row on the right,
+				 * and render the next text line alongside it in the same visual row.
+				 */
+				uint32_t content_bottom = y + h_px;
+				if (fb->height < content_bottom) content_bottom = fb->height;
+				uint32_t remaining_h = (content_bottom > row_y) ? (content_bottom - row_y) : 0u;
+				uint32_t row_h = (remaining_h > 16u) ? 16u : remaining_h;
+				uint32_t max_w = (fb->width > x) ? (fb->width - x) : 0u;
+				if (fcols < 6u) fcols = 6u;
+				if (fcols > 80u) fcols = 80u;
+				uint32_t box_w = fcols * 8u;
+				if (box_w > w_px) box_w = w_px;
+				if (box_w > max_w) box_w = max_w;
+				if (entry && entry->has_dims) {
+					uint32_t want_w = (uint32_t)entry->w + 2u;
+					if (want_w < 32u) want_w = 32u;
+					if (want_w < box_w) box_w = want_w;
 				}
-			}
-			/* Label: show format in orange, then the rest in normal. */
-			struct text_color fmtc = tc;
-			fmtc.fg = 0xffffa000u;
-			uint32_t label_x = x + 8u;
-			uint32_t label_w = (box_w > 16u) ? (box_w - 16u) : 0u;
-			if (fmt[0] != 0 && label_w >= 8u * 4u) {
-				draw_text_u32(fb->pixels, fb->stride, label_x, row_y + 6u, fmt, fmtc);
-				label_x += 8u * 5u; /* fmt + space */
-				label_w = (label_w > 8u * 5u) ? (label_w - 8u * 5u) : 0u;
-			}
-			if (img_box.entry && img_box.entry->has_dims && label_w >= 8u * 6u) {
-				char wdec[11];
-				char hdec[11];
-				u32_to_dec(wdec, (uint32_t)img_box.entry->w);
-				u32_to_dec(hdec, (uint32_t)img_box.entry->h);
-				char dims[32];
-				size_t di = 0;
-				for (size_t ii = 0; wdec[ii] && di + 1 < sizeof(dims); ii++) dims[di++] = wdec[ii];
-				if (di + 1 < sizeof(dims)) dims[di++] = 'x';
-				for (size_t ii = 0; hdec[ii] && di + 1 < sizeof(dims); ii++) dims[di++] = hdec[ii];
-				if (di + 1 < sizeof(dims)) dims[di++] = ' ';
-				dims[di] = 0;
-				draw_text_u32(fb->pixels, fb->stride, label_x, row_y + 6u, dims, fmtc);
-				uint32_t adv = (uint32_t)di * 8u;
-				label_x += adv;
-				label_w = (label_w > adv) ? (label_w - adv) : 0u;
-			}
-			draw_text_clipped_u32(fb->pixels, fb->stride, label_x, row_y + 6u, label_w, label, tc);
+				if (box_w > w_px / 2u) box_w = w_px / 2u;
+				uint32_t fx = x + ((w_px > box_w) ? (w_px - box_w) : 0u);
+				uint32_t col = 0xff505058u;
+				if (row_h != 0u && box_w != 0u) {
+					fill_rect_u32(fb->pixels, fb->stride, fx, row_y, box_w, 1u, col);
+					if (box_w >= 2u) {
+						fill_rect_u32(fb->pixels, fb->stride, fx, row_y, 1u, row_h, col);
+						fill_rect_u32(fb->pixels, fb->stride, fx + box_w - 1u, row_y, 1u, row_h, col);
+					}
+				}
+				struct text_color fmtc = tc;
+				fmtc.fg = 0xffffa000u;
+				uint32_t label_x = fx + 8u;
+				uint32_t label_w = (box_w > 16u) ? (box_w - 16u) : 0u;
+				if (fmt[0] != 0 && label_w >= 8u * 4u) {
+					draw_text_u32(fb->pixels, fb->stride, label_x, row_y + 6u, fmt, fmtc);
+					label_x += 8u * 5u;
+					label_w = (label_w > 8u * 5u) ? (label_w - 8u * 5u) : 0u;
+				}
+				if (entry && entry->has_dims && label_w >= 8u * 6u) {
+					char wdec[11];
+					char hdec[11];
+					u32_to_dec(wdec, (uint32_t)entry->w);
+					u32_to_dec(hdec, (uint32_t)entry->h);
+					char dims[32];
+					size_t di = 0;
+					for (size_t ii = 0; wdec[ii] && di + 1 < sizeof(dims); ii++) dims[di++] = wdec[ii];
+					if (di + 1 < sizeof(dims)) dims[di++] = 'x';
+					for (size_t ii = 0; hdec[ii] && di + 1 < sizeof(dims); ii++) dims[di++] = hdec[ii];
+					if (di + 1 < sizeof(dims)) dims[di++] = ' ';
+					dims[di] = 0;
+					draw_text_u32(fb->pixels, fb->stride, label_x, row_y + 6u, dims, fmtc);
+					uint32_t adv = (uint32_t)di * 8u;
+					label_x += adv;
+					label_w = (label_w > adv) ? (label_w - adv) : 0u;
+				}
+				draw_text_clipped_u32(fb->pixels, fb->stride, label_x, row_y + 6u, label_w, label, tc);
 
-			/* Activate per-row rendering for the reserved blank lines that follow. */
-			img_box.active = 1;
-			img_box.rows_total = rows;
-			img_box.row_in_box = 1;
-			continue;
+				/* Activate float; pixel rows start on the next visual row. */
+				float_box.active = 1;
+				float_box.rows_total = rows;
+				float_box.row_in_box = 0;
+				float_box.cols_total = fcols;
+				float_box.entry = entry;
+
+				/* Replace this marker line with the next text line, rendered with
+				 * reduced width so it flows beside the float.
+				 */
+				use_cols = max_cols;
+				{
+					uint32_t f2 = float_box.cols_total;
+					if (max_cols > 12u) {
+						if (f2 > max_cols - 10u) f2 = max_cols - 10u;
+					} else {
+						if (f2 > max_cols - 1u) f2 = max_cols - 1u;
+					}
+					use_cols = (max_cols > (f2 + 1u)) ? (max_cols - f2 - 1u) : 1u;
+					if (use_cols < 1u) use_cols = 1u;
+				}
+				start = 0;
+				line[0] = 0;
+				(void)text_layout_next_line_ex(text, &pos, use_cols, line, sizeof(line), &start);
+				/* Fall through to normal text rendering for this row (do NOT also render a block placeholder). */
+			} else {
+				img_box.entry = entry;
+
+				/* Draw only the marker row (top border + label). The following reserved
+				 * blank lines will be rendered row-by-row so scrolling into the middle
+				 * of an image still shows pixels.
+				 */
+				uint32_t content_bottom = y + h_px;
+				if (fb->height < content_bottom) content_bottom = fb->height;
+				uint32_t remaining_h = (content_bottom > row_y) ? (content_bottom - row_y) : 0u;
+				uint32_t row_h = (remaining_h > 16u) ? 16u : remaining_h;
+				uint32_t max_w = (fb->width > x) ? (fb->width - x) : 0u;
+				uint32_t box_w = w_px;
+				if (box_w > max_w) box_w = max_w;
+				if (img_box.entry && img_box.entry->has_dims) {
+					uint32_t want_w = (uint32_t)img_box.entry->w + 2u;
+					if (want_w < 32u) want_w = 32u;
+					if (want_w < box_w) box_w = want_w;
+				}
+				uint32_t col = 0xff505058u;
+				if (row_h != 0u && box_w != 0u) {
+					/* Top border for this row */
+					fill_rect_u32(fb->pixels, fb->stride, x, row_y, box_w, 1u, col);
+					/* Left + right borders for this row */
+					if (box_w >= 2u) {
+						fill_rect_u32(fb->pixels, fb->stride, x, row_y, 1u, row_h, col);
+						fill_rect_u32(fb->pixels, fb->stride, x + box_w - 1u, row_y, 1u, row_h, col);
+					}
+				}
+				/* Label: show format in orange, then the rest in normal. */
+				struct text_color fmtc = tc;
+				fmtc.fg = 0xffffa000u;
+				uint32_t label_x = x + 8u;
+				uint32_t label_w = (box_w > 16u) ? (box_w - 16u) : 0u;
+				if (fmt[0] != 0 && label_w >= 8u * 4u) {
+					draw_text_u32(fb->pixels, fb->stride, label_x, row_y + 6u, fmt, fmtc);
+					label_x += 8u * 5u; /* fmt + space */
+					label_w = (label_w > 8u * 5u) ? (label_w - 8u * 5u) : 0u;
+				}
+				if (img_box.entry && img_box.entry->has_dims && label_w >= 8u * 6u) {
+					char wdec[11];
+					char hdec[11];
+					u32_to_dec(wdec, (uint32_t)img_box.entry->w);
+					u32_to_dec(hdec, (uint32_t)img_box.entry->h);
+					char dims[32];
+					size_t di = 0;
+					for (size_t ii = 0; wdec[ii] && di + 1 < sizeof(dims); ii++) dims[di++] = wdec[ii];
+					if (di + 1 < sizeof(dims)) dims[di++] = 'x';
+					for (size_t ii = 0; hdec[ii] && di + 1 < sizeof(dims); ii++) dims[di++] = hdec[ii];
+					if (di + 1 < sizeof(dims)) dims[di++] = ' ';
+					dims[di] = 0;
+					draw_text_u32(fb->pixels, fb->stride, label_x, row_y + 6u, dims, fmtc);
+					uint32_t adv = (uint32_t)di * 8u;
+					label_x += adv;
+					label_w = (label_w > adv) ? (label_w - adv) : 0u;
+				}
+				draw_text_clipped_u32(fb->pixels, fb->stride, label_x, row_y + 6u, label_w, label, tc);
+
+				/* Activate per-row rendering for the reserved blank lines that follow. */
+				img_box.active = 1;
+				img_box.rows_total = rows;
+				img_box.row_in_box = 1;
+				continue;
+			}
 		}
 
 		char drawline[1024];
@@ -1469,6 +1697,13 @@ static void draw_body_wrapped(struct shm_fb *fb,
 			const uint32_t *src = &g_img_pixel_pool[e->pix_off];
 			blit_xrgb_clipped(fb, dx, dy, w, h, src, e->pix_w, e->pix_h);
 		}
+
+		if (float_box.active) {
+			float_box.row_in_box++;
+			if (float_box.row_in_box >= float_box.rows_total) {
+				float_box.active = 0;
+			}
+		}
 	}
 }
 
@@ -1493,6 +1728,123 @@ static void render_page(struct shm_fb *fb,
 	fb->hdr->frame_counter++;
 }
 
+static int text_layout_index_for_row_col_with_float_right(const char *text,
+						  uint32_t max_cols,
+						  uint32_t target_row,
+						  uint32_t target_col,
+						  size_t *out_index)
+{
+	if (!text || !out_index || max_cols == 0) return -1;
+	struct {
+		uint8_t active;
+		uint32_t rows_total;
+		uint32_t row_in_box;
+		uint32_t cols_total;
+	} float_box = {0};
+
+	size_t pos = 0;
+	char line[256];
+	for (uint32_t row = 0; ; row++) {
+		uint32_t use_cols = max_cols;
+		uint32_t text_cols = max_cols;
+		if (float_box.active) {
+			uint32_t fcols = float_box.cols_total;
+			if (max_cols > 12u) {
+				if (fcols > max_cols - 10u) fcols = max_cols - 10u;
+			} else {
+				if (fcols > max_cols - 1u) fcols = max_cols - 1u;
+			}
+			text_cols = (max_cols > (fcols + 1u)) ? (max_cols - fcols - 1u) : 1u;
+			if (text_cols < 1u) text_cols = 1u;
+			use_cols = text_cols;
+		}
+		size_t start = 0;
+		int r = text_layout_next_line_ex(text, &pos, use_cols, line, sizeof(line), &start);
+		if (r != 0) return -1;
+
+		/* Update float state from marker rows.
+		 * For float markers, treat the next text line as the clickable content
+		 * for this same visual row (matching the renderer).
+		 */
+		if (line[0] == (char)0x1e && line[1] == 'I' && line[2] == 'M' && line[3] == 'G' && line[4] == ' ') {
+			uint32_t rows_total = 0;
+			size_t p = 5;
+			while (line[p] >= '0' && line[p] <= '9') {
+				rows_total = rows_total * 10u + (uint32_t)(line[p] - '0');
+				p++;
+			}
+			while (line[p] == ' ') p++;
+			char *tok = &line[p];
+			while (line[p] && line[p] != ' ' && (uint8_t)line[p] != 0x1f) p++;
+			char tok_end = line[p];
+			line[p] = 0;
+			int is_float = (tok[0] == 'F' && tok[1] == 'R');
+			uint32_t fcols = 0;
+			if (is_float) {
+				for (size_t k = 2; tok[k] >= '0' && tok[k] <= '9'; k++) {
+					fcols = fcols * 10u + (uint32_t)(tok[k] - '0');
+				}
+			}
+			line[p] = tok_end;
+			if (is_float && fcols > 0 && rows_total >= 2u) {
+				if (rows_total > 200u) rows_total = 200u;
+				if (fcols < 6u) fcols = 6u;
+				if (fcols > 80u) fcols = 80u;
+				float_box.active = 1;
+				float_box.rows_total = rows_total;
+				float_box.row_in_box = 0;
+				float_box.cols_total = fcols;
+
+				/* Replace marker row with next text line for click mapping on this row. */
+				uint32_t f2 = float_box.cols_total;
+				uint32_t use_cols2 = max_cols;
+				uint32_t text_cols2 = max_cols;
+				if (max_cols > 12u) {
+					if (f2 > max_cols - 10u) f2 = max_cols - 10u;
+				} else {
+					if (f2 > max_cols - 1u) f2 = max_cols - 1u;
+				}
+				text_cols2 = (max_cols > (f2 + 1u)) ? (max_cols - f2 - 1u) : 1u;
+				if (text_cols2 < 1u) text_cols2 = 1u;
+				use_cols2 = text_cols2;
+
+				size_t start2 = 0;
+				char line2[256];
+				line2[0] = 0;
+				int r2 = text_layout_next_line_ex(text, &pos, use_cols2, line2, sizeof(line2), &start2);
+				if (row == target_row) {
+					if (target_col >= text_cols2) return -1;
+					if (r2 != 0) return -1;
+					if (line2[0] == (char)0x1e) return -1;
+					size_t len2 = c_strlen(line2);
+					if (target_col >= len2) return -1;
+					*out_index = start2 + (size_t)target_col;
+					return 0;
+				}
+
+				/* Non-target row: treat it as rendered; proceed to float row counter update below. */
+				line[0] = 0;
+			}
+		}
+
+		if (row == target_row) {
+			if (float_box.active && target_col >= text_cols) return -1;
+			if (line[0] == (char)0x1e) return -1;
+			size_t len = c_strlen(line);
+			if (target_col >= len) return -1;
+			*out_index = start + (size_t)target_col;
+			return 0;
+		}
+
+		if (float_box.active) {
+			float_box.row_in_box++;
+			if (float_box.row_in_box >= float_box.rows_total) {
+				float_box.active = 0;
+			}
+		}
+	}
+}
+
 static int ui_try_link_click(uint32_t x,
 			    uint32_t y,
 			    uint32_t width,
@@ -1513,7 +1865,7 @@ static int ui_try_link_click(uint32_t x,
 	uint32_t col = (x - 8) / 8u;
 	row += scroll_rows;
 	size_t idx = 0;
-	if (text_layout_index_for_row_col(visible_text, max_cols, row, col, &idx) != 0) return 0;
+	if (text_layout_index_for_row_col_with_float_right(visible_text, max_cols, row, col, &idx) != 0) return 0;
 	if (idx > 0xffffffffu) return 0;
 	const char *href = links_href_at_index(links, (uint32_t)idx);
 	if (!href || href[0] == 0) return 0;

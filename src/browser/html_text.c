@@ -1392,10 +1392,25 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 					last_was_space = 0;
 					append_space_collapse(out, out_len, &o, &last_was_space);
 				} else {
+					/* Float heuristic: if dimensions look like a thumbnail, request a float-right box.
+					 * This is intentionally conservative and generic.
+					 */
+					int float_right = 0;
+					uint32_t float_cols = 0;
+					if (img_w > 0 && img_h > 0 && img_w <= 240u) {
+						float_right = 1;
+						/* total box width in text columns, including borders */
+						float_cols = (img_w + 7u) / 8u;
+						float_cols += 2u;
+						if (float_cols < 10u) float_cols = 10u;
+						if (float_cols > 40u) float_cols = 40u;
+					}
+
 					/* Block image placeholder: emit a marker line and reserve rows.
 					 * Renderer draws the actual rectangle lines in the framebuffer.
-					 * Format: 0x1e "IMG <rows> ? <label>" 0x1f "<url>" \n + (rows-1) blank lines.
-					 * The format token is a placeholder; the renderer will sniff the URL.
+					 * Format: 0x1e "IMG <rows> <token> <label>" 0x1f "<url>" \n + (rows-1) blank lines.
+					 * Token is either "?" (block) or "FR<cols>" (float-right, width in columns).
+					 * The renderer will still sniff the URL for the real image format.
 					 */
 					uint32_t rows_total = 8u;
 					if (img_h > 0) {
@@ -1424,7 +1439,14 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 					char rows_dec[11];
 					u32_to_dec_local(rows_dec, rows_total);
 					append_str(out, out_len, &o, rows_dec);
-					append_str(out, out_len, &o, " ?");
+					if (float_right && float_cols > 0) {
+						append_str(out, out_len, &o, " FR");
+						char cols_dec[11];
+						u32_to_dec_local(cols_dec, float_cols);
+						append_str(out, out_len, &o, cols_dec);
+					} else {
+						append_str(out, out_len, &o, " ?");
+					}
 					if (label[0] != 0) {
 						(void)append_char(out, out_len, &o, ' ');
 						append_str(out, out_len, &o, label);
@@ -1434,8 +1456,10 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 						append_str(out, out_len, &o, src_tmp);
 					}
 					(void)append_char(out, out_len, &o, '\n');
-					for (uint32_t rr = 1; rr < rows_total; rr++) {
-						(void)append_char(out, out_len, &o, '\n');
+					if (!(float_right && float_cols > 0)) {
+						for (uint32_t rr = 1; rr < rows_total; rr++) {
+							(void)append_char(out, out_len, &o, '\n');
+						}
 					}
 					last_was_space = 1;
 					append_blankline_collapse(out, out_len, &o, &last_was_space);

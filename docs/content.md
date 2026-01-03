@@ -115,6 +115,39 @@ Tests
 - Tokenize + visible-text filter (Phase 1)
 - Layout + render (this phase)
 
+### Step 2.3: Make text flow around some images (minimal “float”)
+Motivation
+- Right now block images reserve N full-width blank text rows, so we waste horizontal space next to images.
+- Wikipedia often uses narrow thumbnails/infobox images where simple float-style wrapping dramatically improves readability.
+
+Design constraints (match current architecture)
+- No DOM layout engine; keep this as a renderer/layout enhancement on top of the existing text stream.
+- Keep everything bounded and deterministic; avoid Wikipedia-only hacks.
+- Preserve the existing block-image placeholder behavior for large images.
+
+Approach (incremental)
+1. Extend the image marker format to optionally request a float mode.
+  - Existing marker: `0x1e "IMG <rows> ? <label>" 0x1f "<url>"`.
+  - New token in place of `?`: `FR<cols>` (float-right, width in text columns). Example: `IMG 12 FR20 ...`.
+  - For floats: do **not** emit the “(rows-1) blank lines” reservation; the image will occupy the right side while text continues.
+2. Renderer support for float boxes.
+  - When a float marker is encountered, start a “float box” state for `rows_total` rows.
+  - For each row while float is active:
+    - Render the text line with a reduced `max_cols` so word-wrap happens in the remaining space.
+    - Draw the image box (borders + pixel slice) on the right side.
+  - Keep the existing full-width block placeholder for non-float markers.
+3. Hit-testing / click mapping.
+  - Current `row/col -> source index` assumes a constant `max_cols` for every row.
+  - Add a click-mapping path that replays layout with the same float state so links still work while wrapping around floats.
+
+Heuristics (generic)
+- Only float images with explicit dimensions and “thumbnail-ish” width (e.g. `img_w <= 240px`), otherwise use the existing block placeholder.
+- Clamp float width so it never leaves less than a small text area (e.g. at least 10 columns for text).
+
+Tests
+- Keep existing visible-text extraction tests unchanged (float markers are still markers; images without dimensions remain block placeholders).
+- Add a deterministic layout/hit-test regression test once float rendering is in place (e.g. a fixture with a float marker + adjacent text and a link).
+
 Regression test strategy
 - Add a local “fixture HTML” file under `tools/fixtures/` (small, curated) and test:
   - extracted visible text equals expected output
