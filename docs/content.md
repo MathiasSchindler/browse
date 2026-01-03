@@ -2,6 +2,10 @@
 
 Goal: starting from the current HTTPS fetch (status + headers), incrementally parse enough of the HTTP body to render **visible text** into the framebuffer, with regression tests after each step. Once text rendering is stable, add a minimal CSS pipeline in small, testable slices.
 
+North Star
+- Wikipedia readability is our primary “north star” while building, because it’s a real, popular, complex document.
+- We will not add Wikipedia-specific hacks/shortcuts that don’t generalize (or that would hurt other pages/projects). Prefer semantic, standards-based improvements that help broadly.
+
 Non-goals (for now): full HTML5 compliance, full CSS spec, JS, fonts, layout engine, images, forms.
 
 ---

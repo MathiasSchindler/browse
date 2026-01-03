@@ -7,9 +7,14 @@
 #include "../tls/selftest.h"
 #include "tls13_client.h"
 #include "html_text.h"
+#include "text_layout.h"
 
 #define FB_W 1920u
 #define FB_H 1080u
+
+#define UI_TOPBAR_H 24u
+#define UI_CONTENT_PAD_Y 2u
+#define UI_CONTENT_Y0 (UI_TOPBAR_H + UI_CONTENT_PAD_Y)
 
 enum {
 	HOST_BUF_LEN = 128,
@@ -21,6 +26,7 @@ static char g_visible[64 * 1024];
 static char g_status_bar[128];
 static char g_url_bar[URL_BUF_LEN];
 static char g_active_host[HOST_BUF_LEN];
+static struct html_links g_links;
 static uint32_t g_scroll_rows;
 static int g_have_page;
 
@@ -76,7 +82,7 @@ static void draw_ui(struct shm_fb *fb, const char *active_host, const char *url_
 	fill_rect_u32(fb->pixels, fb->stride, 0, 0, fb->width, fb->height, 0xff101014u);
 
 	/* Title bar */
-	fill_rect_u32(fb->pixels, fb->stride, 0, 0, fb->width, 24, 0xff202028u);
+	fill_rect_u32(fb->pixels, fb->stride, 0, 0, fb->width, UI_TOPBAR_H, 0xff202028u);
 	struct text_color tc = { .fg = 0xffffffffu, .bg = 0, .opaque_bg = 0 };
 	struct text_color dim = { .fg = 0xffb0b0b0u, .bg = 0, .opaque_bg = 0 };
 
@@ -119,14 +125,98 @@ static void draw_ui(struct shm_fb *fb, const char *active_host, const char *url_
 	draw_text_clipped_u32(fb->pixels, fb->stride, url_x, 8, url_w, top, dim);
 
 	/* Body */
-	fill_rect_u32(fb->pixels, fb->stride, 0, 24, fb->width, fb->height - 24, 0xff101014u);
+	fill_rect_u32(fb->pixels, fb->stride, 0, UI_TOPBAR_H, fb->width, fb->height - UI_TOPBAR_H, 0xff101014u);
 
 	draw_text_u32(fb->pixels, fb->stride, 8, 40, line1, tc);
 	draw_text_u32(fb->pixels, fb->stride, 8, 56, line2, tc);
 	draw_text_u32(fb->pixels, fb->stride, 8, 72, line3, dim);
 }
 
-static void draw_body_wrapped(struct shm_fb *fb, uint32_t x, uint32_t y, uint32_t w_px, uint32_t h_px, const char *text, struct text_color tc)
+static int links_contains_index(const struct html_links *links, uint32_t idx)
+{
+	if (!links) return 0;
+	for (uint32_t i = 0; i < links->n && i < HTML_MAX_LINKS; i++) {
+		const struct html_link *l = &links->links[i];
+		if (idx >= l->start && idx < l->end) return 1;
+	}
+	return 0;
+}
+
+static uint32_t links_color_at_index(const struct html_links *links, uint32_t idx, uint32_t default_xrgb)
+{
+	if (!links) return default_xrgb;
+	for (uint32_t i = 0; i < links->n && i < HTML_MAX_LINKS; i++) {
+		const struct html_link *l = &links->links[i];
+		if (idx >= l->start && idx < l->end) {
+			if (l->has_fg) return l->fg_xrgb;
+			return default_xrgb;
+		}
+	}
+	return default_xrgb;
+}
+
+static const char *links_href_at_index(const struct html_links *links, uint32_t idx)
+{
+	if (!links) return 0;
+	for (uint32_t i = 0; i < links->n && i < HTML_MAX_LINKS; i++) {
+		const struct html_link *l = &links->links[i];
+		if (idx >= l->start && idx < l->end) return l->href;
+	}
+	return 0;
+}
+
+static void draw_line_with_links(struct shm_fb *fb,
+				 uint32_t x,
+				 uint32_t y,
+				 const char *line,
+				 size_t base_index,
+				 const struct html_links *links,
+				 struct text_color normal,
+				 struct text_color linkc)
+{
+	if (!fb || !line) return;
+	/* Build and draw segments where link/non-link state is constant. */
+	char seg[256];
+	uint32_t seg_x = x;
+	int seg_is_link = 0;
+	uint32_t seg_link_color = linkc.fg;
+	uint32_t si = 0;
+	for (uint32_t i = 0; line[i] != 0; i++) {
+		uint32_t idx = (base_index > 0xffffffffu) ? 0xffffffffu : (uint32_t)(base_index + (size_t)i);
+		int is_link = links_contains_index(links, idx);
+		uint32_t lc = is_link ? links_color_at_index(links, idx, linkc.fg) : normal.fg;
+		if (i == 0) seg_is_link = is_link;
+		if (i == 0) seg_link_color = lc;
+		if (is_link != seg_is_link || (is_link && lc != seg_link_color) || si + 2 >= sizeof(seg)) {
+			seg[si] = 0;
+			struct text_color c = seg_is_link ? linkc : normal;
+			if (seg_is_link) c.fg = seg_link_color;
+			draw_text_u32(fb->pixels, fb->stride, seg_x, y, seg, c);
+			seg_x += (uint32_t)si * 8u;
+			si = 0;
+			seg_is_link = is_link;
+			seg_link_color = lc;
+		}
+		seg[si++] = line[i];
+	}
+	if (si > 0) {
+		seg[si] = 0;
+		struct text_color c = seg_is_link ? linkc : normal;
+		if (seg_is_link) c.fg = seg_link_color;
+		draw_text_u32(fb->pixels, fb->stride, seg_x, y, seg, c);
+	}
+}
+
+static void draw_body_wrapped(struct shm_fb *fb,
+				     uint32_t x,
+				     uint32_t y,
+				     uint32_t w_px,
+				     uint32_t h_px,
+				     const char *text,
+				     const struct html_links *links,
+				     struct text_color tc,
+				     struct text_color linkc,
+				     uint32_t scroll_rows)
 {
 	if (!fb || !text) return;
 	uint32_t max_cols = (w_px / 8u);
@@ -134,97 +224,72 @@ static void draw_body_wrapped(struct shm_fb *fb, uint32_t x, uint32_t y, uint32_
 	if (max_cols == 0 || max_rows == 0) return;
 	if (max_cols > 255) max_cols = 255;
 
-	uint32_t row = 0;
-	uint32_t col = 0;
+	/* Skip scroll_rows lines by running the layout forward. */
+	size_t pos = 0;
 	char line[256];
-	uint32_t li = 0;
-	for (size_t i = 0; text[i] != 0; i++) {
-		char c = text[i];
-		if (c == '\r') continue;
-		if (c == '\n') {
-			line[li] = 0;
-			draw_text_u32(fb->pixels, fb->stride, x, y + row * 16u, line, tc);
-			row++;
-			col = 0;
-			li = 0;
-			if (row >= max_rows) return;
-			continue;
-		}
-		if (li + 1 >= sizeof(line)) {
-			line[li] = 0;
-			draw_text_u32(fb->pixels, fb->stride, x, y + row * 16u, line, tc);
-			row++;
-			col = 0;
-			li = 0;
-			if (row >= max_rows) return;
-		}
-		line[li++] = c;
-		col++;
-		if (col >= max_cols) {
-			line[li] = 0;
-			draw_text_u32(fb->pixels, fb->stride, x, y + row * 16u, line, tc);
-			row++;
-			col = 0;
-			li = 0;
-			if (row >= max_rows) return;
-		}
+	for (uint32_t s = 0; s < scroll_rows; s++) {
+		int r = text_layout_next_line(text, &pos, max_cols, line, sizeof(line));
+		if (r != 0) break;
 	}
-	if (li > 0 && row < max_rows) {
-		line[li] = 0;
-		draw_text_u32(fb->pixels, fb->stride, x, y + row * 16u, line, tc);
+
+	for (uint32_t row = 0; row < max_rows; row++) {
+		size_t start = 0;
+		int r = text_layout_next_line_ex(text, &pos, max_cols, line, sizeof(line), &start);
+		if (r != 0) return;
+		draw_line_with_links(fb, x, y + row * 16u, line, start, links, tc, linkc);
 	}
 }
+
 
 static void render_page(struct shm_fb *fb,
 				const char *active_host,
 				const char *url_bar,
 				const char *status_bar,
 				const char *visible_text,
+				const struct html_links *links,
 				uint32_t scroll_rows)
 {
 	struct text_color dim = { .fg = 0xffb0b0b0u, .bg = 0, .opaque_bg = 0 };
+	struct text_color linkc = { .fg = 0xff6aa8ffu, .bg = 0, .opaque_bg = 0 };
 	draw_ui(fb, active_host, url_bar, status_bar, "", "", "");
-	fill_rect_u32(fb->pixels, fb->stride, 0, 24, fb->width, (fb->height > 24) ? (fb->height - 24) : 0, 0xff101014u);
-	fill_rect_u32(fb->pixels, fb->stride, 0, 88, fb->width, (fb->height > 88) ? (fb->height - 88) : 0, 0xff101014u);
+	fill_rect_u32(fb->pixels, fb->stride, 0, UI_TOPBAR_H, fb->width, (fb->height > UI_TOPBAR_H) ? (fb->height - UI_TOPBAR_H) : 0, 0xff101014u);
 	uint32_t w_px = (fb->width > 16) ? (fb->width - 16) : 0;
-	uint32_t h_px = (fb->height > 96) ? (fb->height - 96) : 0;
-	/* Skip scroll_rows by pre-advancing through wrapped output. */
+	uint32_t y0 = UI_CONTENT_Y0;
+	uint32_t h_px = (fb->height > y0) ? (fb->height - y0) : 0;
 	if (!visible_text) visible_text = "";
-	if (scroll_rows == 0) {
-		draw_body_wrapped(fb, 8, 96, w_px, h_px, visible_text, dim);
-	} else {
-		/* Fast-ish skip: count produced rows without drawing, then draw the rest. */
-		uint32_t max_cols = (w_px / 8u);
-		if (max_cols == 0) max_cols = 1;
-		if (max_cols > 255) max_cols = 255;
-		uint32_t row = 0;
-		uint32_t col = 0;
-		size_t start_i = 0;
-		for (size_t i = 0; visible_text[i] != 0; i++) {
-			char c = visible_text[i];
-			if (c == '\r') continue;
-			if (c == '\n') {
-				row++;
-				col = 0;
-				if (row >= scroll_rows) {
-					start_i = i + 1;
-					break;
-				}
-				continue;
-			}
-			col++;
-			if (col >= max_cols) {
-				row++;
-				col = 0;
-				if (row >= scroll_rows) {
-					start_i = i + 1;
-					break;
-				}
-			}
-		}
-		draw_body_wrapped(fb, 8, 96, w_px, h_px, visible_text + start_i, dim);
-	}
+	draw_body_wrapped(fb, 8, y0, w_px, h_px, visible_text, links, dim, linkc, scroll_rows);
 	fb->hdr->frame_counter++;
+}
+
+static int ui_try_link_click(uint32_t x,
+			    uint32_t y,
+			    uint32_t width,
+			    const char *visible_text,
+			    const struct html_links *links,
+			    uint32_t scroll_rows,
+			    char *out_href,
+			    size_t out_href_len)
+{
+	if (!visible_text || !links || !out_href || out_href_len == 0) return 0;
+	if (y < UI_CONTENT_Y0) return 0;
+	if (x < 8) return 0;
+	uint32_t w_px = (width > 16) ? (width - 16) : 0;
+	uint32_t max_cols = (w_px / 8u);
+	if (max_cols == 0) max_cols = 1;
+	if (max_cols > 255) max_cols = 255;
+	uint32_t row = (y - UI_CONTENT_Y0) / 16u;
+	uint32_t col = (x - 8) / 8u;
+	row += scroll_rows;
+	size_t idx = 0;
+	if (text_layout_index_for_row_col(visible_text, max_cols, row, col, &idx) != 0) return 0;
+	if (idx > 0xffffffffu) return 0;
+	const char *href = links_href_at_index(links, (uint32_t)idx);
+	if (!href || href[0] == 0) return 0;
+	/* copy */
+	size_t o = 0;
+	for (; href[o] && o + 1 < out_href_len; o++) out_href[o] = href[o];
+	out_href[o] = 0;
+	return 1;
 }
 
 enum ui_action {
@@ -277,6 +342,7 @@ static void do_https_status(struct shm_fb *fb, char host[HOST_BUF_LEN], char pat
 	g_visible[0] = 0;
 	body[0] = 0;
 	g_status_bar[0] = 0;
+	g_links.n = 0;
 	g_scroll_rows = 0;
 	g_have_page = 0;
 
@@ -382,12 +448,12 @@ static void do_https_status(struct shm_fb *fb, char host[HOST_BUF_LEN], char pat
 
 	/* Render extracted visible text (best-effort). */
 	if (body_len > 0) {
-		(void)html_visible_text_extract(body, body_len, g_visible, sizeof(g_visible));
+		(void)html_visible_text_extract_links(body, body_len, g_visible, sizeof(g_visible), &g_links);
 	}
 	(void)c_strlcpy_s(g_url_bar, sizeof(g_url_bar), url_bar);
 	(void)c_strlcpy_s(g_active_host, sizeof(g_active_host), host);
 	g_have_page = 1;
-	render_page(fb, host, url_bar, g_status_bar, g_visible, g_scroll_rows);
+	render_page(fb, host, url_bar, g_status_bar, g_visible, &g_links, g_scroll_rows);
 }
 
 int main(void)
@@ -441,7 +507,7 @@ int main(void)
 				g_scroll_rows += inc;
 			}
 			if (g_have_page) {
-				render_page(&fb, g_active_host, g_url_bar, g_status_bar, g_visible, g_scroll_rows);
+				render_page(&fb, g_active_host, g_url_bar, g_status_bar, g_visible, &g_links, g_scroll_rows);
 			}
 		}
 
@@ -452,7 +518,7 @@ int main(void)
 				if (fb.hdr->mouse_last_button == 1u && fb.hdr->mouse_last_state == 1u) {
 					uint32_t x = fb.hdr->mouse_last_x;
 					uint32_t y = fb.hdr->mouse_last_y;
-					enum ui_action a = ui_action_from_click(&fb, x, y);
+						enum ui_action a = ui_action_from_click(&fb, x, y);
 					if (a == UI_GO_EN) {
 						(void)c_strlcpy_s(host, sizeof(host), "en.wikipedia.org");
 						(void)c_strlcpy_s(path, sizeof(path), "/");
@@ -475,6 +541,23 @@ int main(void)
 							draw_ui(&fb, host, url_bar, "", "Reload clicked", host, "Fetching ...");
 						fb.hdr->frame_counter++;
 						do_https_status(&fb, host, path, url_bar);
+						} else {
+							/* Body link click */
+							char href[HTML_HREF_MAX];
+							href[0] = 0;
+							if (g_have_page && ui_try_link_click(x, y, fb.width, g_visible, &g_links, g_scroll_rows, href, sizeof(href))) {
+								char new_host[HOST_BUF_LEN];
+								char new_path[PATH_BUF_LEN];
+								if (url_apply_location(host, href, new_host, sizeof(new_host), new_path, sizeof(new_path)) == 0) {
+									(void)c_strlcpy_s(host, sizeof(host), new_host);
+									(void)c_strlcpy_s(path, sizeof(path), new_path);
+									g_scroll_rows = 0;
+									compose_url_bar(url_bar, sizeof(url_bar), host, path);
+									draw_ui(&fb, host, url_bar, "", "Link clicked", href, "Fetching ...");
+									fb.hdr->frame_counter++;
+									do_https_status(&fb, host, path, url_bar);
+								}
+							}
 					}
 				}
 			}

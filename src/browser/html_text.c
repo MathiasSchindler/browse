@@ -31,6 +31,70 @@ static size_t min_sz(size_t a, size_t b)
 	return (a < b) ? a : b;
 }
 
+static void cpy_str_trunc(char *dst, size_t dst_cap, const char *src)
+{
+	if (!dst || dst_cap == 0) return;
+	dst[0] = 0;
+	if (!src) return;
+	size_t i = 0;
+	for (; src[i] && i + 1 < dst_cap; i++) dst[i] = src[i];
+	dst[i] = 0;
+}
+
+static int ieq_attr(const uint8_t *s, size_t n, const char *lit)
+{
+	/* Attribute names are ASCII; compare lowercased. */
+	for (size_t i = 0; i < n; i++) {
+		char lc = lit[i];
+		if (lc == 0) return 0;
+		if (to_lower(s[i]) != (uint8_t)lc) return 0;
+	}
+	return lit[n] == 0;
+}
+
+static int hex_nibble(uint8_t c, uint8_t *out)
+{
+	if (!out) return -1;
+	if (c >= '0' && c <= '9') { *out = (uint8_t)(c - '0'); return 0; }
+	if (c >= 'a' && c <= 'f') { *out = (uint8_t)(10 + (c - 'a')); return 0; }
+	if (c >= 'A' && c <= 'F') { *out = (uint8_t)(10 + (c - 'A')); return 0; }
+	return -1;
+}
+
+static int parse_css_color_from_style(const uint8_t *v, size_t vlen, uint32_t *out_xrgb)
+{
+	/* Very small parser: find "color" then parse #RRGGBB. */
+	if (!v || !out_xrgb) return -1;
+	for (size_t i = 0; i + 5 < vlen; i++) {
+		/* case-insensitive match "color" */
+		uint8_t c0 = to_lower(v[i + 0]);
+		uint8_t c1 = to_lower(v[i + 1]);
+		uint8_t c2 = to_lower(v[i + 2]);
+		uint8_t c3 = to_lower(v[i + 3]);
+		uint8_t c4 = to_lower(v[i + 4]);
+		if (!(c0 == 'c' && c1 == 'o' && c2 == 'l' && c3 == 'o' && c4 == 'r')) continue;
+		size_t j = i + 5;
+		while (j < vlen && (v[j] == ' ' || v[j] == '\t')) j++;
+		if (j >= vlen || v[j] != ':') continue;
+		j++;
+		while (j < vlen && (v[j] == ' ' || v[j] == '\t')) j++;
+		if (j + 7 > vlen || v[j] != '#') continue;
+		uint8_t r1, r2, g1, g2, b1, b2;
+		if (hex_nibble(v[j + 1], &r1) != 0) continue;
+		if (hex_nibble(v[j + 2], &r2) != 0) continue;
+		if (hex_nibble(v[j + 3], &g1) != 0) continue;
+		if (hex_nibble(v[j + 4], &g2) != 0) continue;
+		if (hex_nibble(v[j + 5], &b1) != 0) continue;
+		if (hex_nibble(v[j + 6], &b2) != 0) continue;
+		uint32_t rr = (uint32_t)((r1 << 4) | r2);
+		uint32_t gg = (uint32_t)((g1 << 4) | g2);
+		uint32_t bb = (uint32_t)((b1 << 4) | b2);
+		*out_xrgb = 0xff000000u | (rr << 16) | (gg << 8) | bb;
+		return 0;
+	}
+	return -1;
+}
+
 static int append_char(char *out, size_t out_len, size_t *io, char c)
 {
 	if (!out || !io || out_len == 0) return -1;
@@ -153,15 +217,37 @@ static int tag_is_block_break(const uint8_t *tag, size_t n)
 	return 0;
 }
 
-int html_visible_text_extract(const uint8_t *html, size_t html_len, char *out, size_t out_len)
+static int html_visible_text_extract_impl(const uint8_t *html,
+					 size_t html_len,
+					 char *out,
+					 size_t out_len,
+					 struct html_links *out_links)
 {
 	if (!out || out_len == 0) return -1;
 	out[0] = 0;
 	if (!html || html_len == 0) return 0;
+	if (out_links) {
+		out_links->n = 0;
+		for (size_t i = 0; i < HTML_MAX_LINKS; i++) {
+			out_links->links[i].start = 0;
+			out_links->links[i].end = 0;
+			out_links->links[i].fg_xrgb = 0;
+			out_links->links[i].has_fg = 0;
+			out_links->links[i].href[0] = 0;
+		}
+	}
 
 	size_t o = 0;
 	int last_was_space = 1;
 	int skip_mode = 0; /* 0=none, 1=script, 2=style, 3=noscript */
+	int seen_main = 0;
+	int in_main = 0;
+	int in_a = 0;
+	uint32_t a_start = 0;
+	char a_href[HTML_HREF_MAX];
+	a_href[0] = 0;
+	uint32_t a_fg_xrgb = 0;
+	uint8_t a_has_fg = 0;
 
 	for (size_t i = 0; i < html_len; i++) {
 		uint8_t c = html[i];
@@ -221,13 +307,117 @@ int html_visible_text_extract(const uint8_t *html, size_t html_len, char *out, s
 			for (size_t k = 0; k < nb; k++) name_buf[k] = to_lower(html[name_start + k]);
 			name_buf[nb] = 0;
 
+			/* Link open/close tracking (<a href="...">...</a>) */
+			if (out_links && nb == 1 && name_buf[0] == 'a') {
+				if (is_end) {
+					if (in_a && out_links->n < HTML_MAX_LINKS && a_href[0] != 0) {
+						struct html_link *ln = &out_links->links[out_links->n++];
+						ln->start = a_start;
+						ln->end = (o > 0xffffffffu) ? 0xffffffffu : (uint32_t)o;
+						ln->fg_xrgb = a_fg_xrgb;
+						ln->has_fg = a_has_fg;
+						cpy_str_trunc(ln->href, sizeof(ln->href), a_href);
+					}
+					in_a = 0;
+					a_href[0] = 0;
+					a_has_fg = 0;
+					a_fg_xrgb = 0;
+				} else {
+					/* Parse href=... within the tag. */
+					char href_tmp[HTML_HREF_MAX];
+					href_tmp[0] = 0;
+					uint32_t fg_tmp = 0;
+					uint8_t has_fg_tmp = 0;
+					size_t k = j;
+					while (k < html_len && html[k] != '>') {
+						while (k < html_len && is_ascii_space(html[k])) k++;
+						size_t an = k;
+						while (k < html_len && (is_alpha(html[k]) || html[k] == '-' || html[k] == '_')) k++;
+						size_t alen = k - an;
+						while (k < html_len && is_ascii_space(html[k])) k++;
+						if (alen == 0) {
+							k++;
+							continue;
+						}
+						if (k < html_len && html[k] == '=') {
+							k++;
+							while (k < html_len && is_ascii_space(html[k])) k++;
+							uint8_t q = 0;
+							if (k < html_len && (html[k] == '"' || html[k] == '\'')) {
+								q = html[k];
+								k++;
+							}
+							size_t vs = k;
+							if (q) {
+								while (k < html_len && html[k] != q) k++;
+							} else {
+								while (k < html_len && !is_ascii_space(html[k]) && html[k] != '>') k++;
+							}
+							size_t vlen = (k > vs) ? (k - vs) : 0;
+							if (q && k < html_len && html[k] == q) {
+								/* leave k at quote; next loop will advance */
+							}
+
+							if (ieq_attr(html + an, alen, "href") && vlen > 0) {
+								size_t w = 0;
+								for (; w < vlen && w + 1 < sizeof(href_tmp); w++) {
+									uint8_t hc = html[vs + w];
+									if (hc < 32 || hc >= 127) break;
+									href_tmp[w] = (char)hc;
+								}
+								href_tmp[w] = 0;
+							}
+							if (ieq_attr(html + an, alen, "style") && vlen > 0) {
+								if (parse_css_color_from_style(html + vs, vlen, &fg_tmp) == 0) {
+									has_fg_tmp = 1;
+								}
+							}
+						}
+						if (k < html_len && html[k] != '>') k++;
+					}
+					if (href_tmp[0] != 0) {
+						in_a = 1;
+						a_start = (o > 0xffffffffu) ? 0xffffffffu : (uint32_t)o;
+						cpy_str_trunc(a_href, sizeof(a_href), href_tmp);
+							a_has_fg = has_fg_tmp;
+							a_fg_xrgb = fg_tmp;
+					}
+				}
+			}
+
+				/* Semantic main: if <main> exists, prefer it as the primary content flow.
+				 * This is not Wikipedia-specific and helps avoid rendering nav/sidebar first.
+				 */
+				if (nb == 4 && ieq_lit_n(name_buf, nb, "main")) {
+					if (!is_end) {
+						if (!seen_main) {
+							/* Discard pre-main boilerplate (e.g. nav/sidebar). */
+							o = 0;
+							out[0] = 0;
+							last_was_space = 1;
+							if (out_links) {
+								out_links->n = 0;
+							}
+							in_a = 0;
+							a_href[0] = 0;
+							a_has_fg = 0;
+							a_fg_xrgb = 0;
+						}
+						seen_main = 1;
+						in_main = 1;
+					} else {
+						if (seen_main) in_main = 0;
+					}
+				}
+
 			if (!is_end) {
 				if (ieq_lit_n(name_buf, nb, "script")) skip_mode = 1;
 				else if (ieq_lit_n(name_buf, nb, "style")) skip_mode = 2;
 				else if (ieq_lit_n(name_buf, nb, "noscript")) skip_mode = 3;
 			}
 
-			if (tag_is_block_break(name_buf, nb)) {
+			int allow_output = (!seen_main || in_main);
+			if (allow_output && tag_is_block_break(name_buf, nb)) {
 				append_newline_collapse(out, out_len, &o, &last_was_space);
 			}
 
@@ -258,6 +448,11 @@ int html_visible_text_extract(const uint8_t *html, size_t html_len, char *out, s
 				}
 			}
 			/* fallback: treat '&' as normal char */
+		}
+
+		int allow_output = (!seen_main || in_main);
+		if (!allow_output) {
+			continue;
 		}
 
 		if (is_ascii_space(c)) {
@@ -293,4 +488,14 @@ int html_visible_text_extract(const uint8_t *html, size_t html_len, char *out, s
 		out[--o] = 0;
 	}
 	return 0;
+}
+
+int html_visible_text_extract(const uint8_t *html, size_t html_len, char *out, size_t out_len)
+{
+	return html_visible_text_extract_impl(html, html_len, out, out_len, 0);
+}
+
+int html_visible_text_extract_links(const uint8_t *html, size_t html_len, char *out, size_t out_len, struct html_links *out_links)
+{
+	return html_visible_text_extract_impl(html, html_len, out, out_len, out_links);
 }

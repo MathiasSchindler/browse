@@ -22,6 +22,11 @@ Constraints / goals
 - Networking requirement: IPv6-only. No IPv4 support, no tunneling (e.g. 6to4/Teredo), and no IPv4 fallback paths.
 - Product goal: fast, usable browsing for popular sites (not pixel-perfect)
 
+North Star (project principle)
+- Wikipedia readability is our “north star” for development milestones.
+- Avoid Wikipedia-specific shortcuts/hacks that don’t generalize or could harm other pages/projects.
+- Prefer semantic, standards-based improvements (HTML/CSS/HTTP) that benefit a broad set of sites.
+
 Dev-only exception
 - The windowed framebuffer viewer is allowed to use libc/SDL2 for development convenience. The shipping browser must not depend on them.
 

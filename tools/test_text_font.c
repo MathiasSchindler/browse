@@ -39,5 +39,47 @@ int main(void)
 			if (g[i] != expect[i]) return 1;
 		}
 	}
+	{
+		static const uint8_t expect[8] = {0x18, 0x18, 0x18, 0x18, 0x18, 0x00, 0x18, 0x00};
+		const uint8_t *g = glyph_for((unsigned char)'!');
+		for (size_t i = 0; i < 8; i++) {
+			if (g[i] != expect[i]) return 1;
+		}
+	}
+	{
+		static const uint8_t expect[8] = {0x66, 0x66, 0x24, 0x00, 0x00, 0x00, 0x00, 0x00};
+		const uint8_t *g = glyph_for((unsigned char)'"');
+		for (size_t i = 0; i < 8; i++) {
+			if (g[i] != expect[i]) return 1;
+		}
+	}
+	{
+		static const uint8_t expect[8] = {0x18, 0x18, 0x30, 0x00, 0x00, 0x00, 0x00, 0x00};
+		const uint8_t *g = glyph_for((unsigned char)'\'');
+		for (size_t i = 0; i < 8; i++) {
+			if (g[i] != expect[i]) return 1;
+		}
+	}
+	{
+		static const uint8_t expect[8] = {0x60, 0x30, 0x18, 0x0C, 0x06, 0x03, 0x01, 0x00};
+		const uint8_t *g = glyph_for((unsigned char)'\\');
+		for (size_t i = 0; i < 8; i++) {
+			if (g[i] != expect[i]) return 1;
+		}
+	}
+	{
+		static const uint8_t expect[8] = {0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x00};
+		const uint8_t *g = glyph_for((unsigned char)'|');
+		for (size_t i = 0; i < 8; i++) {
+			if (g[i] != expect[i]) return 1;
+		}
+	}
+	{
+		static const uint8_t expect[8] = {0x3C, 0x42, 0x9D, 0xA5, 0x9D, 0x41, 0x3E, 0x00};
+		const uint8_t *g = glyph_for((unsigned char)'@');
+		for (size_t i = 0; i < 8; i++) {
+			if (g[i] != expect[i]) return 1;
+		}
+	}
 	return 0;
 }
