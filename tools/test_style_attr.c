@@ -50,7 +50,14 @@ int main(void)
 {
 	if (expect("empty", "", 0, 0, 0, 0, 0, 0, 0)) return 1;
 	if (expect("color", "color:#ff0000", 1, 0xffff0000u, 0, 0, 0, 0, 0)) return 1;
+	if (expect("color_short_hex", "color:#f0a", 1, 0xffff00aau, 0, 0, 0, 0, 0)) return 1;
+	if (expect("color_rgb", "color: rgb(17, 34, 51)", 1, 0xff112233u, 0, 0, 0, 0, 0)) return 1;
+	if (expect("color_rgba", "color: rgba(17, 34, 51, 0.5)", 1, 0xff112233u, 0, 0, 0, 0, 0)) return 1;
+	if (expect("color_named", "color: black", 1, 0xff000000u, 0, 0, 0, 0, 0)) return 1;
 	if (expect("bg", "background-color:#00ff00", 0, 0, 1, 0xff00ff00u, 0, 0, 0)) return 1;
+	if (expect("bg_shorthand", "background:#010203", 0, 0, 1, 0xff010203u, 0, 0, 0)) return 1;
+	if (expect("color_var_fallback", "color: var(--x, #112233)", 1, 0xff112233u, 0, 0, 0, 0, 0)) return 1;
+	if (expect("bg_var_fallback", "background-color: var(--x, rgb(1,2,3))", 0, 0, 1, 0xff010203u, 0, 0, 0)) return 1;
 	if (expect("bold", "font-weight:bold", 0, 0, 0, 0, 1, 0, 0)) return 1;
 	if (expect("underline", "text-decoration: underline", 0, 0, 0, 0, 0, 1, 1)) return 1;
 	if (expect("underline_none", "text-decoration: none", 0, 0, 0, 0, 0, 1, 0)) return 1;

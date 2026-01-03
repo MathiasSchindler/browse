@@ -36,6 +36,16 @@ int main(void)
 	if (expect_eq("img_srcset_pick", "A<img srcset='https://x/y/a.webp 1x, https://x/y/b.png 2x'>B",
 	              "A\n\x1e" "IMG 8 ? b.png\x1fhttps://x/y/b.png\n\n\n\n\n\n\n\n\nB")) return 1;
 	if (expect_eq("img_inline_icon", "A<img width='24' height='24' alt='icon' src='x.png'>B", "A [img] B")) return 1;
+	if (expect_eq("inline_display_none", "<html><body>foo <span style=\"display:none\">HIDE</span> bar</body></html>", "foo bar")) return 1;
+	if (expect_eq("infobox_table_2col",
+	              "<html><body>"
+	              "<table class=\"infobox\">"
+	              "<tr><th colspan=\"2\" style=\"background:#F0F0F0\">Kidd-Klasse</th></tr>"
+	              "<tr><th>Land</th><td>Vereinigte Staaten</td></tr>"
+	              "<tr><th>Typ</th><td>U-Boot</td></tr>"
+	              "</table>"
+	              "</body></html>",
+	              "Kidd-Klasse\nLand: Vereinigte Staaten\nTyp: U-Boot")) return 1;
 
 	puts("visible-text selftest: OK");
 	return 0;

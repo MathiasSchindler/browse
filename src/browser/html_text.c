@@ -93,6 +93,76 @@ static int is_id_char(uint8_t c)
 	return is_alpha(c) || is_digit(c) || c == '_' || c == '-' || c == ':' || c == '.';
 }
 
+static int streq_ci_lit(const uint8_t *s, size_t n, const char *lit)
+{
+	if (!s || !lit) return 0;
+	for (size_t i = 0; i < n; i++) {
+		char lc = lit[i];
+		if (lc == 0) return 0;
+		if (to_lower(s[i]) != (uint8_t)lc) return 0;
+	}
+	return lit[n] == 0;
+}
+
+static int parse_inline_display(const uint8_t *s, size_t n, enum css_display *out_disp, int *out_has)
+{
+	if (out_has) *out_has = 0;
+	if (out_disp) *out_disp = CSS_DISPLAY_UNSET;
+	if (!s || n == 0 || !out_disp || !out_has) return 0;
+
+	for (size_t i = 0; i < n; i++) {
+		uint8_t c = s[i];
+		if (!is_alpha(c)) continue;
+		size_t name_start = i;
+		size_t j = i;
+		while (j < n && (is_alpha(s[j]) || s[j] == '-')) j++;
+		size_t name_len = j - name_start;
+		while (j < n && is_ascii_space(s[j])) j++;
+		if (j >= n || s[j] != ':') { i = j; continue; }
+		j++;
+		while (j < n && is_ascii_space(s[j])) j++;
+		if (j >= n) break;
+		size_t v_start = j;
+		while (j < n && s[j] != ';') j++;
+		size_t v_len = (j > v_start) ? (j - v_start) : 0;
+		while (v_len > 0 && is_ascii_space(s[v_start + v_len - 1])) v_len--;
+
+		if (name_len == 7 && streq_ci_lit(s + name_start, name_len, "display")) {
+			/* very small: inline|block|none */
+			if (v_len == 4 && streq_ci_lit(s + v_start, v_len, "none")) {
+				*out_has = 1;
+				*out_disp = CSS_DISPLAY_NONE;
+				return 1;
+			}
+			if (v_len == 5 && streq_ci_lit(s + v_start, v_len, "block")) {
+				*out_has = 1;
+				*out_disp = CSS_DISPLAY_BLOCK;
+				return 1;
+			}
+			if (v_len == 6 && streq_ci_lit(s + v_start, v_len, "inline")) {
+				*out_has = 1;
+				*out_disp = CSS_DISPLAY_INLINE;
+				return 1;
+			}
+		}
+
+		i = j;
+	}
+
+	return 0;
+}
+
+static int streq_lit(const char *s, const char *lit)
+{
+	if (!s || !lit) return 0;
+	for (size_t i = 0;; i++) {
+		char a = s[i];
+		char b = lit[i];
+		if (a != b) return 0;
+		if (a == 0) return 1;
+	}
+}
+
 static void parse_class_tokens(const uint8_t *v,
 			      size_t vlen,
 			      char classes[CSS_MAX_CLASSES_PER_NODE][CSS_MAX_CLASS_LEN + 1],
@@ -238,6 +308,14 @@ static void append_space_collapse(char *out, size_t out_len, size_t *io, int *la
 	if (*last_was_space) return;
 	(void)append_char(out, out_len, io, ' ');
 	*last_was_space = 1;
+}
+
+static void append_lit(char *out, size_t out_len, size_t *io, const char *lit)
+{
+	if (!out || !io || !lit) return;
+	for (size_t i = 0; lit[i]; i++) {
+		(void)append_char(out, out_len, io, lit[i]);
+	}
 }
 
 static void append_newline_collapse(char *out, size_t out_len, size_t *io, int *last_was_space)
@@ -622,6 +700,12 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 	struct style_attr span_style;
 	c_memset(&span_style, 0, sizeof(span_style));
 
+	uint8_t table_mode_stack[16];
+	uint32_t table_depth = 0;
+	uint32_t table_mode_depth = 0;
+	uint32_t table_cell_index = 0;
+	for (size_t ti = 0; ti < sizeof(table_mode_stack); ti++) table_mode_stack[ti] = 0;
+
 	for (size_t i = 0; i < html_len; i++) {
 		uint8_t c = html[i];
 
@@ -763,6 +847,9 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 			uint32_t class_count = 0;
 			char node_id[CSS_MAX_ID_LEN + 1];
 			node_id[0] = 0;
+			int inline_has_disp = 0;
+			enum css_display inline_disp = CSS_DISPLAY_UNSET;
+			uint32_t th_colspan = 0;
 			if (!is_end) {
 				/* Parse class=... and id=... within the tag (best-effort). */
 				size_t k = j;
@@ -796,6 +883,10 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 								parse_class_tokens(html + vs, vlen, classes, &class_count);
 							} else if (ieq_attr(html + an, alen, "id")) {
 								parse_id_token(html + vs, vlen, node_id, sizeof(node_id));
+								} else if (ieq_attr(html + an, alen, "style")) {
+									(void)parse_inline_display(html + vs, vlen, &inline_disp, &inline_has_disp);
+								} else if (nb == 2 && name_buf[0] == 't' && name_buf[1] == 'h' && ieq_attr(html + an, alen, "colspan")) {
+									th_colspan = parse_uint_dec_attr(html + vs, vlen);
 							}
 						}
 					}
@@ -824,12 +915,68 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 					 ancestors,
 					 anc_n,
 					 &comp);
+			if (inline_has_disp) {
+				comp.has_display = 1;
+				comp.display = inline_disp;
+			}
 			if (!is_end && comp.has_display && comp.display == CSS_DISPLAY_NONE) {
 				if (hidden_depth < (sizeof(hidden_tag_stack) / sizeof(hidden_tag_stack[0]))) {
 					hidden_tag_stack[hidden_depth++] = this_tagid;
 				}
 				i = tag_end;
 				continue;
+			}
+
+			/* Structured table mode for readability: infobox/wikitable. */
+			if (nb == 5 && ieq_lit_n(name_buf, nb, "table")) {
+				if (!is_end) {
+					int is_mode = 0;
+					for (uint32_t ci = 0; ci < class_count; ci++) {
+						if (streq_lit(classes[ci], "infobox") || streq_lit(classes[ci], "wikitable")) {
+							is_mode = 1;
+							break;
+						}
+					}
+					if (table_depth < (uint32_t)(sizeof(table_mode_stack) / sizeof(table_mode_stack[0]))) {
+						table_mode_stack[table_depth++] = (uint8_t)(is_mode != 0);
+						if (is_mode) table_mode_depth++;
+					}
+				} else {
+					if (table_depth > 0) {
+						table_depth--;
+						if (table_mode_stack[table_depth]) {
+							if (table_mode_depth > 0) table_mode_depth--;
+						}
+					}
+				}
+			}
+
+			/* Table row/cell formatting (only in structured table mode). */
+			if (table_mode_depth > 0) {
+				if (nb == 2 && name_buf[0] == 't' && name_buf[1] == 'r') {
+					if (!is_end) {
+						append_newline_collapse(out, out_len, &o, &last_was_space);
+						table_cell_index = 0;
+					} else {
+						append_newline_collapse(out, out_len, &o, &last_was_space);
+						table_cell_index = 0;
+					}
+					i = tag_end;
+					continue;
+				}
+				if (!is_end && (nb == 2 && name_buf[0] == 't' && (name_buf[1] == 'd' || name_buf[1] == 'h'))) {
+					/* Section header rows often use <th colspan=2>. */
+					if (name_buf[1] == 'h' && th_colspan >= 2) {
+						append_blankline_collapse(out, out_len, &o, &last_was_space);
+						table_cell_index = 0;
+					}
+					if (table_cell_index > 0) {
+						if (table_cell_index == 1) append_lit(out, out_len, &o, ": ");
+						else append_lit(out, out_len, &o, " | ");
+						last_was_space = 0;
+					}
+					table_cell_index++;
+				}
 			}
 
 			if (!is_end && !self_close && css_depth < (sizeof(css_stack) / sizeof(css_stack[0]))) {
@@ -1101,6 +1248,12 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 			if (seen_main) allow_output = in_main;
 			else if (seen_article) allow_output = in_article;
 			int is_block = tag_is_block_break(name_buf, nb);
+			if (table_mode_depth > 0) {
+				/* In structured tables, we manage breaks ourselves. */
+				if (nb == 2 && name_buf[0] == 't' && (name_buf[1] == 'd' || name_buf[1] == 'h' || name_buf[1] == 'r')) {
+					is_block = 0;
+				}
+			}
 			if (comp.has_display) {
 				if (comp.display == CSS_DISPLAY_BLOCK) is_block = 1;
 				else if (comp.display == CSS_DISPLAY_INLINE) is_block = 0;
