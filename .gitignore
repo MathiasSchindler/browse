@@ -1,0 +1,11 @@
+# build outputs
+/build/
+
+# editor/OS noise
+.vscode/
+*.swp
+*~
+.DS_Store
+
+# core dumps
+core
