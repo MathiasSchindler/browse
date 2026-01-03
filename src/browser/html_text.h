@@ -54,6 +54,27 @@ struct html_spans {
 	struct html_span spans[HTML_MAX_SPANS];
 };
 
+enum {
+	HTML_MAX_INLINE_IMGS = 512,
+	HTML_INLINE_IMG_URL_MAX = 256,
+};
+
+struct html_inline_img {
+	uint32_t start;
+	uint32_t end;
+	char url[HTML_INLINE_IMG_URL_MAX];
+};
+
+struct html_inline_imgs {
+	uint32_t n;
+	struct html_inline_img imgs[HTML_MAX_INLINE_IMGS];
+};
+
+typedef int (*html_img_dim_lookup_fn)(void *ctx,
+				      const char *url,
+				      uint32_t *out_w,
+				      uint32_t *out_h);
+
 /* Like html_visible_text_extract(), but also captures <a href="..."> link ranges
  * in the produced visible-text stream. Ranges are [start,end) indices into out.
  */
@@ -70,3 +91,32 @@ int html_visible_text_extract_links_and_spans(const uint8_t *html,
 					  size_t out_len,
 					  struct html_links *out_links,
 					  struct html_spans *out_spans);
+
+/* Like html_visible_text_extract_links_and_spans(), but allows the caller to
+ * provide a best-effort image dimension lookup by URL.
+ *
+ * This is used to reserve enough rows for <img> placeholders once image
+ * dimensions are known (e.g. after sniffing/decoding).
+ */
+int html_visible_text_extract_links_and_spans_ex(const uint8_t *html,
+				     size_t html_len,
+				     char *out,
+				     size_t out_len,
+				     struct html_links *out_links,
+				     struct html_spans *out_spans,
+				     html_img_dim_lookup_fn img_dim_lookup,
+				     void *img_dim_lookup_ctx);
+
+/* Like html_visible_text_extract_links_and_spans_ex(), but also returns a list
+ * of inline-icon <img> placeholders (currently rendered as literal "[img]")
+ * along with their source URLs.
+ */
+int html_visible_text_extract_links_spans_and_inline_imgs_ex(const uint8_t *html,
+					    size_t html_len,
+					    char *out,
+					    size_t out_len,
+					    struct html_links *out_links,
+					    struct html_spans *out_spans,
+					    struct html_inline_imgs *out_inline_imgs,
+					    html_img_dim_lookup_fn img_dim_lookup,
+					    void *img_dim_lookup_ctx);

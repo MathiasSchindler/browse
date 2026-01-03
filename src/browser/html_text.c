@@ -526,7 +526,10 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 					 char *out,
 					 size_t out_len,
 					 struct html_links *out_links,
-					 struct html_spans *out_spans)
+				 struct html_spans *out_spans,
+				 struct html_inline_imgs *out_inline_imgs,
+				 html_img_dim_lookup_fn img_dim_lookup,
+				 void *img_dim_lookup_ctx)
 {
 	if (!out || out_len == 0) return -1;
 	out[0] = 0;
@@ -556,6 +559,14 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 			out_spans->spans[i].has_bg = 0;
 			out_spans->spans[i].bold = 0;
 			out_spans->spans[i].underline = 0;
+		}
+	}
+	if (out_inline_imgs) {
+		out_inline_imgs->n = 0;
+		for (size_t i = 0; i < HTML_MAX_INLINE_IMGS; i++) {
+			out_inline_imgs->imgs[i].start = 0;
+			out_inline_imgs->imgs[i].end = 0;
+			out_inline_imgs->imgs[i].url[0] = 0;
 		}
 	}
 
@@ -1197,12 +1208,34 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 					}
 				}
 
+				/* If the caller can provide image dimensions (e.g. from an async sniff
+				 * cache), prefer that for placeholder sizing.
+				 */
+				if (img_dim_lookup && src_tmp[0] != 0) {
+					uint32_t dw = 0;
+					uint32_t dh = 0;
+					if (img_dim_lookup(img_dim_lookup_ctx, src_tmp, &dw, &dh) == 0) {
+						if (dw != 0) img_w = dw;
+						if (dh != 0) img_h = dh;
+					}
+				}
+
 				int inline_img = 0;
 				if (img_w > 0 && img_h > 0 && img_w <= 32u && img_h <= 32u) inline_img = 1;
 				if (inline_img) {
 					/* Inline icon: keep layout compact. */
 					append_space_collapse(out, out_len, &o, &last_was_space);
+					uint32_t icon_start = 0xffffffffu;
+					if (out_inline_imgs && out_inline_imgs->n < HTML_MAX_INLINE_IMGS) {
+						icon_start = (o > 0xffffffffu) ? 0xffffffffu : (uint32_t)o;
+					}
 					append_str(out, out_len, &o, "[img]");
+					if (out_inline_imgs && out_inline_imgs->n < HTML_MAX_INLINE_IMGS && src_tmp[0] != 0 && icon_start != 0xffffffffu) {
+						struct html_inline_img *im = &out_inline_imgs->imgs[out_inline_imgs->n++];
+						im->start = icon_start;
+						im->end = (icon_start <= 0xffffffffu - 5u) ? (icon_start + 5u) : 0xffffffffu;
+						cpy_str_trunc(im->url, sizeof(im->url), src_tmp);
+					}
 					last_was_space = 0;
 					append_space_collapse(out, out_len, &o, &last_was_space);
 				} else {
@@ -1211,7 +1244,7 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 					 * Format: 0x1e "IMG <rows> ? <label>" 0x1f "<url>" \n + (rows-1) blank lines.
 					 * The format token is a placeholder; the renderer will sniff the URL.
 					 */
-					uint32_t rows_total = 4u;
+					uint32_t rows_total = 8u;
 					if (img_h > 0) {
 						/* Rows include the label row; ensure pixel area can fit img_h.
 						 * Pixel area height is roughly rows_total*16 - 17 (label row + bottom border).
@@ -1373,12 +1406,12 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 
 int html_visible_text_extract(const uint8_t *html, size_t html_len, char *out, size_t out_len)
 {
-	return html_visible_text_extract_impl(html, html_len, out, out_len, 0, 0);
+	return html_visible_text_extract_impl(html, html_len, out, out_len, 0, 0, 0, 0, 0);
 }
 
 int html_visible_text_extract_links(const uint8_t *html, size_t html_len, char *out, size_t out_len, struct html_links *out_links)
 {
-	return html_visible_text_extract_impl(html, html_len, out, out_len, out_links, 0);
+	return html_visible_text_extract_impl(html, html_len, out, out_len, out_links, 0, 0, 0, 0);
 }
 
 int html_visible_text_extract_links_and_spans(const uint8_t *html,
@@ -1388,5 +1421,46 @@ int html_visible_text_extract_links_and_spans(const uint8_t *html,
 					  struct html_links *out_links,
 					  struct html_spans *out_spans)
 {
-	return html_visible_text_extract_impl(html, html_len, out, out_len, out_links, out_spans);
+	return html_visible_text_extract_impl(html, html_len, out, out_len, out_links, out_spans, 0, 0, 0);
+}
+
+int html_visible_text_extract_links_and_spans_ex(const uint8_t *html,
+				     size_t html_len,
+				     char *out,
+				     size_t out_len,
+				     struct html_links *out_links,
+				     struct html_spans *out_spans,
+				     html_img_dim_lookup_fn img_dim_lookup,
+				     void *img_dim_lookup_ctx)
+{
+	return html_visible_text_extract_impl(html,
+					     html_len,
+					     out,
+					     out_len,
+					     out_links,
+					     out_spans,
+				     0,
+					     img_dim_lookup,
+					     img_dim_lookup_ctx);
+}
+
+int html_visible_text_extract_links_spans_and_inline_imgs_ex(const uint8_t *html,
+					    size_t html_len,
+					    char *out,
+					    size_t out_len,
+					    struct html_links *out_links,
+					    struct html_spans *out_spans,
+					    struct html_inline_imgs *out_inline_imgs,
+					    html_img_dim_lookup_fn img_dim_lookup,
+					    void *img_dim_lookup_ctx)
+{
+	return html_visible_text_extract_impl(html,
+				     html_len,
+				     out,
+				     out_len,
+				     out_links,
+				     out_spans,
+				     out_inline_imgs,
+				     img_dim_lookup,
+				     img_dim_lookup_ctx);
 }

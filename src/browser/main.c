@@ -35,8 +35,12 @@ static char g_url_bar[URL_BUF_LEN];
 static char g_active_host[HOST_BUF_LEN];
 static struct html_links g_links;
 static struct html_spans g_spans;
+static struct html_inline_imgs g_inline_imgs;
 static uint32_t g_scroll_rows;
 static int g_have_page;
+
+static uint8_t g_body[512 * 1024];
+static size_t g_body_len;
 
 enum img_fmt {
 	IMG_FMT_UNKNOWN = 0,
@@ -127,6 +131,23 @@ static uint32_t hash32_fnv1a(const char *s)
 		h *= 16777619u;
 	}
 	return h;
+}
+
+struct img_dim_ctx {
+	const char *active_host;
+};
+
+static struct img_sniff_cache_entry *img_cache_find_done(const char *active_host, const char *url);
+
+static int html_img_dim_lookup(void *ctx, const char *url, uint32_t *out_w, uint32_t *out_h)
+{
+	if (!ctx || !url || !out_w || !out_h) return -1;
+	struct img_dim_ctx *c = (struct img_dim_ctx *)ctx;
+	struct img_sniff_cache_entry *e = img_cache_find_done(c->active_host ? c->active_host : "", url);
+	if (!e || !e->has_dims) return -1;
+	*out_w = (uint32_t)e->w;
+	*out_h = (uint32_t)e->h;
+	return 0;
 }
 
 static int streq(const char *a, const char *b)
@@ -771,6 +792,7 @@ static void draw_body_wrapped(struct shm_fb *fb,
 				     const char *text,
 				     const struct html_links *links,
 				     const struct html_spans *spans,
+				     const struct html_inline_imgs *inline_imgs,
 				     struct text_color tc,
 				     struct text_color linkc,
 			     uint32_t scroll_rows,
@@ -987,7 +1009,54 @@ static void draw_body_wrapped(struct shm_fb *fb,
 			continue;
 		}
 
-		draw_line_with_links(fb, x, row_y, line, start, links, spans, tc, linkc);
+		char drawline[1024];
+		(void)c_strlcpy_s(drawline, sizeof(drawline), line);
+		struct {
+			uint32_t col;
+			struct img_sniff_cache_entry *entry;
+		} to_draw[32];
+		uint32_t n_to_draw = 0;
+		if (inline_imgs && inline_imgs->n > 0) {
+			size_t line_len = c_strlen(line);
+			for (uint32_t ii = 0; ii < inline_imgs->n; ii++) {
+				const struct html_inline_img *im = &inline_imgs->imgs[ii];
+				if (im->url[0] == 0) continue;
+				if (im->start < start) continue;
+				size_t rel = (size_t)(im->start - (uint32_t)start);
+				if (rel + 5u > line_len) continue;
+				/* Best-effort: ensure the placeholder token is present. */
+				if (!(line[rel + 0] == '[' && line[rel + 1] == 'i' && line[rel + 2] == 'm' && line[rel + 3] == 'g' && line[rel + 4] == ']')) continue;
+				(void)img_cache_get_or_mark_pending(active_host, im->url);
+				struct img_sniff_cache_entry *e = img_cache_find_done(active_host, im->url);
+				if (!e || !e->has_pixels) continue;
+				/* Hide the textual token once pixels are available, preserving width. */
+				for (size_t k = 0; k < 5u; k++) drawline[rel + k] = ' ';
+				if (n_to_draw < (uint32_t)(sizeof(to_draw) / sizeof(to_draw[0]))) {
+					to_draw[n_to_draw].col = (uint32_t)rel;
+					to_draw[n_to_draw].entry = e;
+					n_to_draw++;
+				}
+			}
+		}
+
+		draw_line_with_links(fb, x, row_y, drawline, start, links, spans, tc, linkc);
+
+		/* Draw inline icons after text so they are on top. */
+		for (uint32_t di = 0; di < n_to_draw; di++) {
+			struct img_sniff_cache_entry *e = to_draw[di].entry;
+			if (!e || !e->has_pixels) continue;
+			uint32_t token_x = x + to_draw[di].col * 8u;
+			uint32_t token_w = 5u * 8u;
+			uint32_t w = (uint32_t)e->pix_w;
+			uint32_t h = (uint32_t)e->pix_h;
+			/* Fit into a single text row (16px). Clip rather than scale for now. */
+			if (w > 16u) w = 16u;
+			if (h > 16u) h = 16u;
+			uint32_t dx = token_x + ((token_w > w) ? ((token_w - w) / 2u) : 0u);
+			uint32_t dy = row_y + ((16u > h) ? ((16u - h) / 2u) : 0u);
+			const uint32_t *src = &g_img_pixel_pool[e->pix_off];
+			blit_xrgb_clipped(fb, dx, dy, w, h, src, e->pix_w, e->pix_h);
+		}
 	}
 }
 
@@ -1008,7 +1077,7 @@ static void render_page(struct shm_fb *fb,
 	uint32_t y0 = UI_CONTENT_Y0;
 	uint32_t h_px = (fb->height > y0) ? (fb->height - y0) : 0;
 	if (!visible_text) visible_text = "";
-	draw_body_wrapped(fb, 8, y0, w_px, h_px, visible_text, links, &g_spans, dim, linkc, scroll_rows, active_host);
+	draw_body_wrapped(fb, 8, y0, w_px, h_px, visible_text, links, &g_spans, &g_inline_imgs, dim, linkc, scroll_rows, active_host);
 	fb->hdr->frame_counter++;
 }
 
@@ -1085,16 +1154,16 @@ static void compose_url_bar(char *out, size_t out_len, const char *host, const c
 
 static void do_https_status(struct shm_fb *fb, char host[HOST_BUF_LEN], char path[PATH_BUF_LEN], char url_bar[URL_BUF_LEN])
 {
-	static uint8_t body[512 * 1024];
-	size_t body_len = 0;
+	g_body_len = 0;
 	uint64_t content_len = 0;
 	char final_status[128];
 	final_status[0] = 0;
 	g_visible[0] = 0;
-	body[0] = 0;
+	g_body[0] = 0;
 	g_status_bar[0] = 0;
 	g_links.n = 0;
 	g_spans.n = 0;
+	g_inline_imgs.n = 0;
 	g_scroll_rows = 0;
 	g_have_page = 0;
 	/* Reset image decode/sniff state for the new page to avoid stale pixel pool offsets. */
@@ -1159,9 +1228,9 @@ static void do_https_status(struct shm_fb *fb, char host[HOST_BUF_LEN], char pat
 									 &status_code,
 									 location,
 									 sizeof(location),
-									 body,
-									 sizeof(body),
-									 &body_len,
+									 g_body,
+									 sizeof(g_body),
+									 &g_body_len,
 									 &content_len);
 		sys_close(sock);
 
@@ -1205,8 +1274,17 @@ static void do_https_status(struct shm_fb *fb, char host[HOST_BUF_LEN], char pat
 	compose_url_bar(url_bar, URL_BUF_LEN, host, path);
 
 	/* Render extracted visible text (best-effort). */
-	if (body_len > 0) {
-		(void)html_visible_text_extract_links_and_spans(body, body_len, g_visible, sizeof(g_visible), &g_links, &g_spans);
+	if (g_body_len > 0) {
+		struct img_dim_ctx ctx = { .active_host = host };
+		(void)html_visible_text_extract_links_spans_and_inline_imgs_ex(g_body,
+							  g_body_len,
+							  g_visible,
+							  sizeof(g_visible),
+							  &g_links,
+							  &g_spans,
+						  &g_inline_imgs,
+							  html_img_dim_lookup,
+							  &ctx);
 	}
 	(void)c_strlcpy_s(g_url_bar, sizeof(g_url_bar), url_bar);
 	(void)c_strlcpy_s(g_active_host, sizeof(g_active_host), host);
@@ -1334,6 +1412,21 @@ int main(void)
 			 */
 			if (g_have_page && idle_ticks > 25u && (idle_ticks % 20u) == 0u) {
 				if (img_sniff_pump_one()) {
+					/* Re-extract visible text so <img> placeholders can reserve the correct
+					 * number of rows once we know dimensions.
+					 */
+					if (g_body_len > 0) {
+						struct img_dim_ctx ctx = { .active_host = g_active_host };
+						(void)html_visible_text_extract_links_spans_and_inline_imgs_ex(g_body,
+											  g_body_len,
+											  g_visible,
+											  sizeof(g_visible),
+											  &g_links,
+											  &g_spans,
+									  &g_inline_imgs,
+											  html_img_dim_lookup,
+											  &ctx);
+					}
 					render_page(&fb, g_active_host, g_url_bar, g_status_bar, g_visible, &g_links, g_scroll_rows);
 				}
 			}
