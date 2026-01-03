@@ -209,14 +209,18 @@ static const int32_t idct_m[8][8] = {
 static void idct8x8(const int32_t *in, uint8_t *out, size_t out_stride)
 {
 	int32_t tmp[64];
+	const int64_t denom = (int64_t)IDCT_SCALE * 2;
 	for (int y = 0; y < 8; y++) {
 		for (int x = 0; x < 8; x++) {
 			int64_t s = 0;
 			for (int u = 0; u < 8; u++) {
 				s += (int64_t)idct_m[x][u] * (int64_t)in[y * 8 + u];
 			}
-			/* back to coefficient domain scale */
-			tmp[y * 8 + x] = (int32_t)((s + (IDCT_SCALE / 2)) / IDCT_SCALE);
+			/* Back to coefficient domain scale.
+			 * The basis matrix is scaled but does not include the 1/2 factor for the
+			 * 1D IDCT, so we apply it here by dividing by (2*IDCT_SCALE).
+			 */
+			tmp[y * 8 + x] = (int32_t)((s + (denom / 2)) / denom);
 		}
 	}
 	for (int y = 0; y < 8; y++) {
@@ -225,7 +229,7 @@ static void idct8x8(const int32_t *in, uint8_t *out, size_t out_stride)
 			for (int v = 0; v < 8; v++) {
 				s += (int64_t)idct_m[y][v] * (int64_t)tmp[v * 8 + x];
 			}
-			int32_t v0 = (int32_t)((s + (IDCT_SCALE / 2)) / IDCT_SCALE);
+			int32_t v0 = (int32_t)((s + (denom / 2)) / denom);
 			v0 += 128;
 			out[(size_t)y * out_stride + (size_t)x] = (uint8_t)clamp_u8(v0);
 		}
@@ -242,6 +246,15 @@ struct comp {
 	int32_t dc_pred;
 	uint8_t mcu_buf[16 * 16];
 };
+
+static struct comp *comp_find_by_id(struct comp *comps, uint32_t ncomp, uint8_t id)
+{
+	if (!comps) return 0;
+	for (uint32_t i = 0; i < ncomp; i++) {
+		if (comps[i].id == id) return &comps[i];
+	}
+	return 0;
+}
 
 static int decode_block(struct br *b,
 			const struct huff *hdc,
@@ -315,6 +328,74 @@ static void ycbcr_to_xrgb(uint32_t *dst, uint32_t y, uint32_t cb, uint32_t cr)
 	uint32_t g = (uint32_t)clamp_u8(G);
 	uint32_t b = (uint32_t)clamp_u8(B);
 	*dst = 0xff000000u | (r << 16) | (g << 8) | b;
+}
+
+static uint8_t sample_bilinear_16stride(const uint8_t *src,
+					uint32_t src_w,
+					uint32_t src_h,
+					uint32_t dst_x,
+					uint32_t dst_y,
+					uint32_t dst_w,
+					uint32_t dst_h)
+{
+	if (!src || src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0) return 0;
+
+	/* Map dst pixel center to src space and do bilinear interpolation.
+	 * Using 16.16 fixed point.
+	 */
+	int32_t sx_fp = (int32_t)(((((uint64_t)dst_x << 16) + 32768u) * (uint64_t)src_w) / (uint64_t)dst_w);
+	int32_t sy_fp = (int32_t)(((((uint64_t)dst_y << 16) + 32768u) * (uint64_t)src_h) / (uint64_t)dst_h);
+	sx_fp -= 32768;
+	sy_fp -= 32768;
+	if (sx_fp < 0) sx_fp = 0;
+	if (sy_fp < 0) sy_fp = 0;
+	int32_t max_sx = (int32_t)((src_w - 1u) << 16);
+	int32_t max_sy = (int32_t)((src_h - 1u) << 16);
+	if (sx_fp > max_sx) sx_fp = max_sx;
+	if (sy_fp > max_sy) sy_fp = max_sy;
+
+	uint32_t sx0 = (uint32_t)(sx_fp >> 16);
+	uint32_t sy0 = (uint32_t)(sy_fp >> 16);
+	uint32_t fx = (uint32_t)(sx_fp & 0xffff);
+	uint32_t fy = (uint32_t)(sy_fp & 0xffff);
+	uint32_t sx1 = (sx0 + 1u < src_w) ? (sx0 + 1u) : sx0;
+	uint32_t sy1 = (sy0 + 1u < src_h) ? (sy0 + 1u) : sy0;
+
+	uint32_t s00 = src[sy0 * 16u + sx0];
+	uint32_t s01 = src[sy0 * 16u + sx1];
+	uint32_t s10 = src[sy1 * 16u + sx0];
+	uint32_t s11 = src[sy1 * 16u + sx1];
+
+	uint32_t w0 = 65536u - fx;
+	uint32_t w1 = fx;
+	uint32_t t0 = (s00 * w0 + s01 * w1 + 32768u) >> 16;
+	uint32_t t1 = (s10 * w0 + s11 * w1 + 32768u) >> 16;
+	uint32_t wy0 = 65536u - fy;
+	uint32_t wy1 = fy;
+	uint32_t v = (t0 * wy0 + t1 * wy1 + 32768u) >> 16;
+	if (v > 255u) v = 255u;
+	return (uint8_t)v;
+}
+
+static void upsample_to_mcu_16stride(uint8_t *dst,
+				     const uint8_t *src,
+				     uint32_t src_w,
+				     uint32_t src_h,
+				     uint32_t dst_w,
+				     uint32_t dst_h)
+{
+	if (!dst || !src) return;
+	if (src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0) return;
+	if (dst_w > 16u) dst_w = 16u;
+	if (dst_h > 16u) dst_h = 16u;
+	if (src_w > 16u) src_w = 16u;
+	if (src_h > 16u) src_h = 16u;
+
+	for (uint32_t y = 0; y < dst_h; y++) {
+		for (uint32_t x = 0; x < dst_w; x++) {
+			dst[y * 16u + x] = sample_bilinear_16stride(src, src_w, src_h, x, y, dst_w, dst_h);
+		}
+	}
 }
 
 int jpeg_decode_baseline_xrgb(const uint8_t *data,
@@ -525,8 +606,7 @@ int jpeg_decode_baseline_xrgb(const uint8_t *data,
 					/* Consume pending marker if present; otherwise try to align by draining to marker. */
 					b.bitbuf = 0;
 					b.bitcount = 0;
-					comps[0].dc_pred = 0;
-					if (ncomp > 1) { comps[1].dc_pred = 0; comps[2].dc_pred = 0; }
+					for (uint32_t ci = 0; ci < ncomp; ci++) comps[ci].dc_pred = 0;
 					rst_left = restart_interval;
 					rst_index = (rst_index + 1u) & 7u;
 				}
@@ -562,6 +642,47 @@ int jpeg_decode_baseline_xrgb(const uint8_t *data,
 				}
 			}
 
+			/* If components are subsampled relative to the MCU size, upsample them
+			 * with bilinear filtering to avoid blocky/chunky chroma.
+			 */
+			uint8_t y_up[16u * 16u];
+			uint8_t cb_up[16u * 16u];
+			uint8_t cr_up[16u * 16u];
+			int have_y_up = 0;
+			int have_cb_up = 0;
+			int have_cr_up = 0;
+			struct comp *y = 0;
+			struct comp *cb = 0;
+			struct comp *cr = 0;
+			if (ncomp >= 1) {
+				y = comp_find_by_id(comps, ncomp, 1);
+				if (!y) y = &comps[0];
+				uint32_t yw = y->hs * 8u;
+				uint32_t yh = y->vs * 8u;
+				if (y->hs != max_h || y->vs != max_v) {
+					upsample_to_mcu_16stride(y_up, y->mcu_buf, yw, yh, mcu_w, mcu_h);
+					have_y_up = 1;
+				}
+			}
+			if (ncomp > 1) {
+				cb = comp_find_by_id(comps, ncomp, 2);
+				cr = comp_find_by_id(comps, ncomp, 3);
+				if (!cb) cb = (ncomp > 1) ? &comps[1] : 0;
+				if (!cr) cr = (ncomp > 2) ? &comps[2] : cb;
+				uint32_t cbw = cb->hs * 8u;
+				uint32_t cbh = cb->vs * 8u;
+				uint32_t crw = cr->hs * 8u;
+				uint32_t crh = cr->vs * 8u;
+				if (cb->hs != max_h || cb->vs != max_v) {
+					upsample_to_mcu_16stride(cb_up, cb->mcu_buf, cbw, cbh, mcu_w, mcu_h);
+					have_cb_up = 1;
+				}
+				if (cr->hs != max_h || cr->vs != max_v) {
+					upsample_to_mcu_16stride(cr_up, cr->mcu_buf, crw, crh, mcu_w, mcu_h);
+					have_cr_up = 1;
+				}
+			}
+
 			/* Write pixels for this MCU. */
 			for (uint32_t py = 0; py < mcu_h; py++) {
 				uint32_t iy = my * mcu_h + py;
@@ -574,24 +695,41 @@ int jpeg_decode_baseline_xrgb(const uint8_t *data,
 					uint8_t Cr = 128;
 					if (ncomp == 1) {
 						struct comp *c = &comps[0];
-						uint32_t cx = (px * c->hs) / max_h;
-						uint32_t cy = (py * c->vs) / max_v;
-						Y = c->mcu_buf[cy * 16u + cx];
+						if (have_y_up) {
+							Y = y_up[py * 16u + px];
+						} else {
+							uint32_t cx = (px * c->hs) / max_h;
+							uint32_t cy = (py * c->vs) / max_v;
+							Y = c->mcu_buf[cy * 16u + cx];
+						}
 						uint32_t g = (uint32_t)Y;
 						out_pixels[(size_t)iy * (size_t)width + (size_t)ix] = 0xff000000u | (g << 16) | (g << 8) | g;
 					} else {
-						struct comp *y = &comps[0];
-						struct comp *cb = &comps[1];
-						struct comp *cr = &comps[2];
-						uint32_t yx = (px * y->hs) / max_h;
-						uint32_t yy = (py * y->vs) / max_v;
-						uint32_t cbx = (px * cb->hs) / max_h;
-						uint32_t cby = (py * cb->vs) / max_v;
-						uint32_t crx = (px * cr->hs) / max_h;
-						uint32_t cry = (py * cr->vs) / max_v;
-						Y = y->mcu_buf[yy * 16u + yx];
-						Cb = cb->mcu_buf[cby * 16u + cbx];
-						Cr = cr->mcu_buf[cry * 16u + crx];
+						/* Use the component-id mapping established above if present. */
+						if (!y) { y = comp_find_by_id(comps, ncomp, 1); if (!y) y = &comps[0]; }
+						if (!cb) { cb = comp_find_by_id(comps, ncomp, 2); if (!cb) cb = (ncomp > 1) ? &comps[1] : y; }
+						if (!cr) { cr = comp_find_by_id(comps, ncomp, 3); if (!cr) cr = (ncomp > 2) ? &comps[2] : cb; }
+						if (have_y_up) {
+							Y = y_up[py * 16u + px];
+						} else {
+							uint32_t yx = (px * y->hs) / max_h;
+							uint32_t yy = (py * y->vs) / max_v;
+							Y = y->mcu_buf[yy * 16u + yx];
+						}
+						if (have_cb_up) {
+							Cb = cb_up[py * 16u + px];
+						} else {
+							uint32_t cbx = (px * cb->hs) / max_h;
+							uint32_t cby = (py * cb->vs) / max_v;
+							Cb = cb->mcu_buf[cby * 16u + cbx];
+						}
+						if (have_cr_up) {
+							Cr = cr_up[py * 16u + px];
+						} else {
+							uint32_t crx = (px * cr->hs) / max_h;
+							uint32_t cry = (py * cr->vs) / max_v;
+							Cr = cr->mcu_buf[cry * 16u + crx];
+						}
 						ycbcr_to_xrgb(&out_pixels[(size_t)iy * (size_t)width + (size_t)ix], Y, Cb, Cr);
 					}
 				}
