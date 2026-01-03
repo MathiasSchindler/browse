@@ -1392,18 +1392,25 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 					last_was_space = 0;
 					append_space_collapse(out, out_len, &o, &last_was_space);
 				} else {
-					/* Float heuristic: if dimensions look like a thumbnail, request a float-right box.
-					 * This is intentionally conservative and generic.
+					/* Float heuristic: request a float-right box for thumbnail/infobox-like images
+					 * so text can flow beside them instead of reserving full-width blank rows.
+					 *
+					 * Notes:
+					 * - The renderer caps floats to at most half the content width.
+					 * - Keep this generic (no site-specific class parsing yet).
 					 */
 					int float_right = 0;
 					uint32_t float_cols = 0;
-					if (img_w > 0 && img_h > 0 && img_w <= 240u) {
+					/* Many lead/infobox images are ~240-640px wide (e.g. 560x312).
+					 * If we have dimensions and it isn't extremely large, float it.
+					 */
+					if (img_w > 0 && img_h > 0 && img_w <= 640u && img_h <= 640u) {
 						float_right = 1;
 						/* total box width in text columns, including borders */
 						float_cols = (img_w + 7u) / 8u;
 						float_cols += 2u;
 						if (float_cols < 10u) float_cols = 10u;
-						if (float_cols > 40u) float_cols = 40u;
+						if (float_cols > 80u) float_cols = 80u;
 					}
 
 					/* Block image placeholder: emit a marker line and reserve rows.
