@@ -10,6 +10,7 @@
 #include "text_layout.h"
 
 #include "image/jpeg.h"
+#include "image/jpeg_decode.h"
 #include "image/png.h"
 #include "image/gif.h"
 #include "image/gif_decode.h"
@@ -63,7 +64,7 @@ struct img_sniff_cache_entry {
 static struct img_sniff_cache_entry g_img_sniff_cache[32];
 
 static uint8_t g_img_sniff_buf[4096];
-static uint8_t g_img_fetch_buf[256 * 1024];
+static uint8_t g_img_fetch_buf[1024 * 1024];
 
 /* Extremely small pixel pool for the first real decoder (GIF).
  * Bump-allocated; reset on page navigation/reload.
@@ -382,6 +383,39 @@ static int img_sniff_pump_one(void)
 				e->has_dims = 1;
 				e->w = (w > 0xffffu) ? 0xffffu : (uint16_t)w;
 				e->h = (h > 0xffffu) ? 0xffffu : (uint16_t)h;
+			}
+			/* First JPEG decoder: baseline decode for small-ish images. */
+			if (e->has_dims) {
+				uint32_t px = (uint32_t)e->w * (uint32_t)e->h;
+				if (e->w <= 512u && e->h <= 512u && px <= (uint32_t)(sizeof(g_img_pixel_pool) / sizeof(g_img_pixel_pool[0]))) {
+					const uint8_t *jpg_data = g_img_sniff_buf;
+					size_t jpg_len = got;
+					{
+						size_t got_full = 0;
+						if (https_get_prefix_follow_redirects(host, path, g_img_fetch_buf, sizeof(g_img_fetch_buf), &got_full) == 0 && got_full > 0) {
+							jpg_data = g_img_fetch_buf;
+							jpg_len = got_full;
+						}
+					}
+					uint32_t old_used = g_img_pixel_pool_used;
+					uint32_t off = 0;
+					if (img_pixel_alloc(px, &off) == 0) {
+						uint32_t dw = 0, dh = 0;
+						if (jpeg_decode_baseline_xrgb(jpg_data,
+									     jpg_len,
+									     &g_img_pixel_pool[off],
+									     (size_t)px,
+									     &dw,
+									     &dh) == 0) {
+							e->has_pixels = 1;
+							e->pix_off = off;
+							e->pix_w = (dw > 0xffffu) ? 0xffffu : (uint16_t)dw;
+							e->pix_h = (dh > 0xffffu) ? 0xffffu : (uint16_t)dh;
+						} else {
+							g_img_pixel_pool_used = old_used;
+						}
+					}
+				}
 			}
 		} else if (e->fmt == IMG_FMT_PNG) {
 			uint32_t w = 0, h = 0;
@@ -717,16 +751,50 @@ static void draw_body_wrapped(struct shm_fb *fb,
 	if (max_cols > 255) max_cols = 255;
 
 	struct {
-		uint32_t rows_left;
+		uint8_t active;
+		uint32_t rows_total;
+		uint32_t row_in_box; /* 0=label row, 1..=pixel rows */
 		struct img_sniff_cache_entry *entry;
 	} img_box = {0};
 
-	/* Skip scroll_rows lines by running the layout forward. */
+	/* Skip scroll_rows lines by running the layout forward.
+	 * Track whether we are currently inside an image placeholder so that
+	 * scrolling into the middle of an image still renders the correct slice.
+	 */
 	size_t pos = 0;
 	char line[1024];
 	for (uint32_t s = 0; s < scroll_rows; s++) {
 		int r = text_layout_next_line(text, &pos, max_cols, line, sizeof(line));
 		if (r != 0) break;
+		if (img_box.active) {
+			img_box.row_in_box++;
+			if (img_box.row_in_box >= img_box.rows_total) {
+				img_box.active = 0;
+			}
+			continue;
+		}
+		if (line[0] == (char)0x1e && line[1] == 'I' && line[2] == 'M' && line[3] == 'G' && line[4] == ' ') {
+			uint32_t rows = 0;
+			size_t p = 5;
+			while (line[p] >= '0' && line[p] <= '9') {
+				rows = rows * 10u + (uint32_t)(line[p] - '0');
+				p++;
+			}
+			if (rows < 2u) rows = 2u;
+			if (rows > 200u) rows = 200u;
+			/* Find URL payload to get cache entry (best-effort). */
+			char *url = 0;
+			for (size_t k = p; line[k] != 0; k++) {
+				if ((uint8_t)line[k] == 0x1f) {
+					url = &line[k + 1];
+					break;
+				}
+			}
+			img_box.entry = img_cache_find_done(active_host, url ? url : "");
+			img_box.active = 1;
+			img_box.rows_total = rows;
+			img_box.row_in_box = 1; /* marker row was skipped */
+		}
 	}
 
 	for (uint32_t row = 0; row < max_rows; row++) {
@@ -735,14 +803,68 @@ static void draw_body_wrapped(struct shm_fb *fb,
 		if (r != 0) return;
 		uint32_t row_y = y + row * 16u;
 
+		/* If we are inside an image placeholder (but not on the marker row), draw
+		 * the corresponding 16px slice for this row.
+		 */
+		if (img_box.active) {
+			uint32_t rows_total = img_box.rows_total;
+			uint32_t rbox = img_box.row_in_box;
+			/* Geometry */
+			uint32_t content_bottom = y + h_px;
+			if (fb->height < content_bottom) content_bottom = fb->height;
+			uint32_t remaining_h = (content_bottom > row_y) ? (content_bottom - row_y) : 0u;
+			uint32_t row_h = (remaining_h > 16u) ? 16u : remaining_h;
+			uint32_t max_w = (fb->width > x) ? (fb->width - x) : 0u;
+			if (row_h == 0u || max_w == 0u) {
+				img_box.row_in_box++;
+				if (img_box.row_in_box >= rows_total) img_box.active = 0;
+				continue;
+			}
+			uint32_t box_w = w_px;
+			if (box_w > max_w) box_w = max_w;
+			/* Optional width shrink based on known dimensions. */
+			if (img_box.entry && img_box.entry->has_dims) {
+				uint32_t want_w = (uint32_t)img_box.entry->w + 2u;
+				if (want_w < 32u) want_w = 32u;
+				if (want_w < box_w) box_w = want_w;
+			}
+			if (box_w >= 2u) {
+				uint32_t col = 0xff505058u;
+				/* Left + right border for this row */
+				fill_rect_u32(fb->pixels, fb->stride, x, row_y, 1u, row_h, col);
+				fill_rect_u32(fb->pixels, fb->stride, x + box_w - 1u, row_y, 1u, row_h, col);
+				/* Bottom border on last row */
+				if (rbox + 1u == rows_total && row_h > 0u) {
+					fill_rect_u32(fb->pixels, fb->stride, x, row_y + row_h - 1u, box_w, 1u, col);
+				}
+				/* Pixel slice (skip label row). */
+				if (img_box.entry && img_box.entry->has_pixels && rbox >= 1u) {
+					uint32_t inner_x = x + 1u;
+					uint32_t inner_w = (box_w > 2u) ? (box_w - 2u) : 0u;
+					uint32_t dst_h = row_h;
+					if (rbox + 1u == rows_total && dst_h > 0u) {
+						/* Keep bottom border visible. */
+						dst_h = (dst_h > 1u) ? (dst_h - 1u) : 0u;
+					}
+					uint32_t src_y0 = (rbox - 1u) * 16u;
+					if (dst_h != 0u && src_y0 < (uint32_t)img_box.entry->pix_h) {
+						const uint32_t *src = &g_img_pixel_pool[img_box.entry->pix_off] + (size_t)src_y0 * (size_t)img_box.entry->pix_w;
+						uint32_t src_h = (uint32_t)img_box.entry->pix_h - src_y0;
+						blit_xrgb_clipped(fb, inner_x, row_y, inner_w, dst_h, src, img_box.entry->pix_w, src_h);
+					}
+				}
+			}
+			img_box.row_in_box++;
+			if (img_box.row_in_box >= rows_total) {
+				img_box.active = 0;
+			}
+			continue;
+		}
+
 		/* Image placeholder marker row: draw real lines in framebuffer.
 		 * Marker format: 0x1e "IMG <rows> ? <label>" 0x1f "<url>".
 		 * Format is sniffed from the first bytes of the URL.
 		 */
-		if (img_box.rows_left != 0) {
-			img_box.rows_left--;
-			continue;
-		}
 		if (line[0] == (char)0x1e && line[1] == 'I' && line[2] == 'M' && line[3] == 'G' && line[4] == ' ') {
 			/* Parse rows */
 			uint32_t rows = 0;
@@ -769,42 +891,33 @@ static void draw_body_wrapped(struct shm_fb *fb,
 			img_box.entry = img_cache_find_done(active_host, url ? url : "");
 			const char *fmt = img_fmt_token(sniffed);
 			if (rows < 2u) rows = 2u;
-			if (rows > 10u) rows = 10u;
+			if (rows > 200u) rows = 200u;
 
-			/* Clip to remaining visible content area and framebuffer bounds. */
+			/* Draw only the marker row (top border + label). The following reserved
+			 * blank lines will be rendered row-by-row so scrolling into the middle
+			 * of an image still shows pixels.
+			 */
 			uint32_t content_bottom = y + h_px;
-			uint32_t remaining_h = (content_bottom > row_y) ? (content_bottom - row_y) : 0u;
 			if (fb->height < content_bottom) content_bottom = fb->height;
-			remaining_h = (content_bottom > row_y) ? (content_bottom - row_y) : 0u;
+			uint32_t remaining_h = (content_bottom > row_y) ? (content_bottom - row_y) : 0u;
+			uint32_t row_h = (remaining_h > 16u) ? 16u : remaining_h;
 			uint32_t max_w = (fb->width > x) ? (fb->width - x) : 0u;
-			if (remaining_h == 0u || max_w == 0u) {
-				img_box.rows_left = (rows > 0) ? (rows - 1u) : 0u;
-				continue;
-			}
-
-			uint32_t box_h = rows * 16u;
-			if (box_h > remaining_h) box_h = remaining_h;
 			uint32_t box_w = w_px;
 			if (box_w > max_w) box_w = max_w;
 			if (img_box.entry && img_box.entry->has_dims) {
 				uint32_t want_w = (uint32_t)img_box.entry->w + 2u;
-				uint32_t want_h = (uint32_t)img_box.entry->h + 2u;
 				if (want_w < 32u) want_w = 32u;
-				if (want_h < 32u) want_h = 32u;
 				if (want_w < box_w) box_w = want_w;
-				if (want_h < box_h) box_h = want_h;
 			}
-			uint32_t stroke = 1u;
 			uint32_t col = 0xff505058u;
-			/* Top + bottom */
-			fill_rect_u32(fb->pixels, fb->stride, x, row_y, box_w, stroke, col);
-			if (box_h > 1u) {
-				fill_rect_u32(fb->pixels, fb->stride, x, row_y + box_h - 1u, box_w, stroke, col);
-			}
-			/* Left + right */
-			fill_rect_u32(fb->pixels, fb->stride, x, row_y, stroke, box_h, col);
-			if (box_w > 1u) {
-				fill_rect_u32(fb->pixels, fb->stride, x + box_w - 1u, row_y, stroke, box_h, col);
+			if (row_h != 0u && box_w != 0u) {
+				/* Top border for this row */
+				fill_rect_u32(fb->pixels, fb->stride, x, row_y, box_w, 1u, col);
+				/* Left + right borders for this row */
+				if (box_w >= 2u) {
+					fill_rect_u32(fb->pixels, fb->stride, x, row_y, 1u, row_h, col);
+					fill_rect_u32(fb->pixels, fb->stride, x + box_w - 1u, row_y, 1u, row_h, col);
+				}
 			}
 			/* Label: show format in orange, then the rest in normal. */
 			struct text_color fmtc = tc;
@@ -835,16 +948,10 @@ static void draw_body_wrapped(struct shm_fb *fb,
 			}
 			draw_text_clipped_u32(fb->pixels, fb->stride, label_x, row_y + 6u, label_w, label, tc);
 
-			/* If we have decoded pixels, blit them inside the box (below the label row). */
-			if (img_box.entry && img_box.entry->has_pixels) {
-				uint32_t inner_x = x + 1u;
-				uint32_t inner_y = row_y + 16u; /* keep first row for label */
-				uint32_t inner_w = (box_w > 2u) ? (box_w - 2u) : 0u;
-				uint32_t inner_h = (box_h > 17u) ? (box_h - 17u) : 0u;
-				const uint32_t *src = &g_img_pixel_pool[img_box.entry->pix_off];
-				blit_xrgb_clipped(fb, inner_x, inner_y, inner_w, inner_h, src, img_box.entry->pix_w, img_box.entry->pix_h);
-			}
-			img_box.rows_left = (rows > 0) ? (rows - 1u) : 0u;
+			/* Activate per-row rendering for the reserved blank lines that follow. */
+			img_box.active = 1;
+			img_box.rows_total = rows;
+			img_box.row_in_box = 1;
 			continue;
 		}
 

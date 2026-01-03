@@ -1213,9 +1213,12 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 					 */
 					uint32_t rows_total = 4u;
 					if (img_h > 0) {
-						rows_total = (img_h + 15u) / 16u;
+						/* Rows include the label row; ensure pixel area can fit img_h.
+						 * Pixel area height is roughly rows_total*16 - 17 (label row + bottom border).
+						 */
+						rows_total = (img_h + 17u + 15u) / 16u;
 						if (rows_total < 3u) rows_total = 3u;
-						if (rows_total > 10u) rows_total = 10u;
+						if (rows_total > 200u) rows_total = 200u;
 					}
 
 					char label[96];
