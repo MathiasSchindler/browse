@@ -73,6 +73,11 @@ enum {
 enum {
 	/* Minimal errno values we need (Linux). */
 	EINPROGRESS = 115,
+	ETIMEDOUT = 110,
+	ECONNREFUSED = 111,
+	EHOSTUNREACH = 113,
+	ENETUNREACH = 101,
+	EACCES = 13,
 };
 
 enum {

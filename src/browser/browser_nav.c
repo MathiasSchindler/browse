@@ -53,6 +53,40 @@ static void nav_log_dns4_ok(const uint8_t ip4[4])
 	LOGI("nav", msg);
 }
 
+static const char *nav_errno_name(int e)
+{
+	switch (e) {
+	case ETIMEDOUT: return "ETIMEDOUT";
+	case ECONNREFUSED: return "ECONNREFUSED";
+	case EHOSTUNREACH: return "EHOSTUNREACH";
+	case ENETUNREACH: return "ENETUNREACH";
+	case EACCES: return "EACCES";
+	default: return "ERR";
+	}
+}
+
+static void nav_log_connect_failed(const char *which, int rc)
+{
+	if (!which) which = "";
+	int e = (rc < 0) ? -rc : rc;
+	char num[9];
+	u32_to_hex8(num, (uint32_t)e);
+	char msg[160];
+	size_t o = 0;
+	const char *pfx = "TCP connect ";
+	for (size_t i = 0; pfx[i] && o + 1 < sizeof(msg); i++) msg[o++] = pfx[i];
+	for (size_t i = 0; which[i] && o + 1 < sizeof(msg); i++) msg[o++] = which[i];
+	const char *mid = " failed: ";
+	for (size_t i = 0; mid[i] && o + 1 < sizeof(msg); i++) msg[o++] = mid[i];
+	const char *en = nav_errno_name(e);
+	for (size_t i = 0; en[i] && o + 1 < sizeof(msg); i++) msg[o++] = en[i];
+	const char *mid2 = " (0x";
+	for (size_t i = 0; mid2[i] && o + 1 < sizeof(msg); i++) msg[o++] = mid2[i];
+	for (size_t i = 0; num[i] && o + 1 < sizeof(msg); i++) msg[o++] = num[i];
+	if (o + 2 < sizeof(msg)) { msg[o++] = ')'; msg[o++] = 0; } else { msg[sizeof(msg) - 1] = 0; }
+	LOGW("nav", msg);
+}
+
 void browser_compose_url_bar(char *out, size_t out_len, const char *host, const char *path)
 {
 	if (!out || out_len == 0) return;
@@ -143,11 +177,12 @@ void browser_do_https_status(struct shm_fb *fb,
 		fb->hdr->frame_counter++;
 
 		if (dns6_ok) {
-			sock = tcp6_connect(ip6, 443);
-			if (sock >= 0) {
+			int s6 = tcp6_connect(ip6, 443);
+			if (s6 >= 0) {
+				sock = s6;
 				use_v4 = 0;
 			} else {
-				LOGW("nav", "TCP connect (IPv6) failed");
+				nav_log_connect_failed("(IPv6)", s6);
 			}
 		}
 		if (sock < 0) {
@@ -158,11 +193,12 @@ void browser_do_https_status(struct shm_fb *fb,
 				LOGW("nav", "DNS A failed (Google DNS over IPv6+IPv4)");
 			}
 			if (dns4_ok) {
-				sock = tcp4_connect(ip4, 443);
-				if (sock >= 0) {
+				int s4 = tcp4_connect(ip4, 443);
+				if (s4 >= 0) {
+					sock = s4;
 					use_v4 = 1;
 				} else {
-					LOGW("nav", "TCP connect (IPv4) failed");
+					nav_log_connect_failed("(IPv4)", s4);
 				}
 			}
 		}

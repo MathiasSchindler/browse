@@ -325,7 +325,7 @@ static inline void google_dns4_primary(struct in_addr *out)
 static inline void google_dns4_secondary(struct in_addr *out)
 {
 	/* 8.8.4.4 */
-	uint32_t host = (8u << 0u) | (8u << 8u) | (4u << 16u) | (4u << 24u);
+	uint32_t host = (8u << 24u) | (8u << 16u) | (4u << 8u) | (4u << 0u);
 	out->s_addr = htonl(host);
 }
 

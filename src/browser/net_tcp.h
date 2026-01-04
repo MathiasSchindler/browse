@@ -30,7 +30,8 @@ static inline int tcp__connect_with_timeout(int fd, const void *sa, uint32_t sa_
 	/* syscalls return negative errno. */
 	if (rc != -EINPROGRESS) {
 		(void)tcp__set_blocking(fd, 1);
-		return -1;
+		/* rc is negative errno */
+		return rc;
 	}
 
 	struct pollfd pfd;
@@ -38,19 +39,25 @@ static inline int tcp__connect_with_timeout(int fd, const void *sa, uint32_t sa_
 	pfd.events = (short)(POLLOUT | POLLERR | POLLHUP);
 	pfd.revents = 0;
 	int prc = sys_poll(&pfd, 1, timeout_ms);
-	if (prc <= 0) {
+	if (prc < 0) {
 		(void)tcp__set_blocking(fd, 1);
-		return -1;
+		return prc;
+	}
+	if (prc == 0) {
+		(void)tcp__set_blocking(fd, 1);
+		/* Timed out waiting for connect completion. */
+		return -110; /* ETIMEDOUT */
 	}
 
 	int soerr = 0;
 	uint32_t optlen = (uint32_t)sizeof(soerr);
-	if (sys_getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &optlen) < 0) {
+	int grc = sys_getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &optlen);
+	if (grc < 0) {
 		(void)tcp__set_blocking(fd, 1);
-		return -1;
+		return grc;
 	}
 	(void)tcp__set_blocking(fd, 1);
-	return (soerr == 0) ? 0 : -1;
+	return (soerr == 0) ? 0 : -(int)soerr;
 }
 
 static inline int tcp6_connect(const uint8_t ip[16], uint16_t port)
@@ -64,9 +71,10 @@ static inline int tcp6_connect(const uint8_t ip[16], uint16_t port)
 	sa.sin6_port = htons(port);
 	c_memcpy(sa.sin6_addr.s6_addr, ip, 16);
 
-	if (tcp__connect_with_timeout(fd, &sa, (uint32_t)sizeof(sa), 3000) < 0) {
+	int crc = tcp__connect_with_timeout(fd, &sa, (uint32_t)sizeof(sa), 3000);
+	if (crc < 0) {
 		sys_close(fd);
-		return -1;
+		return crc;
 	}
 
 	/* Prevent TLS/HTTP from blocking forever on reads/writes. */
@@ -84,16 +92,17 @@ static inline int tcp4_connect(const uint8_t ip[4], uint16_t port)
 	c_memset(&sa, 0, sizeof(sa));
 	sa.sin_family = (uint16_t)AF_INET;
 	sa.sin_port = htons(port);
-	/* ip is a 4-byte sequence in network order; convert to in_addr.s_addr. */
-	uint32_t host = ((uint32_t)ip[0] << 0u) |
-			 ((uint32_t)ip[1] << 8u) |
-			 ((uint32_t)ip[2] << 16u) |
-			 ((uint32_t)ip[3] << 24u);
+	/* ip is a 4-byte sequence in dotted-decimal order (a.b.c.d). */
+	uint32_t host = ((uint32_t)ip[0] << 24u) |
+			 ((uint32_t)ip[1] << 16u) |
+			 ((uint32_t)ip[2] << 8u) |
+			 ((uint32_t)ip[3] << 0u);
 	sa.sin_addr.s_addr = htonl(host);
 
-	if (tcp__connect_with_timeout(fd, &sa, (uint32_t)sizeof(sa), 3000) < 0) {
+	int crc = tcp__connect_with_timeout(fd, &sa, (uint32_t)sizeof(sa), 3000);
+	if (crc < 0) {
 		sys_close(fd);
-		return -1;
+		return crc;
 	}
 
 	/* Prevent TLS/HTTP from blocking forever on reads/writes. */

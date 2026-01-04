@@ -761,11 +761,13 @@ static int build_client_hello(const char *host,
 	*p++ = 0; /* legacy_session_id_len */
 
 	/* cipher_suites */
-	put_u16(p, 4);
+	/*
+	 * Only advertise ciphers we actually implement.
+	 * Some servers will pick the strongest common suite.
+	 */
+	put_u16(p, 2);
 	p += 2;
 	put_u16(p, (uint16_t)TLS13_CIPHER_TLS_AES_128_GCM_SHA256);
-	p += 2;
-	put_u16(p, 0x1302); /* TLS_AES_256_GCM_SHA384 (advertise only) */
 	p += 2;
 
 	/* legacy_compression_methods */
@@ -1179,11 +1181,18 @@ int tls13_https_get_status_location_and_body(int sock,
 	}
 	LOGI("tls", "got ServerHello\n");
 
-	if (parse_server_hello(sh_hs, sh_hs_len, server_pub) != 0) return -1;
+	LOGI("tls", "parsing ServerHello\n");
+	if (parse_server_hello(sh_hs, sh_hs_len, server_pub) != 0) {
+		LOGE("tls", "parse ServerHello failed (cipher/extension mismatch?)\n");
+		return -1;
+	}
+	LOGI("tls", "ServerHello ok\n");
 	sha256_update(&transcript, sh_hs, sh_hs_len);
 
+	LOGI("tls", "computing shared secret (x25519)\n");
 	uint8_t shared[32];
 	x25519(shared, priv, server_pub);
+	LOGI("tls", "shared secret computed\n");
 	crypto_memset(priv, 0, sizeof(priv));
 	crypto_memset(pub, 0, sizeof(pub));
 	crypto_memset(server_pub, 0, sizeof(server_pub));
@@ -1194,7 +1203,11 @@ int tls13_https_get_status_location_and_body(int sock,
 	struct tls13_aead rx_app = {0};
 	uint8_t c_hs_traffic[32];
 	uint8_t s_hs_traffic[32];
-	if (derive_hs_traffic(&transcript, shared, c_hs_traffic, s_hs_traffic, &tx_hs, &rx_hs) != 0) return -1;
+	LOGI("tls", "deriving handshake keys\n");
+	if (derive_hs_traffic(&transcript, shared, c_hs_traffic, s_hs_traffic, &tx_hs, &rx_hs) != 0) {
+		LOGE("tls", "derive handshake keys failed\n");
+		return -1;
+	}
 	LOGI("tls", "derived handshake keys\n");
 
 	/* Process encrypted handshake messages until server Finished. */
