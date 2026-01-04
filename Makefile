@@ -78,7 +78,7 @@ FONT_STAMP := build/fonts.stamp
 
 FONT_SRCS := src/core/font/font_render.c $(FONT_BUILTIN_8X8) $(FONT_BUILTIN_8X16)
 
-BROWSER_SRCS := src/core/start.S src/browser/main.c src/browser/browser_img.c src/browser/http.c src/browser/tls13_client.c src/browser/html_text.c src/browser/text_layout.c src/browser/style_attr.c src/browser/css_tiny.c src/browser/image/jpeg.c src/browser/image/jpeg_decode.c src/browser/image/png.c src/browser/image/png_decode.c src/browser/image/gif.c src/browser/image/gif_decode.c $(TLS_SRCS) $(FONT_SRCS)
+BROWSER_SRCS := src/core/start.S src/browser/main.c src/browser/browser_img.c src/browser/browser_nav.c src/browser/browser_ui.c src/browser/http.c src/browser/tls13_client.c src/browser/html_text.c src/browser/text_layout.c src/browser/style_attr.c src/browser/css_tiny.c src/browser/image/jpeg.c src/browser/image/jpeg_decode.c src/browser/image/png.c src/browser/image/png_decode.c src/browser/image/gif.c src/browser/image/gif_decode.c $(TLS_SRCS) $(FONT_SRCS)
 BROWSER_BIN := build/browser
 BROWSER_CFLAGS := $(CORE_CFLAGS) -DTEXT_LOG_MISSING_GLYPHS
 
