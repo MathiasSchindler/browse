@@ -14,6 +14,47 @@
 #include "image/gif_decode.h"
 
 #include "../core/text.h"
+#include "../core/log.h"
+
+static inline void img__msg_append(char *buf, size_t cap, size_t *o, const char *s)
+{
+	if (!buf || cap == 0 || !o || !s) return;
+	while (*s && *o + 1 < cap) {
+		buf[(*o)++] = *s++;
+	}
+}
+
+static inline void img__msg_append_u32_dec(char *buf, size_t cap, size_t *o, uint32_t v)
+{
+	char tmp[11];
+	uint32_t n = 0;
+	if (!buf || cap == 0 || !o) return;
+	if (v == 0) {
+		if (*o + 1 < cap) buf[(*o)++] = '0';
+		return;
+	}
+	while (v > 0 && n < 10) {
+		tmp[n++] = (char)('0' + (v % 10u));
+		v /= 10u;
+	}
+	while (n > 0 && *o + 1 < cap) {
+		buf[(*o)++] = tmp[--n];
+	}
+}
+
+static inline void img__log_key(enum log_level lvl, const char *what, const char *key)
+{
+	char msg[768];
+	size_t o = 0;
+	img__msg_append(msg, sizeof(msg), &o, what ? what : "img");
+	img__msg_append(msg, sizeof(msg), &o, ": ");
+	img__msg_append(msg, sizeof(msg), &o, key ? key : "(null)");
+	if (o + 1 < sizeof(msg)) msg[o++] = '\n';
+	if (lvl == LOG_LVL_ERROR) LOGE_BUF("img", msg, o);
+	else if (lvl == LOG_LVL_WARN) LOGW_BUF("img", msg, o);
+	else if (lvl == LOG_LVL_DEBUG) LOGD_BUF("img", msg, o);
+	else LOGI_BUF("img", msg, o);
+}
 
 static uint32_t g_img_use_tick;
 static uint32_t g_img_generation;
@@ -310,9 +351,25 @@ static int https_get_prefix_follow_redirects(const char *host_in, const char *pa
 	for (int step = 0; step < 4; step++) {
 		uint8_t ip6[16];
 		c_memset(ip6, 0, sizeof(ip6));
-		if (dns_resolve_aaaa_google(host, ip6) != 0) return -1;
+		if (dns_resolve_aaaa_google(host, ip6) != 0) {
+			char key[768];
+			size_t o = 0;
+			img__msg_append(key, sizeof(key), &o, host);
+			img__msg_append(key, sizeof(key), &o, "|");
+			img__msg_append(key, sizeof(key), &o, path);
+			img__log_key(LOG_LVL_WARN, "dns AAAA failed", key);
+			return -1;
+		}
 		int sock = tcp6_connect(ip6, 443);
-		if (sock < 0) return -1;
+		if (sock < 0) {
+			char key[768];
+			size_t o = 0;
+			img__msg_append(key, sizeof(key), &o, host);
+			img__msg_append(key, sizeof(key), &o, "|");
+			img__msg_append(key, sizeof(key), &o, path);
+			img__log_key(LOG_LVL_WARN, "tcp connect failed", key);
+			return -1;
+		}
 
 		char status[128];
 		char location[512];
@@ -332,12 +389,28 @@ static int https_get_prefix_follow_redirects(const char *host_in, const char *pa
 						 &body_len,
 						 &content_len);
 		sys_close(sock);
-		if (rc != 0) return -1;
+		if (rc != 0) {
+			char key[768];
+			size_t o = 0;
+			img__msg_append(key, sizeof(key), &o, host);
+			img__msg_append(key, sizeof(key), &o, "|");
+			img__msg_append(key, sizeof(key), &o, path);
+			img__log_key(LOG_LVL_WARN, "https get failed", key);
+			return -1;
+		}
 
 		int is_redirect = (status_code == 301 || status_code == 302 || status_code == 303 || status_code == 307 || status_code == 308);
 		if (!is_redirect || location[0] == 0) {
 			*out_len = (body_len > out_cap) ? out_cap : (size_t)body_len;
 			return 0;
+		}
+		if (LOG_LEVEL >= 3) {
+			char key[768];
+			size_t o = 0;
+			img__msg_append(key, sizeof(key), &o, host);
+			img__msg_append(key, sizeof(key), &o, "|");
+			img__msg_append(key, sizeof(key), &o, path);
+			img__log_key(LOG_LVL_DEBUG, "redirect", key);
 		}
 		char new_host[HOST_BUF_LEN];
 		char new_path[PATH_BUF_LEN];
@@ -386,7 +459,15 @@ static int https_get_prefix_follow_redirects_keepalive(struct tls13_https_conn *
 
 	for (int step = 0; step < 4; step++) {
 		if (!c->alive || c->sock < 0 || !streq(c->host, host)) {
-			if (https_conn_open_host(c, host) != 0) return -1;
+			if (https_conn_open_host(c, host) != 0) {
+				char key[768];
+				size_t o = 0;
+				img__msg_append(key, sizeof(key), &o, host);
+				img__msg_append(key, sizeof(key), &o, "|");
+				img__msg_append(key, sizeof(key), &o, path);
+				img__log_key(LOG_LVL_WARN, "conn open failed", key);
+				return -1;
+			}
 		}
 
 		char status[128];
@@ -418,12 +499,28 @@ static int https_get_prefix_follow_redirects_keepalive(struct tls13_https_conn *
 		}
 
 		if (peer_close) tls13_https_conn_close(c);
-		if (rc != 0) return -1;
+		if (rc != 0) {
+			char key[768];
+			size_t o = 0;
+			img__msg_append(key, sizeof(key), &o, host);
+			img__msg_append(key, sizeof(key), &o, "|");
+			img__msg_append(key, sizeof(key), &o, path);
+			img__log_key(LOG_LVL_WARN, "https get failed", key);
+			return -1;
+		}
 
 		int is_redirect = (status_code == 301 || status_code == 302 || status_code == 303 || status_code == 307 || status_code == 308);
 		if (!is_redirect || location[0] == 0) {
 			*out_len = (body_len > out_cap) ? out_cap : (size_t)body_len;
 			return 0;
+		}
+		if (LOG_LEVEL >= 3) {
+			char key[768];
+			size_t o = 0;
+			img__msg_append(key, sizeof(key), &o, host);
+			img__msg_append(key, sizeof(key), &o, "|");
+			img__msg_append(key, sizeof(key), &o, path);
+			img__log_key(LOG_LVL_DEBUG, "redirect", key);
 		}
 
 		char new_host[HOST_BUF_LEN];
@@ -609,6 +706,7 @@ static void img_worker_loop(uint32_t wi)
 		char host[HOST_BUF_LEN];
 		char path[PATH_BUF_LEN];
 		if (split_host_path_from_key(w->key, host, sizeof(host), path, sizeof(path)) != 0) {
+			img__log_key(LOG_LVL_ERROR, "bad key", w->key);
 			w->rc = -1;
 			w->state = 2u;
 			continue;
@@ -617,6 +715,7 @@ static void img_worker_loop(uint32_t wi)
 		uint8_t sniff_buf[4096];
 		size_t got = 0;
 		if (https_get_prefix_follow_redirects_keepalive(&conn, host, path, sniff_buf, sizeof(sniff_buf), &got) != 0 || got == 0) {
+			img__log_key(LOG_LVL_WARN, "sniff fetch failed", w->key);
 			w->rc = -1;
 			w->state = 2u;
 			continue;
@@ -671,7 +770,12 @@ static void img_worker_loop(uint32_t wi)
 						w->pix_h = (uint16_t)dh;
 						w->pix_len = (uint32_t)(dw * dh);
 						w->rc = 0;
+					} else {
+						/* Decode failure of tiny image: parent will decide on retries. */
+						w->rc = -2;
 					}
+				} else {
+					w->rc = -1;
 				}
 			}
 		}
@@ -759,9 +863,11 @@ int img_workers_pump(int *out_any_dims_changed, int *out_any_pixels_changed)
 				e->inflight = 0;
 				if (e->fetch_failures < 0xffu) e->fetch_failures++;
 				if (e->fetch_failures >= 3u) {
+					img__log_key(LOG_LVL_WARN, "fetch failed (giving up)", e->key);
 					e->want_pixels = 0;
 					e->state = 2;
 				} else {
+					if (LOG_LEVEL >= 3) img__log_key(LOG_LVL_DEBUG, "fetch failed (retrying)", e->key);
 					e->state = 1;
 				}
 				w->state = 0u;
@@ -813,11 +919,15 @@ int img_workers_pump(int *out_any_dims_changed, int *out_any_pixels_changed)
 				    (e->fmt == IMG_FMT_PNG || e->fmt == IMG_FMT_JPG || e->fmt == IMG_FMT_GIF)) {
 					if (e->pix_failures < 0xffu) e->pix_failures++;
 					if (e->pix_failures >= 3u) {
+						img__log_key(LOG_LVL_WARN, "decode failed (giving up)", e->key);
 						e->want_pixels = 0;
+					} else {
+						if (LOG_LEVEL >= 3) img__log_key(LOG_LVL_DEBUG, "decode failed (retrying)", e->key);
 					}
 				}
 				/* Unsupported formats: don't keep burning worker cycles. */
 				if (e->fmt == IMG_FMT_WEBP || e->fmt == IMG_FMT_SVG) {
+					img__log_key(LOG_LVL_INFO, "unsupported format (skipping)", e->key);
 					e->want_pixels = 0;
 				}
 			}
@@ -886,25 +996,31 @@ int img_decode_large_pump_one(void)
 		char host[HOST_BUF_LEN];
 		char path[PATH_BUF_LEN];
 		if (split_host_path_from_key(e->key, host, sizeof(host), path, sizeof(path)) != 0) {
+			img__log_key(LOG_LVL_ERROR, "bad key", e->key);
 			e->want_pixels = 0;
 			return 0;
 		}
 
 		uint32_t px = (uint32_t)e->w * (uint32_t)e->h;
 		if (px == 0 || px > (uint32_t)(sizeof(g_img_pixel_pool) / sizeof(g_img_pixel_pool[0]))) {
+			img__log_key(LOG_LVL_WARN, "bad dimensions", e->key);
 			e->want_pixels = 0;
 			return 0;
 		}
 
 		size_t got_full = 0;
 		if (https_get_prefix_follow_redirects(host, path, g_img_fetch_buf, sizeof(g_img_fetch_buf), &got_full) != 0 || got_full == 0) {
+			img__log_key(LOG_LVL_WARN, "fetch failed", e->key);
 			e->want_pixels = 0;
 			return 0;
 		}
 
 		uint32_t old_used = g_img_pixel_pool_used;
 		uint32_t off = 0;
-		if (img_pixel_alloc(px, &off) != 0) return 0;
+		if (img_pixel_alloc(px, &off) != 0) {
+			img__log_key(LOG_LVL_WARN, "pixel alloc failed", e->key);
+			return 0;
+		}
 		uint32_t dw = 0, dh = 0;
 		int ok = -1;
 		if (e->fmt == IMG_FMT_JPG) {
@@ -926,6 +1042,7 @@ int img_decode_large_pump_one(void)
 			return 1;
 		} else {
 			g_img_pixel_pool_used = old_used;
+			img__log_key(LOG_LVL_WARN, "decode failed", e->key);
 			e->want_pixels = 0;
 		}
 		return 0;
