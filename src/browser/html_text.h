@@ -62,6 +62,14 @@ enum {
 	HTML_INLINE_IMG_URL_MAX = 512,
 };
 
+/* Experimental: float-right image placeholders.
+ * Disabled by default because pages with many consecutive thumbnails can
+ * visually overlap with the current single-float renderer.
+ */
+#ifndef HTML_ENABLE_FLOAT_RIGHT
+#define HTML_ENABLE_FLOAT_RIGHT 0
+#endif
+
 struct html_inline_img {
 	uint32_t start;
 	uint32_t end;

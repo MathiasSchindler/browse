@@ -228,6 +228,9 @@ void css_sheet_init(struct css_sheet *sheet)
 	ua_add_hide_desc_id_class(sheet, "mw-navigation", "mw-portlet");
 }
 
+#if defined(__GNUC__)
+__attribute__((noinline))
+#endif
 void css_sheet_compute(const struct css_sheet *sheet,
 		       const uint8_t *tag_lc,
 		       size_t tag_len,

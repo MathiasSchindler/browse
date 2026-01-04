@@ -4,6 +4,12 @@
 
 #include "../core/log.h"
 
+#if defined(__GNUC__)
+#define HTML_TEXT_NOINLINE __attribute__((noinline))
+#else
+#define HTML_TEXT_NOINLINE
+#endif
+
 static int is_ascii_space(uint8_t c)
 {
 	return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\f';
@@ -165,7 +171,7 @@ static int streq_lit(const char *s, const char *lit)
 	}
 }
 
-static void parse_class_tokens(const uint8_t *v,
+HTML_TEXT_NOINLINE static void parse_class_tokens(const uint8_t *v,
 			      size_t vlen,
 			      char classes[CSS_MAX_CLASSES_PER_NODE][CSS_MAX_CLASS_LEN + 1],
 			      uint32_t *io_class_count)
@@ -617,6 +623,33 @@ static int emit_codepoint(char *out, size_t out_len, size_t *io_o, int *io_last_
 		return 0;
 	}
 
+	/* Small UTF-8 downmapping for common Wikipedia Greek/punctuation.
+	 * We render these using private single-byte glyphs in the 0x80..0x8F range.
+	 */
+	switch (cp) {
+		case 0x03B1: /* α */ (void)append_char(out, out_len, io_o, (char)0x80); *io_last_was_space = 0; return 0;
+		case 0x03B3: /* γ */ (void)append_char(out, out_len, io_o, (char)0x81); *io_last_was_space = 0; return 0;
+		case 0x03B4: /* δ */ (void)append_char(out, out_len, io_o, (char)0x82); *io_last_was_space = 0; return 0;
+		case 0x03B5: /* ε */
+		case 0x1F10: /* ε with psili (approx) */
+			(void)append_char(out, out_len, io_o, (char)0x83); *io_last_was_space = 0; return 0;
+		case 0x03BF: /* ο */ (void)append_char(out, out_len, io_o, (char)0x84); *io_last_was_space = 0; return 0;
+		case 0x03C0: /* π */ (void)append_char(out, out_len, io_o, (char)0x85); *io_last_was_space = 0; return 0;
+		case 0x03C3: /* σ */ (void)append_char(out, out_len, io_o, (char)0x86); *io_last_was_space = 0; return 0;
+		case 0x03C2: /* ς */ (void)append_char(out, out_len, io_o, (char)0x8D); *io_last_was_space = 0; return 0;
+		case 0x03C5: /* υ */
+		case 0x03CD: /* υ with tonos (approx) */
+			(void)append_char(out, out_len, io_o, (char)0x87); *io_last_was_space = 0; return 0;
+		case 0x03B9: /* ι */
+		case 0x03AF: /* ι with tonos (approx) */
+			(void)append_char(out, out_len, io_o, (char)0x88); *io_last_was_space = 0; return 0;
+		case 0x03BA: /* κ */ (void)append_char(out, out_len, io_o, (char)0x89); *io_last_was_space = 0; return 0;
+		case 0x03BB: /* λ */ (void)append_char(out, out_len, io_o, (char)0x8A); *io_last_was_space = 0; return 0;
+		case 0x2020: /* dagger */ (void)append_char(out, out_len, io_o, (char)0x8B); *io_last_was_space = 0; return 0;
+		case 0x201E: /* double low-9 quote */ (void)append_char(out, out_len, io_o, (char)0x8C); *io_last_was_space = 0; return 0;
+		default: break;
+	}
+
 	switch (cp) {
 		case 0x2010: /* hyphen */
 		case 0x2011: /* non-breaking hyphen */
@@ -688,6 +721,33 @@ static int map_codepoint_to_single_char(uint32_t cp, char *out_ch, int *out_igno
 	if (cp >= 0xA0 && cp <= 0xFF) {
 		*out_ch = (char)(uint8_t)cp;
 		return 0;
+	}
+
+	/* Mirror the UTF-8 downmapping in emit_codepoint() so numeric entities
+	 * (e.g. &#x3b1;) produce the same single-byte glyphs.
+	 */
+	switch (cp) {
+		case 0x03B1: *out_ch = (char)0x80; return 0; /* α */
+		case 0x03B3: *out_ch = (char)0x81; return 0; /* γ */
+		case 0x03B4: *out_ch = (char)0x82; return 0; /* δ */
+		case 0x03B5:
+		case 0x1F10:
+			*out_ch = (char)0x83; return 0; /* ε (approx) */
+		case 0x03BF: *out_ch = (char)0x84; return 0; /* ο */
+		case 0x03C0: *out_ch = (char)0x85; return 0; /* π */
+		case 0x03C3: *out_ch = (char)0x86; return 0; /* σ */
+		case 0x03C2: *out_ch = (char)0x8D; return 0; /* ς */
+		case 0x03C5:
+		case 0x03CD:
+			*out_ch = (char)0x87; return 0; /* υ (approx) */
+		case 0x03B9:
+		case 0x03AF:
+			*out_ch = (char)0x88; return 0; /* ι (approx) */
+		case 0x03BA: *out_ch = (char)0x89; return 0; /* κ */
+		case 0x03BB: *out_ch = (char)0x8A; return 0; /* λ */
+		case 0x2020: *out_ch = (char)0x8B; return 0; /* † */
+		case 0x201E: *out_ch = (char)0x8C; return 0; /* „ */
+		default: break;
 	}
 
 	switch (cp) {
@@ -1118,19 +1178,20 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 							while (k < html_len && !is_ascii_space(html[k]) && html[k] != '>') k++;
 						}
 						size_t vlen = (k > vs) ? (k - vs) : 0;
+						if (q && k < html_len && html[k] == q) k++;
 						if (vlen > 0) {
 							if (ieq_attr(html + an, alen, "class")) {
 								parse_class_tokens(html + vs, vlen, classes, &class_count);
 							} else if (ieq_attr(html + an, alen, "id")) {
 								parse_id_token(html + vs, vlen, node_id, sizeof(node_id));
-								} else if (ieq_attr(html + an, alen, "style")) {
-									(void)parse_inline_display(html + vs, vlen, &inline_disp, &inline_has_disp);
-								} else if (nb == 2 && name_buf[0] == 't' && name_buf[1] == 'h' && ieq_attr(html + an, alen, "colspan")) {
-									th_colspan = parse_uint_dec_attr(html + vs, vlen);
+							} else if (ieq_attr(html + an, alen, "style")) {
+								(void)parse_inline_display(html + vs, vlen, &inline_disp, &inline_has_disp);
+							} else if (nb == 2 && name_buf[0] == 't' && name_buf[1] == 'h' && ieq_attr(html + an, alen, "colspan")) {
+								th_colspan = parse_uint_dec_attr(html + vs, vlen);
 							}
 						}
 					}
-					if (k < html_len && html[k] != '>') k++;
+					while (k < html_len && html[k] != '>' && !is_ascii_space(html[k])) k++;
 				}
 			}
 
@@ -1477,8 +1538,7 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 				else if (ieq_lit_n(name_buf, nb, "style")) {
 					skip_mode = 2;
 					/* Remember where the CSS content starts (just after '>'). */
-					style_start = j;
-					if (style_start < html_len && html[style_start] == '>') style_start++;
+					style_start = (tag_end < html_len) ? (tag_end + 1) : html_len;
 					while (style_start < html_len && (html[style_start] == '\r' || html[style_start] == '\n')) style_start++;
 				}
 				else if (ieq_lit_n(name_buf, nb, "noscript")) skip_mode = 3;
@@ -1644,7 +1704,7 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 					/* Many lead/infobox images are ~240-640px wide (e.g. 560x312).
 					 * If we have dimensions and it isn't extremely large, float it.
 					 */
-					if (img_w > 0 && img_h > 0 && img_w <= 640u && img_h <= 640u) {
+					if (HTML_ENABLE_FLOAT_RIGHT && img_w > 0 && img_h > 0 && img_w <= 640u && img_h <= 640u) {
 						float_right = 1;
 						/* total box width in text columns, including borders */
 						float_cols = (img_w + 7u) / 8u;

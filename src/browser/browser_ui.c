@@ -489,6 +489,7 @@ static void draw_body_wrapped(struct shm_fb *fb,
 		if (img_box.active) {
 			uint32_t rows_total = img_box.rows_total;
 			uint32_t rbox = img_box.row_in_box;
+			int has_pixels = (img_box.entry && img_box.entry->has_pixels);
 			/* Geometry */
 			uint32_t content_bottom = y + h_px;
 			if (fb->height < content_bottom) content_bottom = fb->height;
@@ -508,39 +509,32 @@ static void draw_body_wrapped(struct shm_fb *fb,
 				if (want_w < 32u) want_w = 32u;
 				if (want_w < box_w) box_w = want_w;
 			}
-			if (box_w >= 2u) {
-				uint32_t col = 0xff505058u;
-				/* Left + right border for this row */
-				fill_rect_u32(fb->pixels, fb->stride, x, row_y, 1u, row_h, col);
-				fill_rect_u32(fb->pixels, fb->stride, x + box_w - 1u, row_y, 1u, row_h, col);
-				/* Bottom border on last row */
-				if (rbox + 1u == rows_total && row_h > 0u) {
-					fill_rect_u32(fb->pixels, fb->stride, x, row_y + row_h - 1u, box_w, 1u, col);
-				}
-				/* Pixel slice (skip label row). */
-				if (img_box.entry && img_box.entry->has_pixels && rbox >= 1u) {
-					uint32_t inner_x = x + 1u;
-					uint32_t inner_w = (box_w > 2u) ? (box_w - 2u) : 0u;
-					uint32_t dst_h = row_h;
-					if (rbox + 1u == rows_total && dst_h > 0u) {
-						/* Keep bottom border visible. */
-						dst_h = (dst_h > 1u) ? (dst_h - 1u) : 0u;
-					}
-					if (inner_w != 0u && dst_h != 0u) {
-						/* Clear interior first so partial blits don't leave artifacts. */
-						fill_rect_u32(fb->pixels, fb->stride, inner_x, row_y, inner_w, dst_h, 0xff101014u);
-					}
-					uint32_t src_y0 = (rbox - 1u) * 16u;
-					if (dst_h != 0u && src_y0 < (uint32_t)img_box.entry->pix_h) {
+			if (box_w != 0u) {
+				if (has_pixels) {
+					/* Once the image is rendered, drop the placeholder borders/header and
+					 * draw the image directly in its reserved area.
+					 */
+					fill_rect_u32(fb->pixels, fb->stride, x, row_y, box_w, row_h, 0xff101014u);
+					uint32_t src_y0 = rbox * 16u;
+					if (src_y0 < (uint32_t)img_box.entry->pix_h) {
 						const uint32_t *pool = img_entry_pixels(img_box.entry);
 						const uint32_t *src = pool ? (pool + (size_t)src_y0 * (size_t)img_box.entry->pix_w) : 0;
 						uint32_t src_h = (uint32_t)img_box.entry->pix_h - src_y0;
 						if (src) {
-							uint32_t draw_w = inner_w;
+							uint32_t draw_w = box_w;
 							if (draw_w > img_box.entry->pix_w) draw_w = img_box.entry->pix_w;
-							uint32_t draw_x = inner_x + ((inner_w > draw_w) ? ((inner_w - draw_w) / 2u) : 0u);
-							blit_xrgb_clipped(fb, draw_x, row_y, draw_w, dst_h, src, img_box.entry->pix_w, src_h);
+							uint32_t draw_x = x + ((box_w > draw_w) ? ((box_w - draw_w) / 2u) : 0u);
+							blit_xrgb_clipped(fb, draw_x, row_y, draw_w, row_h, src, img_box.entry->pix_w, src_h);
 						}
+					}
+				} else if (box_w >= 2u) {
+					uint32_t col = 0xff505058u;
+					/* Left + right border for this row */
+					fill_rect_u32(fb->pixels, fb->stride, x, row_y, 1u, row_h, col);
+					fill_rect_u32(fb->pixels, fb->stride, x + box_w - 1u, row_y, 1u, row_h, col);
+					/* Bottom border on last row */
+					if (rbox + 1u == rows_total && row_h > 0u) {
+						fill_rect_u32(fb->pixels, fb->stride, x, row_y + row_h - 1u, box_w, 1u, col);
 					}
 				}
 			}
@@ -681,6 +675,12 @@ static void draw_body_wrapped(struct shm_fb *fb,
 				uint32_t fx = x + ((w_px > box_w) ? (w_px - box_w) : 0u);
 				uint32_t col = 0xff505058u;
 				if (row_h != 0u && box_w != 0u) {
+					/* Clear interior so a new float marker row doesn't leave pixels from a
+					 * previous float behind (common when pages have many thumbnails).
+					 */
+					if (row_h > 1u && box_w > 2u) {
+						fill_rect_u32(fb->pixels, fb->stride, fx + 1u, row_y + 1u, box_w - 2u, row_h - 1u, 0xff101014u);
+					}
 					fill_rect_u32(fb->pixels, fb->stride, fx, row_y, box_w, 1u, col);
 					if (box_w >= 2u) {
 						fill_rect_u32(fb->pixels, fb->stride, fx, row_y, 1u, row_h, col);
@@ -720,8 +720,10 @@ static void draw_body_wrapped(struct shm_fb *fb,
 				float_box.active = 1;
 				float_box.rows_total = rows;
 				float_box.cols_total = fcols;
-				/* Next visual row should draw the first pixel slice (label row is this row). */
-				float_box.row_in_box = 1;
+				/* Label row is this row; first pixel slice draws on the next visual row.
+				 * Keep row_in_box semantics aligned with the scroll + click logic.
+				 */
+				float_box.row_in_box = 0;
 
 				/* Draw the next text line on the same row (mirrors old behavior). */
 				uint32_t use_cols2 = max_cols;
@@ -743,50 +745,51 @@ static void draw_body_wrapped(struct shm_fb *fb,
 				continue;
 			}
 
-			/* Block placeholder label */
+			/* Block placeholder: no header bar. While loading, draw only the box; once
+			 * pixels exist, draw the image starting at this marker row.
+			 */
+			uint32_t content_bottom = y + h_px;
+			if (fb->height < content_bottom) content_bottom = fb->height;
+			uint32_t remaining_h = (content_bottom > row_y) ? (content_bottom - row_y) : 0u;
+			uint32_t row_h = (remaining_h > 16u) ? 16u : remaining_h;
+			uint32_t max_w = (fb->width > x) ? (fb->width - x) : 0u;
 			uint32_t box_w = w_px;
+			if (box_w > max_w) box_w = max_w;
 			if (entry && entry->has_dims) {
 				uint32_t want_w = (uint32_t)entry->w + 2u;
 				if (want_w < 32u) want_w = 32u;
 				if (want_w < box_w) box_w = want_w;
 			}
-			if (box_w >= 2u) {
-				uint32_t col = 0xff505058u;
-				fill_rect_u32(fb->pixels, fb->stride, x, row_y, box_w, 1u, col);
-				fill_rect_u32(fb->pixels, fb->stride, x, row_y, 1u, 16u, col);
-				fill_rect_u32(fb->pixels, fb->stride, x + box_w - 1u, row_y, 1u, 16u, col);
+			int has_pixels = (entry && entry->has_pixels);
+			if (row_h != 0u && box_w != 0u) {
+				if (has_pixels) {
+					fill_rect_u32(fb->pixels, fb->stride, x, row_y, box_w, row_h, 0xff101014u);
+					const uint32_t *pool = img_entry_pixels(entry);
+					const uint32_t *src = pool;
+					uint32_t src_h = (uint32_t)entry->pix_h;
+					if (src) {
+						uint32_t draw_w = box_w;
+						if (draw_w > entry->pix_w) draw_w = entry->pix_w;
+						uint32_t draw_x = x + ((box_w > draw_w) ? ((box_w - draw_w) / 2u) : 0u);
+						blit_xrgb_clipped(fb, draw_x, row_y, draw_w, row_h, src, entry->pix_w, src_h);
+					}
+				} else if (box_w >= 2u) {
+					uint32_t col = 0xff505058u;
+					fill_rect_u32(fb->pixels, fb->stride, x, row_y, box_w, 1u, col);
+					fill_rect_u32(fb->pixels, fb->stride, x, row_y, 1u, row_h, col);
+					fill_rect_u32(fb->pixels, fb->stride, x + box_w - 1u, row_y, 1u, row_h, col);
+					if (row_h > 1u && box_w > 2u) {
+						fill_rect_u32(fb->pixels, fb->stride, x + 1u, row_y + 1u, box_w - 2u, row_h - 1u, 0xff101014u);
+					}
+				}
 			}
-			struct text_color fmtc = tc;
-			fmtc.fg = 0xffffa000u;
-			uint32_t label_x = x + 8u;
-			uint32_t label_w = (box_w > 16u) ? (box_w - 16u) : 0u;
-			if (fmt[0] != 0 && label_w >= 8u * 4u) {
-				draw_text_u32(fb->pixels, fb->stride, label_x, row_y + 6u, fmt, fmtc);
-				label_x += 8u * 5u;
-				label_w = (label_w > 8u * 5u) ? (label_w - 8u * 5u) : 0u;
-			}
-			if (entry && entry->has_dims && label_w >= 8u * 6u) {
-				char wdec[11];
-				char hdec[11];
-				u32_to_dec(wdec, (uint32_t)entry->w);
-				u32_to_dec(hdec, (uint32_t)entry->h);
-				char dims[32];
-				size_t di = 0;
-				for (size_t ii = 0; wdec[ii] && di + 1 < sizeof(dims); ii++) dims[di++] = wdec[ii];
-				if (di + 1 < sizeof(dims)) dims[di++] = 'x';
-				for (size_t ii = 0; hdec[ii] && di + 1 < sizeof(dims); ii++) dims[di++] = hdec[ii];
-				if (di + 1 < sizeof(dims)) dims[di++] = ' ';
-				dims[di] = 0;
-				draw_text_u32(fb->pixels, fb->stride, label_x, row_y + 6u, dims, fmtc);
-				uint32_t adv = (uint32_t)di * 8u;
-				label_x += adv;
-				label_w = (label_w > adv) ? (label_w - adv) : 0u;
-			}
-			draw_text_clipped_u32(fb->pixels, fb->stride, label_x, row_y + 6u, label_w, label, tc);
 
 			img_box.active = 1;
 			img_box.entry = entry;
 			img_box.rows_total = rows;
+			/* Marker row drew the first 16px slice (or the top border); start at the
+			 * next 16px slice on the next visual row.
+			 */
 			img_box.row_in_box = 1;
 			continue;
 		}
