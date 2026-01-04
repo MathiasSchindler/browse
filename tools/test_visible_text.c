@@ -34,9 +34,16 @@ int main(void)
 	if (expect_eq("utf8_punct", "foo\xE2\x80\x93" "bar" "\xE2\x80\xA6", "foo-bar...")) return 1;
 	if (expect_eq("img_placeholder", "A<img alt='Example image' src='https://upload.wikimedia.org/wikipedia/commons/a/a9/X.png'>B",
 	              "A\n\x1e" "IMG 8 ? Example image\x1fhttps://upload.wikimedia.org/wikipedia/commons/a/a9/X.png\n\n\n\n\n\n\n\n\nB")) return 1;
+	if (expect_eq("img_src_newline", "A<img alt='Example image' src='//upload.wikimedia.org/wikipedi\na/commons/a/a9/X.png'>B",
+	              "A\n\x1e" "IMG 8 ? Example image\x1f//upload.wikimedia.org/wikipedia/commons/a/a9/X.png\n\n\n\n\n\n\n\n\nB")) return 1;
 	if (expect_eq("img_srcset_pick", "A<img srcset='https://x/y/a.webp 1x, https://x/y/b.png 2x'>B",
 	              "A\n\x1e" "IMG 8 ? b.png\x1fhttps://x/y/b.png\n\n\n\n\n\n\n\n\nB")) return 1;
-	if (expect_eq("img_inline_icon", "A<img width='24' height='24' alt='icon' src='x.png'>B", "A [img] B")) return 1;
+	if (expect_eq("img_srcset_newline", "A<img srcset='https://x/y/a.webp 1x, https://x/y/b.\npng 2x'>B",
+	              "A\n\x1e" "IMG 8 ? b.png\x1fhttps://x/y/b.png\n\n\n\n\n\n\n\n\nB")) return 1;
+	if (expect_eq("img_inline_icon", "A<img width='24' height='24' alt='icon' src='x.png'>B", "A [img]\xA0" "B")) return 1;
+	if (expect_eq("breadcrumb_nav_inline_li",
+	              "A<ul class='breadcrumb-nav-container'><li><img width='30' height='27' src='x.png'>Geographie</li><li><img width='30' height='27' src='y.png'>Geschichte</li></ul>Z",
+	              "A\n[img]\xA0" "Geographie [img]\xA0" "Geschichte\nZ")) return 1;
 	if (expect_eq("inline_display_none", "<html><body>foo <span style=\"display:none\">HIDE</span> bar</body></html>", "foo bar")) return 1;
 	if (expect_eq("infobox_table_2col",
 	              "<html><body>"

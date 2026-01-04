@@ -195,6 +195,29 @@ static void ua_add_hide_desc_id_class(struct css_sheet *sheet, const char *anc_i
 	r->display = CSS_DISPLAY_NONE;
 }
 
+static void ua_add_desc_class_tag_display(struct css_sheet *sheet, const char *anc_class, const char *tag, enum css_display disp)
+{
+	if (!sheet || !anc_class || anc_class[0] == 0 || !tag || tag[0] == 0) return;
+	if (sheet->ua_n >= CSS_MAX_UA_RULES) return;
+	struct css_rule *r = &sheet->ua_rules[sheet->ua_n++];
+	rule_clear(r);
+	r->sel.has_ancestor = 1;
+	r->sel.ancestor.has_class = 1;
+	{
+		size_t i = 0;
+		for (; anc_class[i] && i + 1 < sizeof(r->sel.ancestor.klass); i++) r->sel.ancestor.klass[i] = anc_class[i];
+		r->sel.ancestor.klass[i] = 0;
+	}
+	r->sel.self.has_tag = 1;
+	{
+		size_t i = 0;
+		for (; tag[i] && i + 1 < sizeof(r->sel.self.tag); i++) r->sel.self.tag[i] = tag[i];
+		r->sel.self.tag[i] = 0;
+	}
+	r->has_display = 1;
+	r->display = disp;
+}
+
 void css_sheet_init(struct css_sheet *sheet)
 {
 	if (!sheet) return;
@@ -226,6 +249,12 @@ void css_sheet_init(struct css_sheet *sheet)
 	ua_add_hide_class(sheet, "vector-menu-portal");
 	ua_add_hide_desc_id_class(sheet, "mw-panel", "mw-portlet");
 	ua_add_hide_desc_id_class(sheet, "mw-navigation", "mw-portlet");
+
+	/* MediaWiki nav lists often use <ul class="breadcrumb-nav-container"> with CSS
+	 * like "ul.breadcrumb-nav-container>li{display:inline}" (child combinator is
+	 * outside our tiny parser). Treat those <li> as inline for better readability.
+	 */
+	ua_add_desc_class_tag_display(sheet, "breadcrumb-nav-container", "li", CSS_DISPLAY_INLINE);
 }
 
 #if defined(__GNUC__)

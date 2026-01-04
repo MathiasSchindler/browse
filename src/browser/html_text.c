@@ -318,6 +318,16 @@ static void append_space_collapse(char *out, size_t out_len, size_t *io, int *la
 	*last_was_space = 1;
 }
 
+static void append_nbsp_collapse(char *out, size_t out_len, size_t *io, int *last_was_space)
+{
+	/* Non-breaking space (U+00A0). Our line wrapper only breaks on ' ' and '\t',
+	 * so this keeps short "icon + label" runs together.
+	 */
+	if (*last_was_space) return;
+	(void)append_char(out, out_len, io, (char)0xA0);
+	*last_was_space = 1;
+}
+
 static void append_lit(char *out, size_t out_len, size_t *io, const char *lit)
 {
 	if (!out || !io || !lit) return;
@@ -452,8 +462,13 @@ static void img_pick_from_srcset(const uint8_t *v, size_t vlen, char *out, size_
 		/* URL token */
 		char url[128];
 		size_t o = 0;
-		while (i < vlen && !is_ascii_space(v[i]) && v[i] != ',') {
-			uint8_t c = v[i++];
+		while (i < vlen && v[i] != ',') {
+			uint8_t c = v[i];
+			/* Some pages insert hard newlines inside long URLs; ignore them. */
+			if (c == '\r' || c == '\n') { i++; continue; }
+			/* Regular whitespace ends the URL token (descriptor follows). */
+			if (is_ascii_space(c)) break;
+			i++;
 			if (c < 32 || c >= 127) continue;
 			if (o + 1 < sizeof(url)) url[o++] = (char)c;
 		}
@@ -470,6 +485,24 @@ static void img_pick_from_srcset(const uint8_t *v, size_t vlen, char *out, size_
 	}
 
 	if (best[0] != 0) cpy_str_trunc(out, out_cap, best);
+}
+
+static void img_copy_src_value(const uint8_t *v, size_t vlen, char *out, size_t out_cap)
+{
+	/* Copy a URL-ish attribute value into ASCII, stripping ASCII whitespace/control.
+	 * Wikipedia sometimes inserts newlines into long attribute values.
+	 */
+	if (!out || out_cap == 0) return;
+	out[0] = 0;
+	if (!v || vlen == 0) return;
+	size_t o = 0;
+	for (size_t i = 0; i < vlen && o + 1 < out_cap; i++) {
+		uint8_t c = v[i];
+		if (is_ascii_space(c) || c == 0) continue;
+		if (c < 32 || c >= 127) continue;
+		out[o++] = (char)c;
+	}
+	out[o] = 0;
 }
 
 static void u32_to_dec_local(char out[11], uint32_t v)
@@ -1006,6 +1039,14 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 	uint32_t table_cell_index = 0;
 	for (size_t ti = 0; ti < sizeof(table_mode_stack); ti++) table_mode_stack[ti] = 0;
 
+	/* Navigation list mode (e.g. MediaWiki breadcrumb/nav lists): render <li>
+	 * inline instead of bullet/block, for compact link/icon strips.
+	 */
+	uint8_t navlist_mode_stack[16];
+	uint32_t navlist_depth = 0;
+	uint32_t navlist_mode_depth = 0;
+	for (size_t ni = 0; ni < sizeof(navlist_mode_stack); ni++) navlist_mode_stack[ni] = 0;
+
 	for (size_t i = 0; i < html_len; i++) {
 		uint8_t c = html[i];
 
@@ -1247,6 +1288,27 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 						table_depth--;
 						if (table_mode_stack[table_depth]) {
 							if (table_mode_depth > 0) table_mode_depth--;
+						}
+					}
+				}
+			}
+
+			/* Breadcrumb/nav lists (used heavily by MediaWiki): render LI inline. */
+			if (nb == 2 && ((name_buf[0] == 'u' && name_buf[1] == 'l') || (name_buf[0] == 'o' && name_buf[1] == 'l'))) {
+				if (!is_end) {
+					int is_mode = 0;
+					for (uint32_t ci = 0; ci < class_count; ci++) {
+						if (streq_lit(classes[ci], "breadcrumb-nav-container")) { is_mode = 1; break; }
+					}
+					if (navlist_depth < (uint32_t)(sizeof(navlist_mode_stack) / sizeof(navlist_mode_stack[0]))) {
+						navlist_mode_stack[navlist_depth++] = (uint8_t)(is_mode != 0);
+						if (is_mode) navlist_mode_depth++;
+					}
+				} else {
+					if (navlist_depth > 0) {
+						navlist_depth--;
+						if (navlist_mode_stack[navlist_depth]) {
+							if (navlist_mode_depth > 0) navlist_mode_depth--;
 						}
 					}
 				}
@@ -1560,6 +1622,10 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 			}
 			int is_heading = (nb == 2 && name_buf[0] == 'h' && name_buf[1] >= '1' && name_buf[1] <= '6');
 			int is_li = (nb == 2 && name_buf[0] == 'l' && name_buf[1] == 'i');
+			if (navlist_mode_depth > 0 && is_li) {
+				/* Treat nav list items as inline regardless of default block semantics. */
+				is_block = 0;
+			}
 
 			/* Phase 1 images: treat <img> as a block placeholder so layout reserves space.
 			 * No decoding yet; we print a small boxed marker plus alt/src tail.
@@ -1567,12 +1633,14 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 			if (allow_output && !is_end && nb == 3 && ieq_lit_n(name_buf, nb, "img")) {
 				char alt_tmp[64];
 				char src_tmp[512];
-				char srcset_tmp[512];
 				uint32_t img_w = 0;
 				uint32_t img_h = 0;
 				alt_tmp[0] = 0;
 				src_tmp[0] = 0;
-				srcset_tmp[0] = 0;
+
+				/* srcset candidate selection is done directly from the raw attribute bytes.
+				 * We avoid pre-copying because some pages contain line breaks inside URLs.
+				 */
 
 				/* Parse alt=, src=/data-src=, srcset=, height= (best-effort, ASCII only). */
 				size_t k = j;
@@ -1625,21 +1693,14 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 							while (o2 > 0 && alt_tmp[o2 - 1] == ' ') o2--;
 							alt_tmp[o2] = 0;
 						} else if ((ieq_attr(html + an, alen, "src") || ieq_attr(html + an, alen, "data-src")) && src_tmp[0] == 0) {
-							size_t o2 = 0;
-							for (size_t t = 0; t < vlen && o2 + 1 < sizeof(src_tmp); t++) {
-								uint8_t sc = html[vs + t];
-								if (sc < 32 || sc >= 127) break;
-								src_tmp[o2++] = (char)sc;
+							img_copy_src_value(html + vs, vlen, src_tmp, sizeof(src_tmp));
+						} else if (ieq_attr(html + an, alen, "srcset") && src_tmp[0] == 0) {
+							char picked[512];
+							picked[0] = 0;
+							img_pick_from_srcset(html + vs, vlen, picked, sizeof(picked));
+							if (picked[0] != 0) {
+								cpy_str_trunc(src_tmp, sizeof(src_tmp), picked);
 							}
-							src_tmp[o2] = 0;
-						} else if (ieq_attr(html + an, alen, "srcset") && srcset_tmp[0] == 0) {
-							size_t o2 = 0;
-							for (size_t t = 0; t < vlen && o2 + 1 < sizeof(srcset_tmp); t++) {
-								uint8_t sc = html[vs + t];
-								if (sc < 32 || sc >= 127) break;
-								srcset_tmp[o2++] = (char)sc;
-							}
-							srcset_tmp[o2] = 0;
 						} else if (ieq_attr(html + an, alen, "width") && img_w == 0) {
 							img_w = parse_uint_dec_attr(html + vs, vlen);
 						} else if (ieq_attr(html + an, alen, "height") && img_h == 0) {
@@ -1647,18 +1708,6 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 						}
 					}
 					if (q && k < html_len && k < tag_end && html[k] == q) k++;
-				}
-
-				/* Prefer srcset candidate (if any) for label selection; this is also a good
-				 * future hook once decoding exists.
-				 */
-				if (srcset_tmp[0] != 0) {
-					char picked[512];
-					picked[0] = 0;
-					img_pick_from_srcset((const uint8_t *)srcset_tmp, c_strlen(srcset_tmp), picked, sizeof(picked));
-					if (picked[0] != 0) {
-						cpy_str_trunc(src_tmp, sizeof(src_tmp), picked);
-					}
 				}
 
 				/* If the caller can provide image dimensions (e.g. from an async sniff
@@ -1690,7 +1739,7 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 						cpy_str_trunc(im->url, sizeof(im->url), src_tmp);
 					}
 					last_was_space = 0;
-					append_space_collapse(out, out_len, &o, &last_was_space);
+					append_nbsp_collapse(out, out_len, &o, &last_was_space);
 				} else {
 					/* Float heuristic: request a float-right box for thumbnail/infobox-like images
 					 * so text can flow beside them instead of reserving full-width blank rows.

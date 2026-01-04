@@ -127,6 +127,29 @@ struct img_pix_free_block {
 static struct img_pix_free_block g_img_pix_free[128];
 static uint32_t g_img_pix_free_n;
 
+static void img_pixel_try_shrink_tail(void)
+{
+	/* If we freed a block at the end of the bump-allocated pool, shrink the
+	 * high-water mark. This reduces fragmentation and makes large allocations
+	 * more likely to succeed.
+	 */
+	uint32_t changed;
+	do {
+		changed = 0;
+		for (uint32_t i = 0; i < g_img_pix_free_n; i++) {
+			struct img_pix_free_block *b = &g_img_pix_free[i];
+			if (b->len == 0) continue;
+			if (b->off + b->len == g_img_pixel_pool_used) {
+				g_img_pixel_pool_used -= b->len;
+				g_img_pix_free[i] = g_img_pix_free[g_img_pix_free_n - 1u];
+				g_img_pix_free_n--;
+				changed = 1;
+				break;
+			}
+		}
+	} while (changed);
+}
+
 static void img_pixel_free(uint32_t off, uint32_t n_pixels)
 {
 	if (n_pixels == 0) return;
@@ -160,6 +183,8 @@ static void img_pixel_free(uint32_t off, uint32_t n_pixels)
 		g_img_pix_free[w++] = g_img_pix_free[i];
 	}
 	g_img_pix_free_n = w;
+
+	img_pixel_try_shrink_tail();
 }
 
 static int img_pixel_alloc(uint32_t n_pixels, uint32_t *out_off)
@@ -171,15 +196,24 @@ static int img_pixel_alloc(uint32_t n_pixels, uint32_t *out_off)
 	uint32_t cap = (uint32_t)(sizeof(g_img_pixel_pool) / sizeof(g_img_pixel_pool[0]));
 	if (g_img_pixel_pool_used > cap) g_img_pixel_pool_used = cap;
 
-	/* First-fit from free list. */
+	/* Best-fit from free list (minimizes fragmentation). */
+	uint32_t best_i = 0xffffffffu;
+	uint32_t best_len = 0xffffffffu;
 	for (uint32_t i = 0; i < g_img_pix_free_n; i++) {
 		struct img_pix_free_block *b = &g_img_pix_free[i];
 		if (b->len < n_pixels) continue;
+		if (b->len < best_len) {
+			best_len = b->len;
+			best_i = i;
+		}
+	}
+	if (best_i != 0xffffffffu) {
+		struct img_pix_free_block *b = &g_img_pix_free[best_i];
 		*out_off = b->off;
 		b->off += n_pixels;
 		b->len -= n_pixels;
 		if (b->len == 0) {
-			g_img_pix_free[i] = g_img_pix_free[g_img_pix_free_n - 1u];
+			g_img_pix_free[best_i] = g_img_pix_free[g_img_pix_free_n - 1u];
 			g_img_pix_free_n--;
 		}
 		return 0;
@@ -1053,16 +1087,21 @@ int img_decode_large_pump_one(void)
 				if (img_pixel_alloc(px, &off) == 0) { alloc_ok = 0; break; }
 			}
 			if (alloc_ok != 0) {
-				char msg[256];
-				size_t o = 0;
-				img__msg_append(msg, sizeof(msg), &o, "pixel alloc failed (px=");
-				img__msg_append_u32_dec(msg, sizeof(msg), &o, px);
-				img__msg_append(msg, sizeof(msg), &o, ", pool_used=");
-				img__msg_append_u32_dec(msg, sizeof(msg), &o, g_img_pixel_pool_used);
-				img__msg_append(msg, sizeof(msg), &o, ", pool_cap=");
-				img__msg_append_u32_dec(msg, sizeof(msg), &o, (uint32_t)(sizeof(g_img_pixel_pool) / sizeof(g_img_pixel_pool[0])));
-				img__msg_append(msg, sizeof(msg), &o, ")");
-				img__log_key(LOG_LVL_WARN, msg, e->key);
+				if (e->pix_failures < 0xffu) e->pix_failures++;
+				if (e->pix_failures == 1u) {
+					char msg[256];
+					size_t o = 0;
+					img__msg_append(msg, sizeof(msg), &o, "pixel alloc failed (px=");
+					img__msg_append_u32_dec(msg, sizeof(msg), &o, px);
+					img__msg_append(msg, sizeof(msg), &o, ", pool_used=");
+					img__msg_append_u32_dec(msg, sizeof(msg), &o, g_img_pixel_pool_used);
+					img__msg_append(msg, sizeof(msg), &o, ", pool_cap=");
+					img__msg_append_u32_dec(msg, sizeof(msg), &o, (uint32_t)(sizeof(g_img_pixel_pool) / sizeof(g_img_pixel_pool[0])));
+					img__msg_append(msg, sizeof(msg), &o, ")");
+					img__log_key(LOG_LVL_WARN, msg, e->key);
+				}
+				/* Stop burning cycles until the UI asks again for this image. */
+				e->want_pixels = 0;
 				return 0;
 			}
 		}
