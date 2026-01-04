@@ -37,6 +37,12 @@ struct cfb_header {
 	uint32_t mouse_last_x;
 	uint32_t mouse_last_y;
 	uint64_t mouse_event_counter;
+	uint32_t keyq_wpos;
+	uint32_t reserved4;
+	struct {
+		uint32_t kind;
+		uint32_t ch;
+	} keyq[32];
 };
 
 enum {
@@ -121,11 +127,46 @@ int main(int argc, char **argv)
 	ino_t mapped_ino = 0;
 	uint64_t last_frame = (uint64_t)-1;
 
+	SDL_StartTextInput();
+
 	for (;;) {
 		SDL_Event ev;
 		while (SDL_PollEvent(&ev)) {
 			if (ev.type == SDL_QUIT) {
 				goto out;
+			}
+			if ((ev.type == SDL_TEXTINPUT || ev.type == SDL_KEYDOWN) && mapped && mapped_len >= CFB_HEADER_V1_SIZE) {
+				struct cfb_header *hdr = (struct cfb_header *)mapped;
+				if (hdr->magic == CFB_MAGIC && hdr->format == CFB_FORMAT_XRGB8888) {
+					if (hdr->version >= 3 && mapped_len >= sizeof(struct cfb_header)) {
+						if (ev.type == SDL_TEXTINPUT) {
+							/* Push bytes (URLs are typically ASCII/UTF-8 bytes). */
+							for (int i = 0; ev.text.text[i] != 0; i++) {
+								uint32_t w = hdr->keyq_wpos;
+								hdr->keyq[w & 31u].kind = 1u; /* CFB_KEY_TEXT */
+								hdr->keyq[w & 31u].ch = (uint32_t)(uint8_t)ev.text.text[i];
+								hdr->keyq_wpos = w + 1u;
+								hdr->input_counter++;
+							}
+						} else if (ev.type == SDL_KEYDOWN) {
+							uint32_t kind = 0;
+							switch (ev.key.keysym.sym) {
+							case SDLK_BACKSPACE: kind = 2u; break; /* CFB_KEY_BACKSPACE */
+							case SDLK_RETURN:
+							case SDLK_KP_ENTER: kind = 3u; break; /* CFB_KEY_ENTER */
+							case SDLK_ESCAPE: kind = 4u; break; /* CFB_KEY_ESCAPE */
+							default: kind = 0; break;
+							}
+							if (kind) {
+								uint32_t w = hdr->keyq_wpos;
+								hdr->keyq[w & 31u].kind = kind;
+								hdr->keyq[w & 31u].ch = 0;
+								hdr->keyq_wpos = w + 1u;
+								hdr->input_counter++;
+							}
+						}
+					}
+				}
 			}
 			if (ev.type == SDL_MOUSEWHEEL && mapped && mapped_len >= CFB_HEADER_V1_SIZE) {
 				struct cfb_header *hdr = (struct cfb_header *)mapped;

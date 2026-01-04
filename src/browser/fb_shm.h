@@ -39,7 +39,7 @@ static inline int shm_fb_open(struct shm_fb *out, uint32_t width, uint32_t heigh
 
 	struct cfb_header *hdr = (struct cfb_header *)mapped;
 	hdr->magic = CFB_MAGIC;
-	hdr->version = 2;
+	hdr->version = 3;
 	hdr->width = width;
 	hdr->height = height;
 	hdr->stride_bytes = stride;
@@ -56,6 +56,12 @@ static inline int shm_fb_open(struct shm_fb *out, uint32_t width, uint32_t heigh
 	hdr->mouse_last_x = 0;
 	hdr->mouse_last_y = 0;
 	hdr->mouse_event_counter = 0;
+	hdr->keyq_wpos = 0;
+	hdr->reserved4 = 0;
+	for (uint32_t i = 0; i < CFB_KEYQ_SIZE; i++) {
+		hdr->keyq[i].kind = 0;
+		hdr->keyq[i].ch = 0;
+	}
 	hdr->reserved2 = 0;
 	hdr->reserved3 = 0;
 

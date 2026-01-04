@@ -11,6 +11,22 @@ enum {
 	CFB_FORMAT_XRGB8888 = 1,
 };
 
+enum {
+	CFB_KEY_TEXT = 1,
+	CFB_KEY_BACKSPACE = 2,
+	CFB_KEY_ENTER = 3,
+	CFB_KEY_ESCAPE = 4,
+};
+
+enum {
+	CFB_KEYQ_SIZE = 32,
+};
+
+struct cfb_key_event {
+	uint32_t kind;
+	uint32_t ch; /* For CFB_KEY_TEXT: byte value (usually ASCII). */
+};
+
 struct cfb_header {
 	uint32_t magic;
 	uint32_t version;
@@ -35,6 +51,12 @@ struct cfb_header {
 	uint32_t mouse_last_x;
 	uint32_t mouse_last_y;
 	uint64_t mouse_event_counter;
+	/* Keyboard/text events (written by dev viewer; consumed by browser).
+	 * Events are pushed into a small ring buffer.
+	 */
+	uint32_t keyq_wpos;
+	uint32_t reserved4;
+	struct cfb_key_event keyq[CFB_KEYQ_SIZE];
 };
 
 static inline int32_t cfb_wheel_delta_y(const struct cfb_header *h)

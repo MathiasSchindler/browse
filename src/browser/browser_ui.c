@@ -46,6 +46,20 @@ static struct ui_buttons ui_layout_buttons(const struct shm_fb *fb)
 	return b;
 }
 
+static int ui_layout_urlbar_rect(const struct shm_fb *fb, uint32_t *out_x, uint32_t *out_y, uint32_t *out_w, uint32_t *out_h)
+{
+	if (!fb || !out_x || !out_y || !out_w || !out_h) return 0;
+	struct ui_buttons b = ui_layout_buttons(fb);
+	uint32_t url_x = 8u;
+	uint32_t url_right = (b.en_x > 8u) ? (b.en_x - 8u) : 0u;
+	uint32_t url_w = (url_right > url_x) ? (url_right - url_x) : 0u;
+	*out_x = url_x;
+	*out_y = 0u;
+	*out_w = url_w;
+	*out_h = UI_TOPBAR_H;
+	return (url_w > 0u) ? 1 : 0;
+}
+
 static void draw_text_clipped_u32(void *base, uint32_t stride_bytes, uint32_t x, uint32_t y, uint32_t max_w_px, const char *s, struct text_color color)
 {
 	if (!s) return;
@@ -330,6 +344,39 @@ static void blit_xrgb_clipped(struct shm_fb *fb,
 		const uint32_t *srow = src + (size_t)y * (size_t)src_w;
 		for (uint32_t x = 0; x < w; x++) {
 			row[x] = srow[x];
+		}
+	}
+}
+
+static void blit_xrgb_scaled_nn_clipped(struct shm_fb *fb,
+					uint32_t dst_x,
+					uint32_t dst_y,
+					uint32_t dst_w,
+					uint32_t dst_h,
+					const uint32_t *src,
+					uint32_t src_w,
+					uint32_t src_h)
+{
+	if (!fb || !src) return;
+	if (dst_w == 0 || dst_h == 0 || src_w == 0 || src_h == 0) return;
+	if (dst_x >= fb->width || dst_y >= fb->height) return;
+
+	uint32_t max_w = fb->width - dst_x;
+	uint32_t max_h = fb->height - dst_y;
+	uint32_t w = dst_w;
+	uint32_t h = dst_h;
+	if (w > max_w) w = max_w;
+	if (h > max_h) h = max_h;
+
+	for (uint32_t y = 0; y < h; y++) {
+		uint32_t sy = (uint32_t)(((uint64_t)y * (uint64_t)src_h) / (uint64_t)dst_h);
+		if (sy >= src_h) sy = src_h - 1u;
+		uint32_t *row = pixel_ptr(fb->pixels, fb->stride, dst_x, dst_y + y);
+		const uint32_t *srow = src + (size_t)sy * (size_t)src_w;
+		for (uint32_t x = 0; x < w; x++) {
+			uint32_t sx = (uint32_t)(((uint64_t)x * (uint64_t)src_w) / (uint64_t)dst_w);
+			if (sx >= src_w) sx = src_w - 1u;
+			row[x] = srow[sx];
 		}
 	}
 }
@@ -829,14 +876,33 @@ static void draw_body_wrapped(struct shm_fb *fb,
 			if (!e || !e->has_pixels) continue;
 			uint32_t token_x = x + to_draw[di].col * 8u;
 			uint32_t token_w = 5u * 8u;
-			uint32_t w = (uint32_t)e->pix_w;
-			uint32_t h = (uint32_t)e->pix_h;
-			if (w > 16u) w = 16u;
-			if (h > 16u) h = 16u;
+			uint32_t src_w = (uint32_t)e->pix_w;
+			uint32_t src_h = (uint32_t)e->pix_h;
+			uint32_t w = src_w;
+			uint32_t h = src_h;
+			if (w == 0 || h == 0) continue;
+			/* Fit into a 16x16 cell (keep aspect). */
+			if (w > 16u || h > 16u) {
+				if (w >= h) {
+					h = (uint32_t)(((uint64_t)h * 16u) / (uint64_t)w);
+					w = 16u;
+				} else {
+					w = (uint32_t)(((uint64_t)w * 16u) / (uint64_t)h);
+					h = 16u;
+				}
+				if (w == 0) w = 1u;
+				if (h == 0) h = 1u;
+			}
 			uint32_t dx = token_x + ((token_w > w) ? ((token_w - w) / 2u) : 0u);
 			uint32_t dy = row_y + ((16u > h) ? ((16u - h) / 2u) : 0u);
 			const uint32_t *src = img_entry_pixels(e);
-			if (src) blit_xrgb_clipped(fb, dx, dy, w, h, src, e->pix_w, e->pix_h);
+			if (src) {
+				if (src_w > 16u || src_h > 16u) {
+					blit_xrgb_scaled_nn_clipped(fb, dx, dy, w, h, src, src_w, src_h);
+				} else {
+					blit_xrgb_clipped(fb, dx, dy, w, h, src, src_w, src_h);
+				}
+			}
 		}
 
 		if (float_box.active) {
@@ -1031,5 +1097,9 @@ enum ui_action browser_ui_action_from_click(const struct shm_fb *fb, uint32_t x,
 	if (ui_hit_rect(x, y, b.en_x, b.en_y, b.en_w, b.en_h)) return UI_GO_EN;
 	if (ui_hit_rect(x, y, b.de_x, b.de_y, b.de_w, b.de_h)) return UI_GO_DE;
 	if (ui_hit_rect(x, y, b.reload_x, b.reload_y, b.reload_w, b.reload_h)) return UI_RELOAD;
+	uint32_t ux, uy, uw, uh;
+	if (ui_layout_urlbar_rect(fb, &ux, &uy, &uw, &uh)) {
+		if (ui_hit_rect(x, y, ux, uy, uw, uh)) return UI_FOCUS_URLBAR;
+	}
 	return UI_NONE;
 }

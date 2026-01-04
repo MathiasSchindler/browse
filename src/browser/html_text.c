@@ -1711,14 +1711,17 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 				}
 
 				/* If the caller can provide image dimensions (e.g. from an async sniff
-				 * cache), prefer that for placeholder sizing.
+				 * cache), use them only when HTML didn't provide width/height.
+				 * MediaWiki often serves thumbnails whose real pixel size (e.g. 40px)
+				 * differs from the rendered width/height (e.g. 30px). For layout we
+				 * must respect the author-provided display size.
 				 */
-				if (img_dim_lookup && src_tmp[0] != 0) {
+				if (img_dim_lookup && src_tmp[0] != 0 && (img_w == 0 || img_h == 0)) {
 					uint32_t dw = 0;
 					uint32_t dh = 0;
 					if (img_dim_lookup(img_dim_lookup_ctx, src_tmp, &dw, &dh) == 0) {
-						if (dw != 0) img_w = dw;
-						if (dh != 0) img_h = dh;
+						if (img_w == 0 && dw != 0) img_w = dw;
+						if (img_h == 0 && dh != 0) img_h = dh;
 					}
 				}
 

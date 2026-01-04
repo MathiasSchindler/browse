@@ -20,6 +20,50 @@ static int expect_eq(const char *name, const char *html, const char *expect)
 	return 0;
 }
 
+static int expect_eq_ex(const char *name,
+			 const char *html,
+			 const char *expect,
+			 html_img_dim_lookup_fn dim_lookup,
+			 void *dim_ctx)
+{
+	char out[512];
+	struct html_links links;
+	struct html_spans spans;
+	struct html_inline_imgs imgs;
+	memset(out, 0, sizeof(out));
+	memset(&links, 0, sizeof(links));
+	memset(&spans, 0, sizeof(spans));
+	memset(&imgs, 0, sizeof(imgs));
+	if (html_visible_text_extract_links_spans_and_inline_imgs_ex((const uint8_t *)html,
+								strlen(html),
+								out,
+								sizeof(out),
+								&links,
+								&spans,
+								&imgs,
+								dim_lookup,
+								dim_ctx) != 0) {
+		printf("visible-text %s: FAIL (extract_ex)\n", name);
+		return 1;
+	}
+	if (strcmp(out, expect) != 0) {
+		printf("visible-text %s: FAIL\n", name);
+		printf("  got:    '%s'\n", out);
+		printf("  expect: '%s'\n", expect);
+		return 1;
+	}
+	return 0;
+}
+
+static int dim_lookup_always_40x36(void *ctx, const char *url, uint32_t *out_w, uint32_t *out_h)
+{
+	(void)ctx;
+	(void)url;
+	if (out_w) *out_w = 40;
+	if (out_h) *out_h = 36;
+	return 0;
+}
+
 int main(void)
 {
 	if (expect_eq("basic", "<html><body>Hello <b>world</b>!</body></html>", "Hello world!")) return 1;
@@ -44,6 +88,11 @@ int main(void)
 	if (expect_eq("breadcrumb_nav_inline_li",
 	              "A<ul class='breadcrumb-nav-container'><li><img width='30' height='27' src='x.png'>Geographie</li><li><img width='30' height='27' src='y.png'>Geschichte</li></ul>Z",
 	              "A\n[img]\xA0" "Geographie [img]\xA0" "Geschichte\nZ")) return 1;
+	if (expect_eq_ex("breadcrumb_nav_inline_li_dimlookup",
+			 "A<ul class='breadcrumb-nav-container'><li><img width='30' height='27' src='x.png'>Geographie</li><li><img width='30' height='27' src='y.png'>Geschichte</li></ul>Z",
+			 "A\n[img]\xA0" "Geographie [img]\xA0" "Geschichte\nZ",
+			 dim_lookup_always_40x36,
+			 0)) return 1;
 	if (expect_eq("inline_display_none", "<html><body>foo <span style=\"display:none\">HIDE</span> bar</body></html>", "foo bar")) return 1;
 	if (expect_eq("infobox_table_2col",
 	              "<html><body>"
