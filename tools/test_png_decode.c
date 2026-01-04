@@ -115,7 +115,9 @@ static int test_2x2_gray_alpha(void)
 		return 1;
 	}
 
-	/* Decoder composites grayscale+alpha over the UI background 0xff101014. */
+	/* Decoder composites grayscale+alpha over a light checkerboard background.
+	 * For this 2x2 image, all pixels land in the same 8x8 tile.
+	 */
 	if (px[0] != 0xffffffffu) {
 		fprintf(stderr, "p0 mismatch: got 0x%08x expected 0xffffffff\n", px[0]);
 		return 1;
@@ -124,8 +126,8 @@ static int test_2x2_gray_alpha(void)
 		fprintf(stderr, "p1 mismatch: got 0x%08x expected 0xff000000\n", px[1]);
 		return 1;
 	}
-	if (px[3] != 0xff101014u) {
-		fprintf(stderr, "p3 mismatch: got 0x%08x expected 0xff101014\n", px[3]);
+	if (px[3] != 0xffd0d0d0u) {
+		fprintf(stderr, "p3 mismatch: got 0x%08x expected 0xffd0d0d0\n", px[3]);
 		return 1;
 	}
 	return 0;

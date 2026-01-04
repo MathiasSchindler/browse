@@ -15,6 +15,15 @@ static int is_png_sig(const uint8_t *d, size_t n)
 	return 1;
 }
 
+static inline uint32_t png_alpha_bg(uint32_t x, uint32_t y)
+{
+	/* Light checkerboard to make transparency visible regardless of UI theme.
+	 * 8x8 squares.
+	 */
+	uint32_t a = ((x >> 3) ^ (y >> 3)) & 1u;
+	return a ? 0xfff0f0f0u : 0xffd0d0d0u;
+}
+
 /* --- zlib/deflate (minimal, no dictionary) --- */
 struct seg_reader {
 	const uint8_t *const *segs;
@@ -592,18 +601,18 @@ int png_decode_xrgb(const uint8_t *data,
 			}
 		}
 	} else if (color_type == 4) {
-		/* Grayscale+alpha: composite over the UI background (dark) so SVG-rendered
-		 * thumbnails with transparency don't disappear.
+		/* Grayscale+alpha: composite over a light checkerboard so transparent
+		 * pixels remain visible on dark backgrounds.
 		 */
-		const uint32_t bg = 0xff101014u;
-		const uint32_t bgr = (bg >> 16) & 0xffu;
-		const uint32_t bgg = (bg >> 8) & 0xffu;
-		const uint32_t bgb = (bg >> 0) & 0xffu;
 		for (uint32_t y = 0; y < h; y++) {
 			const uint8_t *src = &rows[(size_t)y * (size_t)rowbytes];
 			for (uint32_t x = 0; x < w; x++) {
 				uint32_t g = (uint32_t)src[(size_t)x * 2u + 0u];
 				uint32_t a = (uint32_t)src[(size_t)x * 2u + 1u];
+				uint32_t bg = png_alpha_bg(x, y);
+				uint32_t bgr = (bg >> 16) & 0xffu;
+				uint32_t bgg = (bg >> 8) & 0xffu;
+				uint32_t bgb = (bg >> 0) & 0xffu;
 				uint32_t r = (bgr * (255u - a) + g * a + 127u) / 255u;
 				uint32_t gg = (bgg * (255u - a) + g * a + 127u) / 255u;
 				uint32_t b = (bgb * (255u - a) + g * a + 127u) / 255u;
@@ -623,8 +632,18 @@ int png_decode_xrgb(const uint8_t *data,
 			const uint8_t *src = &rows[(size_t)y * (size_t)rowbytes];
 			for (uint32_t x = 0; x < w; x++) {
 				const uint8_t *c = &src[(size_t)x * 4u];
-				/* ignore alpha (composite over black) */
-				out_pixels[(size_t)y * (size_t)w + (size_t)x] = 0xff000000u | ((uint32_t)c[0] << 16) | ((uint32_t)c[1] << 8) | (uint32_t)c[2];
+				uint32_t r0 = (uint32_t)c[0];
+				uint32_t g0 = (uint32_t)c[1];
+				uint32_t b0 = (uint32_t)c[2];
+				uint32_t a0 = (uint32_t)c[3];
+				uint32_t bg = png_alpha_bg(x, y);
+				uint32_t bgr = (bg >> 16) & 0xffu;
+				uint32_t bgg = (bg >> 8) & 0xffu;
+				uint32_t bgb = (bg >> 0) & 0xffu;
+				uint32_t r = (bgr * (255u - a0) + r0 * a0 + 127u) / 255u;
+				uint32_t gg = (bgg * (255u - a0) + g0 * a0 + 127u) / 255u;
+				uint32_t b = (bgb * (255u - a0) + b0 * a0 + 127u) / 255u;
+				out_pixels[(size_t)y * (size_t)w + (size_t)x] = 0xff000000u | (r << 16) | (gg << 8) | b;
 			}
 		}
 	}
