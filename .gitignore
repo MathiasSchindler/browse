@@ -8,4 +8,5 @@
 .DS_Store
 
 # core dumps
-core
+/core
+core.*
