@@ -6,6 +6,8 @@
 #include "net_dns.h"
 #include "net_tcp.h"
 #include "tls13_client.h"
+
+#include "http_parse.h"
 #include "url.h"
 
 #include "../core/text.h"
@@ -62,51 +64,85 @@ void browser_do_https_status(struct shm_fb *fb,
 
 	for (int step = 0; step < 6; step++) {
 		browser_compose_url_bar(url_bar, URL_BUF_LEN, host, path);
-		browser_draw_ui(fb, host, url_bar, "", "Resolving AAAA via Google DNS v6 ...", host, path);
+		browser_draw_ui(fb, host, url_bar, "", "Resolving (AAAA/A) via Google DNS ...", host, path);
 		fb->hdr->frame_counter++;
 
 		uint8_t ip6[16];
+		uint8_t ip4[4];
 		c_memset(ip6, 0, sizeof(ip6));
-		int dns_ok = dns_resolve_aaaa_google(host, ip6);
-		char ip_str[48];
-		if (dns_ok == 0) {
-			ip6_to_str(ip_str, ip6);
+		c_memset(ip4, 0, sizeof(ip4));
+		int dns6_ok = (dns_resolve_aaaa_google(host, ip6) == 0);
+		int dns4_ok = 0;
+		int use_v4 = 0;
+		int sock = -1;
+
+		char line1[192];
+		c_memset(line1, 0, sizeof(line1));
+		size_t o = 0;
+		if (dns6_ok) {
+			char ip_str6[48];
+			ip6_to_str(ip_str6, ip6);
+			const char *pfx = "DNS AAAA = ";
+			for (size_t i = 0; pfx[i] && o + 1 < sizeof(line1); i++) line1[o++] = pfx[i];
+			for (size_t i = 0; ip_str6[i] && o + 1 < sizeof(line1); i++) line1[o++] = ip_str6[i];
+			line1[o] = 0;
 		} else {
-			c_memcpy(ip_str, "<dns6 fail>", 12);
+			const char *pfx = "DNS AAAA failed; trying A ...";
+			for (size_t i = 0; pfx[i] && o + 1 < sizeof(line1); i++) line1[o++] = pfx[i];
+			line1[o] = 0;
 		}
 
-		char line1[128];
-		c_memset(line1, 0, sizeof(line1));
-		const char *pfx = "DNS AAAA = ";
-		size_t o = 0;
-		for (size_t i = 0; pfx[i] && o + 1 < sizeof(line1); i++) line1[o++] = pfx[i];
-		for (size_t i = 0; ip_str[i] && o + 1 < sizeof(line1); i++) line1[o++] = ip_str[i];
-		line1[o] = 0;
-
 		browser_compose_url_bar(url_bar, URL_BUF_LEN, host, path);
-		browser_draw_ui(fb, host, url_bar, "", line1, "Connecting IPv6 to :443 ...", path);
+		browser_draw_ui(fb, host, url_bar, "", line1, "Connecting ...", path);
 		fb->hdr->frame_counter++;
 
-		int sock = -1;
-		if (dns_ok == 0) {
+		if (dns6_ok) {
 			sock = tcp6_connect(ip6, 443);
+			if (sock >= 0) {
+				use_v4 = 0;
+			}
+		}
+		if (sock < 0) {
+			dns4_ok = (dns_resolve_a_google4(host, ip4) == 0);
+			if (dns4_ok) {
+				sock = tcp4_connect(ip4, 443);
+				if (sock >= 0) use_v4 = 1;
+			}
 		}
 
-		const char *line2 = (sock >= 0) ? "TCP connect OK (TLS 1.3 handshake ...)" : "TCP connect FAILED";
+		const char *line2 = (sock >= 0) ? (use_v4 ? "TCP connect OK (IPv4)" : "TCP connect OK (IPv6)") : "TCP connect FAILED";
 		browser_compose_url_bar(url_bar, URL_BUF_LEN, host, path);
-		browser_draw_ui(fb, host, url_bar, "", line1, line2, "Sending ClientHello + SNI + HTTP/1.1 GET");
+		browser_draw_ui(fb, host, url_bar, "", line1, line2, "TLS 1.3 handshake + HTTP/1.1 GET");
 		fb->hdr->frame_counter++;
 
 		if (sock < 0) {
-			browser_compose_url_bar(url_bar, URL_BUF_LEN, host, path);
-			browser_draw_ui(fb, host, url_bar, "", line1, "TLS+HTTP FAILED", "(connect)");
-			fb->hdr->frame_counter++;
-			break;
+			if (page.status_bar && page.status_bar_cap) {
+				(void)c_strlcpy_s(page.status_bar, page.status_bar_cap, "CONNECT FAILED (need IPv4 fallback or IPv6?)");
+			}
+			if (page.visible && page.visible_cap) {
+				const char *m = dns6_ok ? "IPv6 connect failed; no IPv4 A record or IPv4 connect failed." : "DNS AAAA failed and DNS A/connect failed. Missing IPv6 and/or IPv4 connectivity.";
+				(void)c_strlcpy_s(page.visible, page.visible_cap, m);
+			}
+			*page.have_page = 1;
+			browser_render_page(fb,
+					  host,
+					  url_bar,
+					  (page.status_bar ? page.status_bar : ""),
+					  page.visible,
+					  page.links,
+					  page.spans,
+					  page.inline_imgs,
+					  *page.scroll_rows);
+			return;
 		}
 
 		char status[128];
 		char location[512];
 		int status_code = -1;
+		char content_type[128];
+		char content_enc[64];
+		content_type[0] = 0;
+		content_enc[0] = 0;
 		int rc = tls13_https_get_status_location_and_body(sock,
 							 host,
 							 path,
@@ -115,6 +151,10 @@ void browser_do_https_status(struct shm_fb *fb,
 							 &status_code,
 							 location,
 							 sizeof(location),
+						 content_type,
+						 sizeof(content_type),
+						 content_enc,
+						 sizeof(content_enc),
 							 page.body,
 							 page.body_cap,
 							 page.body_len,
@@ -125,6 +165,24 @@ void browser_do_https_status(struct shm_fb *fb,
 			browser_compose_url_bar(url_bar, URL_BUF_LEN, host, path);
 			browser_draw_ui(fb, host, url_bar, "", line1, "TLS+HTTP FAILED", "(no cert validation yet; handshake bring-up)");
 			fb->hdr->frame_counter++;
+			break;
+		}
+
+		/* If the server sends compressed body we can't decode yet, don't pretend it's a blank page. */
+		if (content_enc[0] && !http_value_has_token_ci(content_enc, "identity")) {
+			if (page.status_bar && page.status_bar_cap) {
+				(void)c_strlcpy_s(page.status_bar, page.status_bar_cap, "UNSUPPORTED Content-Encoding");
+			}
+			if (page.visible && page.visible_cap) {
+				char msg[256];
+				size_t mo = 0;
+				const char *pfx = "Unsupported Content-Encoding: ";
+				for (size_t i = 0; pfx[i] && mo + 1 < sizeof(msg); i++) msg[mo++] = pfx[i];
+				for (size_t i = 0; content_enc[i] && mo + 1 < sizeof(msg); i++) msg[mo++] = content_enc[i];
+				msg[mo] = 0;
+				(void)c_strlcpy_s(page.visible, page.visible_cap, msg);
+			}
+			*page.body_len = 0;
 			break;
 		}
 
@@ -159,6 +217,30 @@ void browser_do_https_status(struct shm_fb *fb,
 				page.status_bar[so++] = status[i];
 			}
 			page.status_bar[so] = 0;
+
+			/* Add lightweight response diagnostics without making the UI noisy. */
+			if (content_type[0] && so + 3 < page.status_bar_cap) {
+				page.status_bar[so++] = ' ';
+				page.status_bar[so++] = '|';
+				page.status_bar[so++] = ' ';
+				for (size_t i = 0; content_type[i] && content_type[i] != ';' && content_type[i] != '\r' && content_type[i] != '\n' && so + 1 < page.status_bar_cap; i++) {
+					page.status_bar[so++] = content_type[i];
+				}
+				page.status_bar[so] = 0;
+			}
+			if (content_enc[0] && so + 6 < page.status_bar_cap) {
+				const char *pfx = " enc=";
+				for (size_t i = 0; pfx[i] && so + 1 < page.status_bar_cap; i++) page.status_bar[so++] = pfx[i];
+				for (size_t i = 0; content_enc[i] && content_enc[i] != ';' && content_enc[i] != '\r' && content_enc[i] != '\n' && so + 1 < page.status_bar_cap; i++) {
+					page.status_bar[so++] = content_enc[i];
+				}
+				page.status_bar[so] = 0;
+			}
+			if (so + 4 < page.status_bar_cap) {
+				const char *pfx = use_v4 ? " v4" : " v6";
+				for (size_t i = 0; pfx[i] && so + 1 < page.status_bar_cap; i++) page.status_bar[so++] = pfx[i];
+				page.status_bar[so] = 0;
+			}
 		}
 
 		int is_redirect = (status_code == 301 || status_code == 302 || status_code == 303 || status_code == 307 || status_code == 308);

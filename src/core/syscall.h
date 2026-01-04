@@ -22,6 +22,7 @@ typedef int int32_t;
 typedef long long int64_t;
 
 enum {
+	SYS_poll = 7,
 	SYS_read = 0,
 	SYS_write = 1,
 	SYS_open = 2,
@@ -34,6 +35,7 @@ enum {
 	SYS_sendto = 44,
 	SYS_recvfrom = 45,
 	SYS_setsockopt = 54,
+	SYS_getsockopt = 55,
 	SYS_getrandom = 318,
 	SYS_mmap = 9,
 	SYS_munmap = 11,
@@ -61,6 +63,16 @@ enum {
 	O_CREAT = 0100,
 	O_TRUNC = 01000,
 	O_NONBLOCK = 04000,
+};
+
+enum {
+	/* From asm-generic/ioctls.h */
+	FIONBIO = 0x5421,
+};
+
+enum {
+	/* Minimal errno values we need (Linux). */
+	EINPROGRESS = 115,
 };
 
 enum {
@@ -217,6 +229,31 @@ static inline long sys_getrandom(void *buf, size_t len, uint32_t flags)
 static inline int sys_setsockopt(int fd, int level, int optname, const void *optval, uint32_t optlen)
 {
 	return (int)sys_call5(SYS_setsockopt, (long)fd, (long)level, (long)optname, (long)optval, (long)optlen);
+}
+
+typedef ulong nfds_t;
+
+struct pollfd {
+	int fd;
+	short events;
+	short revents;
+};
+
+enum {
+	POLLIN = 0x0001,
+	POLLOUT = 0x0004,
+	POLLERR = 0x0008,
+	POLLHUP = 0x0010,
+};
+
+static inline int sys_poll(struct pollfd *fds, nfds_t nfds, int timeout_ms)
+{
+	return (int)sys_call3(SYS_poll, (long)fds, (long)nfds, (long)timeout_ms);
+}
+
+static inline int sys_getsockopt(int fd, int level, int optname, void *optval, uint32_t *optlen)
+{
+	return (int)sys_call5(SYS_getsockopt, (long)fd, (long)level, (long)optname, (long)optval, (long)optlen);
 }
 
 static inline int sys_ftruncate(int fd, off_t length)

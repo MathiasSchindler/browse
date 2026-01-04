@@ -49,6 +49,12 @@ struct http_resp_feed_ctx {
 	char *location_out;
 	size_t location_out_len;
 
+	char *content_type_out;
+	size_t content_type_out_len;
+
+	char *content_encoding_out;
+	size_t content_encoding_out_len;
+
 	uint8_t *body;
 	size_t body_cap;
 
@@ -169,6 +175,18 @@ static int http_resp_feed(struct http_resp_feed_ctx *ctx, const uint8_t *in, siz
 						char tmp[512];
 						if (http_header_extract_value(ctx->line, "Location", tmp, sizeof(tmp)) == 0) {
 							(void)c_strlcpy_s(ctx->location_out, ctx->location_out_len, tmp);
+						}
+					}
+					if (ctx->content_type_out && ctx->content_type_out_len && ctx->content_type_out[0] == 0) {
+						char tmp[256];
+						if (http_header_extract_value(ctx->line, "Content-Type", tmp, sizeof(tmp)) == 0) {
+							(void)c_strlcpy_s(ctx->content_type_out, ctx->content_type_out_len, tmp);
+						}
+					}
+					if (ctx->content_encoding_out && ctx->content_encoding_out_len && ctx->content_encoding_out[0] == 0) {
+						char tmp[256];
+						if (http_header_extract_value(ctx->line, "Content-Encoding", tmp, sizeof(tmp)) == 0) {
+							(void)c_strlcpy_s(ctx->content_encoding_out, ctx->content_encoding_out_len, tmp);
 						}
 					}
 				}
@@ -493,6 +511,10 @@ int tls13_https_conn_get_status_location_and_body(struct tls13_https_conn *c,
 						int *status_code_out,
 						char *location_out,
 						size_t location_out_len,
+						char *content_type_out,
+						size_t content_type_out_len,
+						char *content_encoding_out,
+						size_t content_encoding_out_len,
 						uint8_t *body,
 						size_t body_cap,
 						size_t *body_len_out,
@@ -504,6 +526,8 @@ int tls13_https_conn_get_status_location_and_body(struct tls13_https_conn *c,
 	status_line[0] = 0;
 	if (status_code_out) *status_code_out = -1;
 	if (location_out && location_out_len) location_out[0] = 0;
+	if (content_type_out && content_type_out_len) content_type_out[0] = 0;
+	if (content_encoding_out && content_encoding_out_len) content_encoding_out[0] = 0;
 	if (body_len_out) *body_len_out = 0;
 	if (content_length_out) *content_length_out = 0;
 	if (out_peer_wants_close) *out_peer_wants_close = 0;
@@ -525,6 +549,10 @@ int tls13_https_conn_get_status_location_and_body(struct tls13_https_conn *c,
 	feed.status_code_out = status_code_out;
 	feed.location_out = location_out;
 	feed.location_out_len = location_out_len;
+	feed.content_type_out = content_type_out;
+	feed.content_type_out_len = content_type_out_len;
+	feed.content_encoding_out = content_encoding_out;
+	feed.content_encoding_out_len = content_encoding_out_len;
 	feed.body = body;
 	feed.body_cap = body_cap;
 	feed.line = line;
@@ -1036,6 +1064,10 @@ int tls13_https_get_status_and_location(int sock,
 					 status_code_out,
 					 location_out,
 					 location_out_len,
+				 0,
+				 0,
+				 0,
+				 0,
 					 0,
 					 0,
 					 0,
@@ -1076,6 +1108,10 @@ int tls13_https_get_status_location_and_body(int sock,
 					int *status_code_out,
 					char *location_out,
 					size_t location_out_len,
+					char *content_type_out,
+					size_t content_type_out_len,
+					char *content_encoding_out,
+					size_t content_encoding_out_len,
 					uint8_t *body,
 					size_t body_cap,
 					size_t *body_len_out,
@@ -1085,6 +1121,8 @@ int tls13_https_get_status_location_and_body(int sock,
 	status_line[0] = 0;
 	if (status_code_out) *status_code_out = -1;
 	if (location_out && location_out_len) location_out[0] = 0;
+	if (content_type_out && content_type_out_len) content_type_out[0] = 0;
+	if (content_encoding_out && content_encoding_out_len) content_encoding_out[0] = 0;
 	if (body_len_out) *body_len_out = 0;
 	if (content_length_out) *content_length_out = 0;
 
@@ -1346,6 +1384,18 @@ int tls13_https_get_status_location_and_body(int sock,
 							char tmp[512];
 							if (http_header_extract_value(line, "Location", tmp, sizeof(tmp)) == 0) {
 								(void)c_strlcpy_s(location_out, location_out_len, tmp);
+							}
+						}
+						if (content_type_out && content_type_out_len && content_type_out[0] == 0) {
+							char tmp[256];
+							if (http_header_extract_value(line, "Content-Type", tmp, sizeof(tmp)) == 0) {
+								(void)c_strlcpy_s(content_type_out, content_type_out_len, tmp);
+							}
+						}
+						if (content_encoding_out && content_encoding_out_len && content_encoding_out[0] == 0) {
+							char tmp[256];
+							if (http_header_extract_value(line, "Content-Encoding", tmp, sizeof(tmp)) == 0) {
+								(void)c_strlcpy_s(content_encoding_out, content_encoding_out_len, tmp);
 							}
 						}
 					}

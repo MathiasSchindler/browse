@@ -24,6 +24,17 @@ static inline uint32_t png_alpha_bg(uint32_t x, uint32_t y)
 	return a ? 0xfff0f0f0u : 0xffd0d0d0u;
 }
 
+static inline uint8_t png_idx_packed(const uint8_t *row, uint32_t x, uint8_t bit_depth)
+{
+	/* Palette/grayscale packed samples are stored MSB-first within each byte. */
+	uint32_t bitpos = x * (uint32_t)bit_depth;
+	uint32_t byte_i = bitpos >> 3;
+	uint32_t in_byte = bitpos & 7u;
+	uint32_t shift = 8u - (uint32_t)bit_depth - in_byte;
+	uint8_t mask = (uint8_t)((1u << bit_depth) - 1u);
+	return (uint8_t)((row[byte_i] >> shift) & mask);
+}
+
 /* --- zlib/deflate (minimal, no dictionary) --- */
 struct seg_reader {
 	const uint8_t *const *segs;
@@ -512,6 +523,8 @@ int png_decode_xrgb(const uint8_t *data,
 	uint8_t bit_depth=0, color_type=0, interlace=0;
 	const uint8_t *plte = 0;
 	size_t plte_len = 0;
+	const uint8_t *trns = 0;
+	size_t trns_len = 0;
 
 	const uint8_t *idat_segs[64];
 	size_t idat_lens[64];
@@ -535,6 +548,10 @@ int png_decode_xrgb(const uint8_t *data,
 		} else if (ctyp == 0x504c5445u) { /* PLTE */
 			plte = cdata;
 			plte_len = clen;
+		} else if (ctyp == 0x74524e53u) { /* tRNS */
+			/* Transparency info: for palette, this is alpha values for palette entries. */
+			trns = cdata;
+			trns_len = clen;
 		} else if (ctyp == 0x49444154u) { /* IDAT */
 			if (idat_n >= 64) return -1;
 			idat_segs[idat_n] = cdata;
@@ -547,15 +564,22 @@ int png_decode_xrgb(const uint8_t *data,
 	}
 
 	if (!seen_ihdr || w == 0 || h == 0) return -1;
-	if (bit_depth != 8) return -1;
-	if (interlace != 0) return -1;
+	if (interlace != 0) return -2;
 	if (!(color_type==0 || color_type==2 || color_type==3 || color_type==4 || color_type==6)) return -1;
+	if (color_type == 3) {
+		/* Palette: allow packed samples (1/2/4/8 bpc). */
+		if (!(bit_depth == 1 || bit_depth == 2 || bit_depth == 4 || bit_depth == 8)) return -2;
+	} else {
+		/* Other color types: keep it simple for now (8bpc only). */
+		if (bit_depth != 8) return -2;
+	}
 	if ((uint64_t)w * (uint64_t)h > (uint64_t)out_cap_pixels) return -1;
 	if (idat_n == 0) return -1;
 
 	uint32_t channels = (color_type==0) ? 1u : (color_type==2) ? 3u : (color_type==3) ? 1u : (color_type==4) ? 2u : 4u;
-	uint32_t bpp = channels; /* bytes per pixel for filter */
-	uint32_t rowbytes = w * channels;
+	uint32_t bits_per_px = channels * (uint32_t)bit_depth;
+	uint32_t bpp = (bits_per_px + 7u) / 8u; /* bytes per pixel for filter */
+	uint32_t rowbytes = (uint32_t)(((uint64_t)w * (uint64_t)bits_per_px + 7u) / 8u);
 	uint64_t need = (uint64_t)h * (uint64_t)(1u + rowbytes);
 	if (need > (uint64_t)scratch_cap) return -1;
 
@@ -583,11 +607,28 @@ int png_decode_xrgb(const uint8_t *data,
 		for (uint32_t y = 0; y < h; y++) {
 			const uint8_t *src = &rows[(size_t)y * (size_t)rowbytes];
 			for (uint32_t x = 0; x < w; x++) {
-				uint8_t idx = src[x];
+				uint8_t idx = 0;
+				if (bit_depth == 8) idx = src[x];
+				else idx = png_idx_packed(src, x, bit_depth);
+
 				uint32_t rgb = 0xff000000u;
+				uint32_t a = 255u;
+				if (trns && idx < trns_len) a = (uint32_t)trns[idx];
 				if (idx < palsz) {
 					const uint8_t *c = &plte[(size_t)idx * 3u];
-					rgb |= ((uint32_t)c[0] << 16) | ((uint32_t)c[1] << 8) | (uint32_t)c[2];
+					uint32_t r = (uint32_t)c[0];
+					uint32_t g = (uint32_t)c[1];
+					uint32_t b = (uint32_t)c[2];
+					if (a < 255u) {
+						uint32_t bg = png_alpha_bg(x, y);
+						uint32_t bgr = (bg >> 16) & 0xffu;
+						uint32_t bgg = (bg >> 8) & 0xffu;
+						uint32_t bgb = (bg >> 0) & 0xffu;
+						r = (bgr * (255u - a) + r * a + 127u) / 255u;
+						g = (bgg * (255u - a) + g * a + 127u) / 255u;
+						b = (bgb * (255u - a) + b * a + 127u) / 255u;
+					}
+					rgb |= (r << 16) | (g << 8) | b;
 				}
 				out_pixels[(size_t)y * (size_t)w + (size_t)x] = rgb;
 			}

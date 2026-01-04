@@ -38,6 +38,14 @@ int jpeg_get_dimensions(const uint8_t *data, size_t len, uint32_t *out_w, uint32
 			continue;
 		}
 
+		/* After SOS, the remaining stream is entropy-coded data until EOI.
+		 * Dimensions are only present in SOF markers which must appear before SOS.
+		 * Continuing to scan risks false positives inside compressed data.
+		 */
+		if (marker == 0xDA) {
+			break;
+		}
+
 		/* Standalone markers without length. */
 		if (marker == 0xD8 || marker == 0xD9) {
 			/* SOI / EOI */

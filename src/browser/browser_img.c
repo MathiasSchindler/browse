@@ -116,7 +116,10 @@ static uint8_t g_img_fetch_buf[1024 * 1024];
 /* Extremely small pixel pool for the first real decoders.
  * Bump-allocated; blocks can be freed best-effort.
  */
-static uint32_t g_img_pixel_pool[1024 * 1024]; /* 1M px = 4 MiB */
+/* Pixel pool is the main limiter for “image-heavy” pages (Wikipedia).
+ * Keep it modest but large enough to avoid constant evictions/fragmentation.
+ */
+static uint32_t g_img_pixel_pool[2 * 1024 * 1024]; /* 2M px = 8 MiB */
 static uint32_t g_img_pixel_pool_used;
 
 struct img_pix_free_block {
@@ -185,6 +188,47 @@ static void img_pixel_free(uint32_t off, uint32_t n_pixels)
 	g_img_pix_free_n = w;
 
 	img_pixel_try_shrink_tail();
+}
+
+static int img_cache_evict_one_min_len(uint32_t min_pix_len)
+{
+	uint32_t best_i = 0xffffffffu;
+	uint32_t best_use = 0xffffffffu;
+	for (uint32_t i = 0; i < (uint32_t)(sizeof(g_img_sniff_cache) / sizeof(g_img_sniff_cache[0])); i++) {
+		struct img_sniff_cache_entry *e = &g_img_sniff_cache[i];
+		if (!e->used) continue;
+		if (e->state != 2) continue;
+		if (e->inflight) continue;
+		if (!e->has_pixels || e->pix_len == 0) continue;
+		if (e->pix_len < min_pix_len) continue;
+		if (e->last_use < best_use) {
+			best_use = e->last_use;
+			best_i = i;
+		}
+	}
+	if (best_i == 0xffffffffu) return -1;
+	struct img_sniff_cache_entry *e = &g_img_sniff_cache[best_i];
+	img_pixel_free(e->pix_off, e->pix_len);
+	e->used = 0;
+	e->state = 0;
+	e->inflight = 0;
+	e->want_pixels = 0;
+	e->gen = 0;
+	e->fetch_failures = 0;
+	e->pix_failures = 0;
+	e->fmt = IMG_FMT_UNKNOWN;
+	e->has_dims = 0;
+	e->w = 0;
+	e->h = 0;
+	e->has_pixels = 0;
+	e->pix_off = 0;
+	e->pix_w = 0;
+	e->pix_h = 0;
+	e->pix_len = 0;
+	e->hash = 0;
+	e->last_use = 0;
+	e->key[0] = 0;
+	return 0;
 }
 
 static int img_pixel_alloc(uint32_t n_pixels, uint32_t *out_off)
@@ -461,6 +505,10 @@ static int https_get_prefix_follow_redirects(const char *host_in, const char *pa
 						 &status_code,
 						 location,
 						 sizeof(location),
+						 0,
+						 0,
+						 0,
+						 0,
 						 out,
 						 out_cap,
 						 &body_len,
@@ -497,12 +545,23 @@ static int https_conn_open_host(struct tls13_https_conn *c, const char *host)
 	if (!c || !host || !host[0]) return -1;
 	tls13_https_conn_close(c);
 
-	uint8_t ip6[16];
-	c_memset(ip6, 0, sizeof(ip6));
-	if (dns_resolve_aaaa_google(host, ip6) != 0) return -1;
+	int sock = -1;
 
-	int sock = tcp6_connect(ip6, 443);
-	if (sock < 0) return -1;
+	/* Prefer IPv6, but fall back to IPv4 (many networks are IPv4-only). */
+	{
+		uint8_t ip6[16];
+		c_memset(ip6, 0, sizeof(ip6));
+		if (dns_resolve_aaaa_google(host, ip6) == 0) {
+			sock = tcp6_connect(ip6, 443);
+		}
+	}
+	if (sock < 0) {
+		uint8_t ip4[4];
+		c_memset(ip4, 0, sizeof(ip4));
+		if (dns_resolve_a_google4(host, ip4) != 0) return -1;
+		sock = tcp4_connect(ip4, 443);
+		if (sock < 0) return -1;
+	}
 
 	if (tls13_https_conn_open(c, sock, host) != 0) {
 		sys_close(sock);
@@ -554,12 +613,16 @@ static int https_get_prefix_follow_redirects_keepalive(struct tls13_https_conn *
 									 &status_code,
 									 location,
 									 sizeof(location),
-									 out,
-									 out_cap,
-									 &body_len,
-									 0,
-									 1,
-									 &peer_close);
+								 0,
+								 0,
+								 0,
+								 0,
+								 out,
+								 out_cap,
+								 &body_len,
+								 0,
+								 1,
+								 &peer_close);
 			if (rc == 0) break;
 			/* Retry once with a fresh connection. */
 			tls13_https_conn_close(c);
@@ -815,6 +878,10 @@ static void img_worker_loop(uint32_t wi)
 				uint8_t fetch_buf[512 * 1024];
 				size_t got_full = 0;
 				if (https_get_prefix_follow_redirects_keepalive(&conn, host, path, fetch_buf, sizeof(fetch_buf), &got_full) == 0 && got_full > 0) {
+					/* Defensive: ensure any partially-written decode can't leak old pixels (e.g. from a previous PNG
+					 * with a checkerboard transparency background).
+					 */
+					for (uint32_t i = 0; i < (uint32_t)IMG_WORKER_MAX_PX; i++) w->pixels[i] = 0xff000000u;
 					uint32_t dw = 0, dh = 0;
 					int dec_ok = -1;
 					if ((enum img_fmt)w->fmt == IMG_FMT_JPG) {
@@ -957,8 +1024,13 @@ int img_workers_pump(int *out_any_dims_changed, int *out_any_pixels_changed)
 
 				uint32_t off = 0;
 				int alloc_ok = img_pixel_alloc(w->pix_len, &off);
-				for (int tries = 0; alloc_ok != 0 && tries < 8; tries++) {
-					if (img_cache_evict_one() != 0) break;
+				for (int tries = 0; alloc_ok != 0 && tries < 32; tries++) {
+					/* First try to evict something that can satisfy this allocation.
+					 * This avoids evicting many tiny entries and still failing due to fragmentation.
+					 */
+					if (img_cache_evict_one_min_len(w->pix_len) != 0) {
+						if (img_cache_evict_one() != 0) break;
+					}
 					alloc_ok = img_pixel_alloc(w->pix_len, &off);
 				}
 				if (alloc_ok == 0) {
@@ -989,7 +1061,7 @@ int img_workers_pump(int *out_any_dims_changed, int *out_any_pixels_changed)
 				}
 				/* Unsupported formats: don't keep burning worker cycles. */
 				if (e->fmt == IMG_FMT_WEBP || e->fmt == IMG_FMT_SVG) {
-					img__log_key(LOG_LVL_INFO, "unsupported format (skipping)", e->key);
+					img__log_key(LOG_LVL_WARN, "unsupported format (skipping)", e->key);
 					e->want_pixels = 0;
 				}
 			}
@@ -1082,8 +1154,10 @@ int img_decode_large_pump_one(void)
 		if (img_pixel_alloc(px, &off) != 0) {
 			/* Try to free some space by evicting old decoded entries, similar to worker path. */
 			int alloc_ok = -1;
-			for (int tries = 0; tries < 8; tries++) {
-				if (img_cache_evict_one() != 0) break;
+			for (int tries = 0; tries < 64; tries++) {
+				if (img_cache_evict_one_min_len(px) != 0) {
+					if (img_cache_evict_one() != 0) break;
+				}
 				if (img_pixel_alloc(px, &off) == 0) { alloc_ok = 0; break; }
 			}
 			if (alloc_ok != 0) {
@@ -1126,7 +1200,9 @@ int img_decode_large_pump_one(void)
 			return 1;
 		} else {
 			g_img_pixel_pool_used = old_used;
-			img__log_key(LOG_LVL_WARN, "decode failed", e->key);
+			if (e->fmt == IMG_FMT_JPG && ok == -2) img__log_key(LOG_LVL_WARN, "unsupported jpeg (non-baseline/progressive)", e->key);
+			else if (e->fmt == IMG_FMT_PNG && ok == -2) img__log_key(LOG_LVL_WARN, "unsupported png (bit depth / interlace)", e->key);
+			else img__log_key(LOG_LVL_WARN, "decode failed", e->key);
 			e->want_pixels = 0;
 		}
 		return 0;

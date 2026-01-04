@@ -435,8 +435,9 @@ static int img_url_ext_rank(const char *url)
 	if (ieq_lit_n((const uint8_t *)ext, n, "jpg")) return 30;
 	if (ieq_lit_n((const uint8_t *)ext, n, "jpeg")) return 30;
 	if (ieq_lit_n((const uint8_t *)ext, n, "gif")) return 20;
-	if (ieq_lit_n((const uint8_t *)ext, n, "webp")) return 10;
-	if (ieq_lit_n((const uint8_t *)ext, n, "svg")) return 1;
+	/* We currently don't decode WEBP/SVG; prefer formats we can render. */
+	if (ieq_lit_n((const uint8_t *)ext, n, "webp")) return 0;
+	if (ieq_lit_n((const uint8_t *)ext, n, "svg")) return 0;
 	return 0;
 }
 

@@ -144,6 +144,28 @@ static void url_edit_backspace(void)
 	g_url_edit_cursor = cursor - 1u;
 }
 
+static void redraw_now(struct shm_fb *fb,
+		       const char *active_host,
+		       const char *status_bar,
+		       const char *visible,
+		       const struct html_links *links,
+		       const struct html_spans *spans,
+		       const struct html_inline_imgs *inline_imgs,
+		       uint32_t scroll_rows,
+		       int have_page)
+{
+	if (!fb) return;
+	char url_tmp[URL_BUF_LEN + 2u];
+	const char *disp_url = url_bar_display(url_tmp, sizeof(url_tmp));
+	const char *disp_status = g_url_edit_active ? "" : (status_bar ? status_bar : "");
+	if (have_page && visible && links && spans && inline_imgs) {
+		browser_render_page(fb, active_host, disp_url, disp_status, visible, links, spans, inline_imgs, scroll_rows);
+	} else {
+		browser_draw_ui(fb, active_host, disp_url, disp_status, "", "", "");
+		fb->hdr->frame_counter++;
+	}
+}
+
 static struct browser_page make_page(void)
 {
 	struct browser_page page;
@@ -293,6 +315,7 @@ int main(void)
 					if (g_url_edit_active && a != UI_FOCUS_URLBAR) {
 						/* Click outside the URL bar cancels editing. */
 						url_edit_cancel();
+						redraw_now(&fb, g_active_host, g_status_bar, g_visible, &g_links, &g_spans, &g_inline_imgs, g_scroll_rows, g_have_page);
 					}
 					if (a == UI_GO_EN) {
 						(void)c_strlcpy_s(host, sizeof(host), "en.wikipedia.org");
@@ -318,6 +341,7 @@ int main(void)
 						browser_do_https_status(&fb, host, path, url_bar, page);
 					} else if (a == UI_FOCUS_URLBAR) {
 						url_edit_begin();
+						redraw_now(&fb, g_active_host, g_status_bar, g_visible, &g_links, &g_spans, &g_inline_imgs, g_scroll_rows, g_have_page);
 					} else {
 						/* Body link click */
 						char href[HTML_HREF_MAX];

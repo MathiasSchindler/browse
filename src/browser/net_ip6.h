@@ -8,6 +8,8 @@ enum {
 	AF_INET6 = 10,
 };
 
+#ifndef NET_SOCK_COMMON_CONSTANTS
+#define NET_SOCK_COMMON_CONSTANTS
 enum {
 	SOCK_STREAM = 1,
 	SOCK_DGRAM = 2,
@@ -17,11 +19,13 @@ enum {
 	IPPROTO_TCP = 6,
 	IPPROTO_UDP = 17,
 };
+#endif
 
 typedef uint32_t socklen_t;
 
 enum {
 	SOL_SOCKET = 1,
+	SO_ERROR = 4,
 	SO_RCVTIMEO = 20,
 	SO_SNDTIMEO = 21,
 };

@@ -127,6 +127,16 @@ static int is_jpeg_sig(const uint8_t *d, size_t n)
 	return (d && n >= 2 && d[0] == 0xff && d[1] == 0xd8);
 }
 
+static int is_sof_marker(uint8_t m)
+{
+	/* SOF0..SOF3, SOF5..SOF7, SOF9..SOF11, SOF13..SOF15 */
+	if (m >= 0xC0 && m <= 0xC3) return 1;
+	if (m >= 0xC5 && m <= 0xC7) return 1;
+	if (m >= 0xC9 && m <= 0xCB) return 1;
+	if (m >= 0xCD && m <= 0xCF) return 1;
+	return 0;
+}
+
 struct br {
 	const uint8_t *p;
 	const uint8_t *end;
@@ -662,6 +672,11 @@ int jpeg_decode_baseline_xrgb(const uint8_t *data,
 				break;
 			}
 			default:
+				/* Only baseline JPEG (SOF0) is supported. If this JPEG uses a
+				 * different SOF marker (e.g. progressive SOF2), return a distinct
+				 * error so callers can log it as “unsupported”.
+				 */
+				if (is_sof_marker(marker) && marker != 0xC0) return -2;
 				break;
 		}
 		p += seglen;
