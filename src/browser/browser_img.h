@@ -11,6 +11,7 @@ enum img_fmt {
 	IMG_FMT_GIF,
 	IMG_FMT_WEBP,
 	IMG_FMT_SVG,
+	IMG_FMT_AVIF,
 };
 
 struct img_sniff_cache_entry {

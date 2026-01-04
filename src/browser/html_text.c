@@ -25,6 +25,15 @@ static int is_digit(uint8_t c)
 	return (c >= '0' && c <= '9');
 }
 
+static int starts_with_lit(const char *s, const char *lit)
+{
+	if (!s || !lit) return 0;
+	for (size_t i = 0; lit[i] != 0; i++) {
+		if (s[i] != lit[i]) return 0;
+	}
+	return 1;
+}
+
 static int is_tag_name_char(uint8_t c)
 {
 	return is_alpha(c) || is_digit(c);
@@ -1693,9 +1702,14 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 							}
 							while (o2 > 0 && alt_tmp[o2 - 1] == ' ') o2--;
 							alt_tmp[o2] = 0;
-						} else if ((ieq_attr(html + an, alen, "src") || ieq_attr(html + an, alen, "data-src")) && src_tmp[0] == 0) {
+						} else if (ieq_attr(html + an, alen, "src") && src_tmp[0] == 0) {
 							img_copy_src_value(html + vs, vlen, src_tmp, sizeof(src_tmp));
-						} else if (ieq_attr(html + an, alen, "srcset") && src_tmp[0] == 0) {
+						} else if (ieq_attr(html + an, alen, "data-src") && (src_tmp[0] == 0 || starts_with_lit(src_tmp, "data:"))) {
+							/* Prefer lazy-load data-src over a data: placeholder src. */
+							img_copy_src_value(html + vs, vlen, src_tmp, sizeof(src_tmp));
+						} else if ((ieq_attr(html + an, alen, "srcset") || ieq_attr(html + an, alen, "data-srcset")) &&
+							   (src_tmp[0] == 0 || starts_with_lit(src_tmp, "data:"))) {
+							/* Prefer (data-)srcset over a data: placeholder src. */
 							char picked[512];
 							picked[0] = 0;
 							img_pick_from_srcset(html + vs, vlen, picked, sizeof(picked));
@@ -1791,6 +1805,44 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 						tail[0] = 0;
 						img_pick_src_tail(src_tmp, tail, sizeof(tail));
 						cpy_str_trunc(label, sizeof(label), tail);
+					}
+
+					/* Diagnostics for big hero placeholders (common on news sites).
+					 * Keep this at DEBUG to avoid spamming normal runs.
+					 */
+					static uint32_t g_img_placeholder_warn_budget = 8;
+					if (LOG_LEVEL >= 3 && g_img_placeholder_warn_budget && rows_total >= 8u && src_tmp[0] != 0) {
+						g_img_placeholder_warn_budget--;
+						char msg[768];
+						size_t mo = 0;
+						const char *pfx = "html img placeholder rows=";
+						for (size_t ii = 0; pfx[ii] && mo + 1 < sizeof(msg); ii++) msg[mo++] = pfx[ii];
+						char rows_dec2[11];
+						u32_to_dec_local(rows_dec2, rows_total);
+						for (size_t ii = 0; rows_dec2[ii] && mo + 1 < sizeof(msg); ii++) msg[mo++] = rows_dec2[ii];
+						if (mo + 1 < sizeof(msg)) msg[mo++] = ' ';
+						if (img_w && img_h) {
+							if (mo + 3 < sizeof(msg)) { msg[mo++] = ' '; msg[mo++] = '('; }
+							char wdec2[11];
+							char hdec2[11];
+							u32_to_dec_local(wdec2, img_w);
+							u32_to_dec_local(hdec2, img_h);
+							for (size_t ii = 0; wdec2[ii] && mo + 1 < sizeof(msg); ii++) msg[mo++] = wdec2[ii];
+							if (mo + 1 < sizeof(msg)) msg[mo++] = 'x';
+							for (size_t ii = 0; hdec2[ii] && mo + 1 < sizeof(msg); ii++) msg[mo++] = hdec2[ii];
+							if (mo + 2 < sizeof(msg)) { msg[mo++] = ')'; msg[mo++] = ' '; }
+						}
+						if (label[0] != 0) {
+							const char *lp = "label=";
+							for (size_t ii = 0; lp[ii] && mo + 1 < sizeof(msg); ii++) msg[mo++] = lp[ii];
+							for (size_t ii = 0; label[ii] && mo + 1 < sizeof(msg); ii++) msg[mo++] = label[ii];
+							if (mo + 1 < sizeof(msg)) msg[mo++] = ' ';
+						}
+						const char *up = "url=";
+						for (size_t ii = 0; up[ii] && mo + 1 < sizeof(msg); ii++) msg[mo++] = up[ii];
+						for (size_t ii = 0; src_tmp[ii] && mo + 1 < sizeof(msg); ii++) msg[mo++] = src_tmp[ii];
+						msg[mo] = 0;
+						LOGD("img", msg);
 					}
 
 					append_newline_collapse(out, out_len, &o, &last_was_space);

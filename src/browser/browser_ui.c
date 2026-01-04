@@ -5,6 +5,18 @@
 #include "url.h"
 
 #include "../core/text.h"
+#include "../core/log.h"
+
+static uint32_t ui_hash32_fnv1a(const char *s)
+{
+	uint32_t h = 2166136261u;
+	if (!s) return h;
+	for (size_t i = 0; s[i] != 0; i++) {
+		h ^= (uint8_t)s[i];
+		h *= 16777619u;
+	}
+	return h;
+}
 
 struct run_style {
 	uint8_t has_fg;
@@ -683,6 +695,9 @@ static void draw_body_wrapped(struct shm_fb *fb,
 		 * Format is sniffed from the first bytes of the URL.
 		 */
 		if (line[0] == (char)0x1e && line[1] == 'I' && line[2] == 'M' && line[3] == 'G' && line[4] == ' ') {
+			static uint32_t last_big_img_hash = 0;
+			static uint32_t big_img_logs_left = 6;
+
 			/* Parse rows */
 			uint32_t rows = 0;
 			size_t p = 5;
@@ -718,6 +733,41 @@ static void draw_body_wrapped(struct shm_fb *fb,
 			enum img_fmt sniffed = img_cache_get_or_mark_pending(active_host, url ? url : "");
 			struct img_sniff_cache_entry *entry = img_cache_find_done(active_host, url ? url : "");
 			const char *fmt = img_fmt_token(sniffed);
+
+			/* Console diagnostics for the common “big hero image placeholder” case.
+			 * This helps identify unsupported formats (AVIF/WEBP/SVG) or size limits.
+			 */
+			if (big_img_logs_left && url && url[0] && rows >= 18u) {
+				uint32_t h = ui_hash32_fnv1a(url);
+				if (h != last_big_img_hash) {
+					last_big_img_hash = h;
+					big_img_logs_left--;
+					char msg[768];
+					size_t o = 0;
+					/* Message prefix */
+					const char *pfx = "large placeholder";
+					for (size_t i = 0; pfx[i] && o + 1 < sizeof(msg); i++) msg[o++] = pfx[i];
+					if (o + 2 < sizeof(msg)) { msg[o++] = ':'; msg[o++] = ' '; }
+					/* fmt */
+					const char *f = fmt ? fmt : "?";
+					for (size_t i = 0; f[i] && o + 1 < sizeof(msg); i++) msg[o++] = f[i];
+					if (entry && entry->has_dims) {
+						char wdec[11];
+						char hdec[11];
+						u32_to_dec(wdec, (uint32_t)entry->w);
+						u32_to_dec(hdec, (uint32_t)entry->h);
+						if (o + 3 < sizeof(msg)) { msg[o++] = ' '; msg[o++] = '('; }
+						for (size_t i = 0; wdec[i] && o + 1 < sizeof(msg); i++) msg[o++] = wdec[i];
+						if (o + 1 < sizeof(msg)) msg[o++] = 'x';
+						for (size_t i = 0; hdec[i] && o + 1 < sizeof(msg); i++) msg[o++] = hdec[i];
+						if (o + 2 < sizeof(msg)) { msg[o++] = ')'; msg[o++] = ' '; }
+					}
+					/* url */
+					for (size_t i = 0; url[i] && o + 1 < sizeof(msg); i++) msg[o++] = url[i];
+					msg[o] = 0;
+					LOGW("img", msg);
+				}
+			}
 			if (rows < 2u) rows = 2u;
 			if (rows > 200u) rows = 200u;
 			if (is_float && fcols > 0) {

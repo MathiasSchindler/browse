@@ -4,6 +4,8 @@
 #include "net_tcp.h"
 #include "url.h"
 
+#include "http_parse.h"
+
 #include "tls13_client.h"
 
 #include "image/jpeg.h"
@@ -44,6 +46,101 @@ static inline void img__msg_append_u32_dec(char *buf, size_t cap, size_t *o, uin
 	}
 }
 
+static inline void img__sanitize_one_line(char *dst, size_t dst_cap, const char *src)
+{
+	if (!dst || dst_cap == 0) return;
+	dst[0] = 0;
+	if (!src) return;
+	size_t o = 0;
+	for (size_t i = 0; src[i] != 0 && o + 1 < dst_cap; i++) {
+		unsigned char c = (unsigned char)src[i];
+		if (c == '\n' || c == '\r' || c == '\t') {
+			dst[o++] = ' ';
+			continue;
+		}
+		/* Keep terminal output single-line and readable. */
+		if (c < 32 || c > 126) {
+			dst[o++] = '?';
+			continue;
+		}
+		dst[o++] = (char)c;
+	}
+	dst[o] = 0;
+}
+
+static inline int img__rewrite_query_u32_cap(char *out, size_t out_cap, const char *path_in, const char *param, uint32_t cap)
+{
+	/* Rewrites e.g. "?width=1280" or "&width=1280" to cap.
+	 * Returns 1 if rewritten, 0 otherwise.
+	 */
+	if (!out || out_cap == 0) return 0;
+	out[0] = 0;
+	if (!path_in || !path_in[0] || !param || !param[0]) {
+		(void)c_strlcpy_s(out, out_cap, path_in ? path_in : "");
+		return 0;
+	}
+
+	/* Default: copy as-is. */
+	(void)c_strlcpy_s(out, out_cap, path_in);
+
+	/* Find param start. */
+	for (size_t i = 0; path_in[i] != 0; i++) {
+		char c = path_in[i];
+		if (!(c == '?' || c == '&')) continue;
+		/* Match param name immediately after ?/& */
+		size_t j = i + 1;
+		size_t k = 0;
+		while (param[k] && path_in[j + k] == param[k]) k++;
+		if (param[k] != 0) continue;
+		if (path_in[j + k] != '=') continue;
+		j = j + k + 1;
+		/* Parse digits */
+		uint32_t v = 0;
+		size_t d = 0;
+		while (path_in[j + d] >= '0' && path_in[j + d] <= '9') {
+			uint32_t nd = (uint32_t)(path_in[j + d] - '0');
+			v = v * 10u + nd;
+			d++;
+			if (d > 10) break;
+		}
+		if (d == 0) continue;
+		if (v <= cap) return 0;
+
+		/* Build rewritten path in out: copy prefix up to digits, then cap, then suffix. */
+		char cap_dec[11];
+		cap_dec[0] = 0;
+		{
+			uint32_t tmp = cap;
+			char rev[11];
+			uint32_t n = 0;
+			if (tmp == 0) {
+				rev[n++] = '0';
+			} else {
+				while (tmp > 0 && n < 10) {
+					rev[n++] = (char)('0' + (tmp % 10u));
+					tmp /= 10u;
+				}
+			}
+			/* reverse */
+			uint32_t o = 0;
+			while (n > 0 && o + 1 < sizeof(cap_dec)) cap_dec[o++] = rev[--n];
+			cap_dec[o] = 0;
+		}
+
+		/* prefix [0..j) */
+		size_t o = 0;
+		for (size_t ii = 0; ii < j && o + 1 < out_cap; ii++) out[o++] = path_in[ii];
+		/* cap */
+		for (size_t ii = 0; cap_dec[ii] && o + 1 < out_cap; ii++) out[o++] = cap_dec[ii];
+		/* suffix starting after digits */
+		for (size_t ii = j + d; path_in[ii] && o + 1 < out_cap; ii++) out[o++] = path_in[ii];
+		out[o] = 0;
+		return 1;
+	}
+
+	return 0;
+}
+
 static inline void img__format_https_from_key(char *out, size_t out_cap, const char *key)
 {
 	if (!out || out_cap == 0) return;
@@ -79,11 +176,13 @@ static inline void img__log_key(enum log_level lvl, const char *what, const char
 {
 	char url[768];
 	img__format_https_from_key(url, sizeof(url), key);
+	char one_line[768];
+	img__sanitize_one_line(one_line, sizeof(one_line), url[0] ? url : (key ? key : "(null)"));
 	char msg[768];
 	size_t o = 0;
 	img__msg_append(msg, sizeof(msg), &o, what ? what : "img");
 	img__msg_append(msg, sizeof(msg), &o, ": ");
-	img__msg_append(msg, sizeof(msg), &o, url[0] ? url : (key ? key : "(null)"));
+	img__msg_append(msg, sizeof(msg), &o, one_line);
 	if (o + 1 < sizeof(msg)) msg[o++] = '\n';
 	if (lvl == LOG_LVL_ERROR) LOGE_BUF("img", msg, o);
 	else if (lvl == LOG_LVL_WARN) LOGW_BUF("img", msg, o);
@@ -93,16 +192,49 @@ static inline void img__log_key(enum log_level lvl, const char *what, const char
 
 static inline void img__log_url(enum log_level lvl, const char *what, const char *url)
 {
+	char one_line[768];
+	img__sanitize_one_line(one_line, sizeof(one_line), url ? url : "(null)");
 	char msg[768];
 	size_t o = 0;
 	img__msg_append(msg, sizeof(msg), &o, what ? what : "img");
 	img__msg_append(msg, sizeof(msg), &o, ": ");
-	img__msg_append(msg, sizeof(msg), &o, url ? url : "(null)");
+	img__msg_append(msg, sizeof(msg), &o, one_line);
 	if (o + 1 < sizeof(msg)) msg[o++] = '\n';
 	if (lvl == LOG_LVL_ERROR) LOGE_BUF("img", msg, o);
 	else if (lvl == LOG_LVL_WARN) LOGW_BUF("img", msg, o);
 	else if (lvl == LOG_LVL_DEBUG) LOGD_BUF("img", msg, o);
 	else LOGI_BUF("img", msg, o);
+}
+
+static inline void img__url_ext(char out[16], const char *url)
+{
+	if (!out) return;
+	out[0] = 0;
+	if (!url) return;
+
+	/* Strip query/fragment. */
+	size_t end = 0;
+	while (url[end] && url[end] != '?' && url[end] != '#') end++;
+
+	/* Find last '.' after last '/'. */
+	size_t last_slash = 0;
+	for (size_t i = 0; i < end; i++) {
+		if (url[i] == '/') last_slash = i + 1;
+	}
+	size_t dot = (size_t)-1;
+	for (size_t i = end; i > last_slash; i--) {
+		if (url[i - 1] == '.') { dot = i - 1; break; }
+	}
+	if (dot == (size_t)-1 || dot + 1 >= end) return;
+
+	size_t o = 0;
+	for (size_t i = dot + 1; i < end && o + 1 < 16; i++) {
+		char c = url[i];
+		if (c >= 'A' && c <= 'Z') c = (char)(c + ('a' - 'A'));
+		if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'))) break;
+		out[o++] = c;
+	}
+	out[o] = 0;
 }
 
 static uint32_t g_img_use_tick;
@@ -372,6 +504,35 @@ static int streq(const char *a, const char *b)
 	}
 }
 
+static int ieq_prefix_ci_to_delim(const char *s, const char *lit, char delim)
+{
+	if (!s || !lit) return 0;
+	for (size_t i = 0; lit[i] != 0; i++) {
+		char a = s[i];
+		char b = lit[i];
+		if (a == 0 || a == delim) return 0;
+		if (a >= 'A' && a <= 'Z') a = (char)(a + ('a' - 'A'));
+		if (b >= 'A' && b <= 'Z') b = (char)(b + ('a' - 'A'));
+		if (a != b) return 0;
+	}
+	/* Next char must be end or delim or ';' to be a whole-type match. */
+	char c = s[c_strlen(lit)];
+	return (c == 0 || c == ';' || c == delim);
+}
+
+static enum img_fmt img_fmt_from_content_type(const char *content_type)
+{
+	if (!content_type || !content_type[0]) return IMG_FMT_UNKNOWN;
+	/* Compare only up to ';' (parameters). */
+	if (ieq_prefix_ci_to_delim(content_type, "image/png", ';')) return IMG_FMT_PNG;
+	if (ieq_prefix_ci_to_delim(content_type, "image/jpeg", ';')) return IMG_FMT_JPG;
+	if (ieq_prefix_ci_to_delim(content_type, "image/gif", ';')) return IMG_FMT_GIF;
+	if (ieq_prefix_ci_to_delim(content_type, "image/webp", ';')) return IMG_FMT_WEBP;
+	if (ieq_prefix_ci_to_delim(content_type, "image/avif", ';')) return IMG_FMT_AVIF;
+	if (ieq_prefix_ci_to_delim(content_type, "image/svg+xml", ';')) return IMG_FMT_SVG;
+	return IMG_FMT_UNKNOWN;
+}
+
 static enum img_fmt img_fmt_from_sniff(const uint8_t *b, size_t n)
 {
 	if (!b || n == 0) return IMG_FMT_UNKNOWN;
@@ -391,6 +552,17 @@ static enum img_fmt img_fmt_from_sniff(const uint8_t *b, size_t n)
 	    b[0] == 'R' && b[1] == 'I' && b[2] == 'F' && b[3] == 'F' &&
 	    b[8] == 'W' && b[9] == 'E' && b[10] == 'B' && b[11] == 'P') {
 		return IMG_FMT_WEBP;
+	}
+	/* Best-effort AVIF sniff: ISO-BMFF ftyp box with avif/avis brand. */
+	if (n >= 16 &&
+	    b[4] == 'f' && b[5] == 't' && b[6] == 'y' && b[7] == 'p') {
+		/* Major brand at +8, compatible brands follow at +16. */
+		for (size_t off = 8; off + 4 <= n && off <= 40; off += 4) {
+			if ((b[off + 0] == 'a' && b[off + 1] == 'v' && b[off + 2] == 'i' && b[off + 3] == 'f') ||
+			    (b[off + 0] == 'a' && b[off + 1] == 'v' && b[off + 2] == 'i' && b[off + 3] == 's')) {
+				return IMG_FMT_AVIF;
+			}
+		}
 	}
 	/* Best-effort SVG sniff: look for "<svg" near the beginning. */
 	if (n >= 5) {
@@ -423,6 +595,7 @@ const char *img_fmt_token(enum img_fmt fmt)
 		case IMG_FMT_GIF: return "GIF";
 		case IMG_FMT_WEBP: return "WEBP";
 		case IMG_FMT_SVG: return "SVG";
+		case IMG_FMT_AVIF: return "AVIF";
 		default: return "?";
 	}
 }
@@ -466,10 +639,20 @@ int browser_html_img_dim_lookup(void *ctx, const char *url, uint32_t *out_w, uin
 	return 0;
 }
 
-static int https_get_prefix_follow_redirects(const char *host_in, const char *path_in, uint8_t *out, size_t out_cap, size_t *out_len)
+static int https_get_prefix_follow_redirects(const char *host_in,
+					const char *path_in,
+					char *content_type_out,
+					size_t content_type_out_len,
+					char *content_enc_out,
+					size_t content_enc_out_len,
+					uint8_t *out,
+					size_t out_cap,
+					size_t *out_len)
 {
 	if (!out || out_cap == 0 || !out_len) return -1;
 	*out_len = 0;
+	if (content_type_out && content_type_out_len) content_type_out[0] = 0;
+	if (content_enc_out && content_enc_out_len) content_enc_out[0] = 0;
 	char host[HOST_BUF_LEN];
 	char path[PATH_BUF_LEN];
 	(void)c_strlcpy_s(host, sizeof(host), host_in ? host_in : "");
@@ -497,6 +680,10 @@ static int https_get_prefix_follow_redirects(const char *host_in, const char *pa
 		int status_code = -1;
 		size_t body_len = 0;
 		uint64_t content_len = 0;
+		char content_type[128];
+		char content_enc[64];
+		content_type[0] = 0;
+		content_enc[0] = 0;
 		int rc = tls13_https_get_status_location_and_body(sock,
 						 host,
 						 path,
@@ -505,10 +692,10 @@ static int https_get_prefix_follow_redirects(const char *host_in, const char *pa
 						 &status_code,
 						 location,
 						 sizeof(location),
-						 0,
-						 0,
-						 0,
-						 0,
+					 content_type,
+					 sizeof(content_type),
+					 content_enc,
+					 sizeof(content_enc),
 						 out,
 						 out_cap,
 						 &body_len,
@@ -523,6 +710,18 @@ static int https_get_prefix_follow_redirects(const char *host_in, const char *pa
 
 		int is_redirect = (status_code == 301 || status_code == 302 || status_code == 303 || status_code == 307 || status_code == 308);
 		if (!is_redirect || location[0] == 0) {
+			if (content_enc[0] && !http_value_has_token_ci(content_enc, "identity")) {
+				char url[768];
+				img__format_https_from_host_path(url, sizeof(url), host, path);
+				char msg[192];
+				size_t o = 0;
+				img__msg_append(msg, sizeof(msg), &o, "unsupported Content-Encoding: ");
+				img__msg_append(msg, sizeof(msg), &o, content_enc);
+				img__log_url(LOG_LVL_WARN, msg, url);
+				return -1;
+			}
+			if (content_type_out && content_type_out_len) (void)c_strlcpy_s(content_type_out, content_type_out_len, content_type);
+			if (content_enc_out && content_enc_out_len) (void)c_strlcpy_s(content_enc_out, content_enc_out_len, content_enc);
 			*out_len = (body_len > out_cap) ? out_cap : (size_t)body_len;
 			return 0;
 		}
@@ -575,12 +774,18 @@ static int https_conn_open_host(struct tls13_https_conn *c, const char *host)
 static int https_get_prefix_follow_redirects_keepalive(struct tls13_https_conn *c,
 						const char *host_in,
 						const char *path_in,
+						char *content_type_out,
+						size_t content_type_out_len,
+						char *content_enc_out,
+						size_t content_enc_out_len,
 						uint8_t *out,
 						size_t out_cap,
 						size_t *out_len)
 {
 	if (!c || !out || out_cap == 0 || !out_len) return -1;
 	*out_len = 0;
+	if (content_type_out && content_type_out_len) content_type_out[0] = 0;
+	if (content_enc_out && content_enc_out_len) content_enc_out[0] = 0;
 
 	char host[HOST_BUF_LEN];
 	char path[PATH_BUF_LEN];
@@ -599,6 +804,8 @@ static int https_get_prefix_follow_redirects_keepalive(struct tls13_https_conn *
 
 		char status[128];
 		char location[512];
+		char content_type[128];
+		char content_enc[64];
 		int status_code = -1;
 		size_t body_len = 0;
 		int peer_close = 0;
@@ -606,6 +813,8 @@ static int https_get_prefix_follow_redirects_keepalive(struct tls13_https_conn *
 		int rc = -1;
 		for (int attempt = 0; attempt < 2; attempt++) {
 			peer_close = 0;
+			content_type[0] = 0;
+			content_enc[0] = 0;
 			rc = tls13_https_conn_get_status_location_and_body(c,
 									 path,
 									 status,
@@ -613,10 +822,10 @@ static int https_get_prefix_follow_redirects_keepalive(struct tls13_https_conn *
 									 &status_code,
 									 location,
 									 sizeof(location),
-								 0,
-								 0,
-								 0,
-								 0,
+								 content_type,
+								 sizeof(content_type),
+								 content_enc,
+								 sizeof(content_enc),
 								 out,
 								 out_cap,
 								 &body_len,
@@ -639,6 +848,18 @@ static int https_get_prefix_follow_redirects_keepalive(struct tls13_https_conn *
 
 		int is_redirect = (status_code == 301 || status_code == 302 || status_code == 303 || status_code == 307 || status_code == 308);
 		if (!is_redirect || location[0] == 0) {
+			if (content_enc[0] && !http_value_has_token_ci(content_enc, "identity")) {
+				char url[768];
+				img__format_https_from_host_path(url, sizeof(url), host, path);
+				char msg[192];
+				size_t o = 0;
+				img__msg_append(msg, sizeof(msg), &o, "unsupported Content-Encoding: ");
+				img__msg_append(msg, sizeof(msg), &o, content_enc);
+				img__log_url(LOG_LVL_WARN, msg, url);
+				return -1;
+			}
+			if (content_type_out && content_type_out_len) (void)c_strlcpy_s(content_type_out, content_type_out_len, content_type);
+			if (content_enc_out && content_enc_out_len) (void)c_strlcpy_s(content_enc_out, content_enc_out_len, content_enc);
 			*out_len = (body_len > out_cap) ? out_cap : (size_t)body_len;
 			return 0;
 		}
@@ -836,10 +1057,28 @@ static void img_worker_loop(uint32_t wi)
 			w->state = 2u;
 			continue;
 		}
+		char fetch_path[PATH_BUF_LEN];
+		/* Prefer asking the CDN for a smaller variant (Tagesschau etc.) so big hero images
+		 * render within our decode caps.
+		 */
+		(void)img__rewrite_query_u32_cap(fetch_path, sizeof(fetch_path), path, "width", IMG_WORKER_MAX_W);
 
 		uint8_t sniff_buf[4096];
 		size_t got = 0;
-		if (https_get_prefix_follow_redirects_keepalive(&conn, host, path, sniff_buf, sizeof(sniff_buf), &got) != 0 || got == 0) {
+		char sniff_ct[128];
+		char sniff_ce[64];
+		sniff_ct[0] = 0;
+		sniff_ce[0] = 0;
+		if (https_get_prefix_follow_redirects_keepalive(&conn,
+								  host,
+								  fetch_path,
+								  sniff_ct,
+								  sizeof(sniff_ct),
+								  sniff_ce,
+								  sizeof(sniff_ce),
+								  sniff_buf,
+								  sizeof(sniff_buf),
+								  &got) != 0 || got == 0) {
 			img__log_key(LOG_LVL_WARN, "sniff fetch failed", w->key);
 			w->rc = -1;
 			w->state = 2u;
@@ -848,6 +1087,37 @@ static void img_worker_loop(uint32_t wi)
 		/* Sniff succeeded. */
 		w->rc = 0;
 		w->fmt = (uint32_t)img_fmt_from_sniff(sniff_buf, got);
+		if ((enum img_fmt)w->fmt == IMG_FMT_UNKNOWN && sniff_ct[0] != 0) {
+			enum img_fmt by_ct = img_fmt_from_content_type(sniff_ct);
+			if (by_ct != IMG_FMT_UNKNOWN) {
+				w->fmt = (uint32_t)by_ct;
+				if (LOG_LEVEL >= 3) {
+					char url[768];
+					img__format_https_from_host_path(url, sizeof(url), host, path);
+					char msg[192];
+					size_t o = 0;
+					img__msg_append(msg, sizeof(msg), &o, "format from Content-Type: ");
+					img__msg_append(msg, sizeof(msg), &o, img_fmt_token(by_ct));
+					img__log_url(LOG_LVL_DEBUG, msg, url);
+				}
+			}
+		}
+		if ((enum img_fmt)w->fmt == IMG_FMT_UNKNOWN) {
+			char url[768];
+			img__format_https_from_host_path(url, sizeof(url), host, path);
+			char msg[256];
+			size_t o = 0;
+			img__msg_append(msg, sizeof(msg), &o, "sniff unknown");
+			if (sniff_ct[0]) {
+				img__msg_append(msg, sizeof(msg), &o, " ct=");
+				img__msg_append(msg, sizeof(msg), &o, sniff_ct);
+			}
+			if (sniff_ce[0]) {
+				img__msg_append(msg, sizeof(msg), &o, " ce=");
+				img__msg_append(msg, sizeof(msg), &o, sniff_ce);
+			}
+			img__log_url(LOG_LVL_WARN, msg, url);
+		}
 		uint32_t dim_w = 0, dim_h = 0;
 		if ((enum img_fmt)w->fmt == IMG_FMT_JPG) {
 			if (jpeg_get_dimensions(sniff_buf, got, &dim_w, &dim_h) == 0) {
@@ -877,7 +1147,20 @@ static void img_worker_loop(uint32_t wi)
 			if (pw > 0 && ph > 0 && pw <= IMG_WORKER_MAX_W && ph <= IMG_WORKER_MAX_H && px <= IMG_WORKER_MAX_PX) {
 				uint8_t fetch_buf[512 * 1024];
 				size_t got_full = 0;
-				if (https_get_prefix_follow_redirects_keepalive(&conn, host, path, fetch_buf, sizeof(fetch_buf), &got_full) == 0 && got_full > 0) {
+				char fetch_ct[128];
+				char fetch_ce[64];
+				fetch_ct[0] = 0;
+				fetch_ce[0] = 0;
+				if (https_get_prefix_follow_redirects_keepalive(&conn,
+									  host,
+									  fetch_path,
+									  fetch_ct,
+									  sizeof(fetch_ct),
+									  fetch_ce,
+									  sizeof(fetch_ce),
+									  fetch_buf,
+									  sizeof(fetch_buf),
+									  &got_full) == 0 && got_full > 0) {
 					/* Defensive: ensure any partially-written decode can't leak old pixels (e.g. from a previous PNG
 					 * with a checkerboard transparency background).
 					 */
@@ -1047,6 +1330,26 @@ int img_workers_pump(int *out_any_dims_changed, int *out_any_pixels_changed)
 					if (out_any_pixels_changed) *out_any_pixels_changed = 1;
 				}
 			} else {
+				/* Some pages use very large hero images; we currently bound decoding to
+				 * keep memory/CPU predictable. If an image is beyond our current cap,
+				 * stop requesting pixels and explain why.
+				 */
+				if (is_current && e->has_dims && !e->has_pixels && e->want_pixels &&
+				    (e->fmt == IMG_FMT_PNG || e->fmt == IMG_FMT_JPG || e->fmt == IMG_FMT_GIF) &&
+				    ((uint32_t)e->w > 512u || (uint32_t)e->h > 512u)) {
+					char msg[192];
+					size_t o = 0;
+					img__msg_append(msg, sizeof(msg), &o, "image too large to decode (");
+					img__msg_append_u32_dec(msg, sizeof(msg), &o, (uint32_t)e->w);
+					img__msg_append(msg, sizeof(msg), &o, "x");
+					img__msg_append_u32_dec(msg, sizeof(msg), &o, (uint32_t)e->h);
+					img__msg_append(msg, sizeof(msg), &o, ", fmt=");
+					img__msg_append(msg, sizeof(msg), &o, img_fmt_token(e->fmt));
+					img__msg_append(msg, sizeof(msg), &o, ")");
+					img__log_key(LOG_LVL_WARN, msg, e->key);
+					e->want_pixels = 0;
+				}
+
 				/* If this was a small image we tried to decode but got no pixels, allow a few retries. */
 				if (is_current && e->has_dims && !e->has_pixels && e->want_pixels &&
 				    e->w > 0 && e->h > 0 && e->w <= IMG_WORKER_MAX_W && e->h <= IMG_WORKER_MAX_H &&
@@ -1059,9 +1362,31 @@ int img_workers_pump(int *out_any_dims_changed, int *out_any_pixels_changed)
 						if (LOG_LEVEL >= 3) img__log_key(LOG_LVL_DEBUG, "decode failed (retrying)", e->key);
 					}
 				}
-				/* Unsupported formats: don't keep burning worker cycles. */
-				if (e->fmt == IMG_FMT_WEBP || e->fmt == IMG_FMT_SVG) {
-					img__log_key(LOG_LVL_WARN, "unsupported format (skipping)", e->key);
+				/* Unsupported formats: don't keep burning worker cycles.
+				 * Also handle IMG_FMT_UNKNOWN here, otherwise some pages end up with a
+				 * permanently blank placeholder and no console clue.
+				 */
+				if (!(e->fmt == IMG_FMT_PNG || e->fmt == IMG_FMT_JPG || e->fmt == IMG_FMT_GIF)) {
+					char url[768];
+					img__format_https_from_key(url, sizeof(url), e->key);
+					char ext[16];
+					img__url_ext(ext, url);
+					char msg[192];
+					size_t o = 0;
+					const char *tok = img_fmt_token(e->fmt);
+					if (tok[0] != '?' ) {
+						img__msg_append(msg, sizeof(msg), &o, "unsupported format ");
+						img__msg_append(msg, sizeof(msg), &o, tok);
+					} else {
+						img__msg_append(msg, sizeof(msg), &o, "unknown image format");
+						if (ext[0]) {
+							img__msg_append(msg, sizeof(msg), &o, " (ext=");
+							img__msg_append(msg, sizeof(msg), &o, ext);
+							img__msg_append(msg, sizeof(msg), &o, ")");
+						}
+					}
+					img__msg_append(msg, sizeof(msg), &o, " (skipping)");
+					img__log_key(LOG_LVL_WARN, msg, e->key);
 					e->want_pixels = 0;
 				}
 			}
@@ -1134,6 +1459,8 @@ int img_decode_large_pump_one(void)
 			e->want_pixels = 0;
 			return 0;
 		}
+		char fetch_path[PATH_BUF_LEN];
+		(void)img__rewrite_query_u32_cap(fetch_path, sizeof(fetch_path), path, "width", IMG_WORKER_MAX_W);
 
 		uint32_t px = (uint32_t)e->w * (uint32_t)e->h;
 		if (px == 0 || px > (uint32_t)(sizeof(g_img_pixel_pool) / sizeof(g_img_pixel_pool[0]))) {
@@ -1143,7 +1470,19 @@ int img_decode_large_pump_one(void)
 		}
 
 		size_t got_full = 0;
-		if (https_get_prefix_follow_redirects(host, path, g_img_fetch_buf, sizeof(g_img_fetch_buf), &got_full) != 0 || got_full == 0) {
+		char fetch_ct[128];
+		char fetch_ce[64];
+		fetch_ct[0] = 0;
+		fetch_ce[0] = 0;
+		if (https_get_prefix_follow_redirects(host,
+								   fetch_path,
+							   fetch_ct,
+							   sizeof(fetch_ct),
+							   fetch_ce,
+							   sizeof(fetch_ce),
+							   g_img_fetch_buf,
+							   sizeof(g_img_fetch_buf),
+							   &got_full) != 0 || got_full == 0) {
 			img__log_key(LOG_LVL_WARN, "fetch failed", e->key);
 			e->want_pixels = 0;
 			return 0;
@@ -1256,8 +1595,28 @@ void prefetch_page_images(const char *active_host, const char *visible_text, con
 		if (!(visible_text[line_start + 1] == 'I' && visible_text[line_start + 2] == 'M' && visible_text[line_start + 3] == 'G')) continue;
 		for (size_t k = line_start; k < line_end; k++) {
 			if ((uint8_t)visible_text[k] == 0x1fu) {
-				const char *url = &visible_text[k + 1];
-				if (url[0]) (void)img_cache_get_or_mark_pending(active_host, url);
+				/* URL is embedded in the visible_text line; it is NOT NUL-terminated.
+				 * Copy only up to the end of this line to avoid pulling in subsequent page text.
+				 */
+				size_t url_start = k + 1;
+				if (url_start >= line_end) break;
+				size_t url_len = line_end - url_start;
+				/* Trim trailing whitespace. */
+				while (url_len > 0) {
+					char c = visible_text[url_start + url_len - 1];
+					if (c == ' ' || c == '\t' || c == '\r') {
+						url_len--;
+						continue;
+					}
+					break;
+				}
+				char url_buf[512];
+				size_t o = 0;
+				for (size_t ii = 0; ii < url_len && o + 1 < sizeof(url_buf); ii++) {
+					url_buf[o++] = visible_text[url_start + ii];
+				}
+				url_buf[o] = 0;
+				if (url_buf[0]) (void)img_cache_get_or_mark_pending(active_host, url_buf);
 				break;
 			}
 		}
