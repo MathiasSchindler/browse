@@ -45,7 +45,15 @@ POST_LINK = \
 	$(OBJCOPY) --add-gnu-debuglink=$@.debug $@
 endif
 
-CORE_SRCS := src/core/start.S src/core/main.c
+CORE_SRCS := \
+	src/core/start.S \
+	src/core/main.c \
+	src/core/demo_frame.c \
+	src/core/backend_shm.c
+
+ifeq ($(BACKEND),fbdev)
+CORE_SRCS += src/core/backend_fbdev.c
+endif
 CORE_BIN := build/core
 
 INPUTD_SRCS := src/core/start.S src/inputd/main.c
