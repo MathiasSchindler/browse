@@ -124,8 +124,10 @@ static uint32_t btn_id_from_code(uint16_t code)
 	}
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+	(void)argc;
+	(void)argv;
 	LOGI("inputd", "starting\n");
 
 	int input_fds[32];

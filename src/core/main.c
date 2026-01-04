@@ -4,8 +4,10 @@
 #include "backend_fbdev.h"
 #endif
 
-int main(void)
+int main(int argc, char **argv)
 {
+	(void)argc;
+	(void)argv;
 #if defined(BACKEND_FBDEV)
 	return run_fbdev_backend();
 #else

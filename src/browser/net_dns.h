@@ -3,12 +3,14 @@
 #include "net_ip4.h"
 #include "net_ip6.h"
 
-/* IPv6-only DNS AAAA resolver over UDP.
- * - Uses Google DNS via IPv6:
+/* DNS resolver over UDP.
+ * - Prefers Google DNS via IPv6:
  *   - 2001:4860:4860::8888
  *   - 2001:4860:4860::8844
- * - No IPv4 fallback, no A queries.
- * Returns 0 on success and writes IPv6 address to out_ip (16 bytes).
+ * - Falls back to Google DNS via IPv4:
+ *   - 8.8.8.8
+ *   - 8.8.4.4
+ * Supports AAAA and A queries.
  */
 
 static inline void google_dns_primary(struct in6_addr *out)
@@ -191,13 +193,126 @@ static inline int dns_try_server_aaaa(const struct in6_addr *ns_ip, const char *
 	return -1;
 }
 
+static inline int dns_try_server_aaaa4(const struct in_addr *ns_ip, const char *host, uint8_t out_ip[16])
+{
+	int fd = sys_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	if (fd < 0) return -1;
+
+	struct timeval tv;
+	tv.tv_sec = 1;
+	tv.tv_usec = 0;
+	(void)sys_setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, (uint32_t)sizeof(tv));
+
+	struct sockaddr_in ns;
+	c_memset(&ns, 0, sizeof(ns));
+	ns.sin_family = (uint16_t)AF_INET;
+	ns.sin_port = htons(53);
+	ns.sin_addr = *ns_ip;
+
+	uint8_t pkt[512];
+	c_memset(pkt, 0, sizeof(pkt));
+	struct dns_header *h = (struct dns_header *)pkt;
+
+	uint16_t id = 0x1234;
+	uint16_t rid = 0;
+	if (sys_getrandom(&rid, sizeof(rid), 0) == (long)sizeof(rid)) {
+		id = rid;
+	}
+
+	h->id = htons(id);
+	h->flags = htons(0x0100);
+	h->qdcount = htons(1);
+
+	size_t off = sizeof(struct dns_header);
+	size_t qn = dns_write_qname(&pkt[off], sizeof(pkt) - off, host);
+	if (qn == 0) {
+		sys_close(fd);
+		return -1;
+	}
+	off += qn;
+	if (off + 4 > sizeof(pkt)) {
+		sys_close(fd);
+		return -1;
+	}
+	/* QTYPE AAAA (28), QCLASS IN (1) */
+	pkt[off + 0] = 0;
+	pkt[off + 1] = 28;
+	pkt[off + 2] = 0;
+	pkt[off + 3] = 1;
+	off += 4;
+
+	ssize_t sent = sys_sendto(fd, pkt, off, 0, &ns, (uint32_t)sizeof(ns));
+	if (sent < 0) {
+		sys_close(fd);
+		return -1;
+	}
+
+	uint8_t resp[512];
+	struct sockaddr_in from;
+	socklen_t fromlen = (socklen_t)sizeof(from);
+	ssize_t rcv = sys_recvfrom(fd, resp, sizeof(resp), 0, &from, &fromlen);
+	sys_close(fd);
+	if (rcv < (ssize_t)sizeof(struct dns_header)) {
+		return -1;
+	}
+
+	size_t rlen = (size_t)rcv;
+	const struct dns_header *rh = (const struct dns_header *)resp;
+	if (ntohs(rh->id) != id) {
+		return -1;
+	}
+	uint16_t flags = ntohs(rh->flags);
+	if ((flags & 0x8000u) == 0) return -1;
+	if ((flags & 0x000Fu) != 0) return -1;
+
+	uint16_t qd = ntohs(rh->qdcount);
+	uint16_t an = ntohs(rh->ancount);
+	if (qd < 1 || an < 1) return -1;
+
+	size_t roff = sizeof(struct dns_header);
+	for (uint16_t qi = 0; qi < qd; qi++) {
+		size_t noff = dns_skip_name(resp, rlen, roff);
+		if (noff == 0 || noff + 4 > rlen) return -1;
+		off = noff + 4;
+		roff = off;
+	}
+
+	for (uint16_t ai = 0; ai < an; ai++) {
+		size_t noff = dns_skip_name(resp, rlen, roff);
+		if (noff == 0 || noff + 10 > rlen) return -1;
+		uint16_t type = (uint16_t)((resp[noff + 0] << 8) | resp[noff + 1]);
+		uint16_t cls = (uint16_t)((resp[noff + 2] << 8) | resp[noff + 3]);
+		uint16_t rdlen = (uint16_t)((resp[noff + 8] << 8) | resp[noff + 9]);
+		size_t rdata = noff + 10;
+		if (rdata + rdlen > rlen) return -1;
+
+		if (type == 28 && cls == 1 && rdlen == 16) {
+			c_memcpy(out_ip, &resp[rdata], 16);
+			return 0;
+		}
+		roff = rdata + rdlen;
+	}
+
+	return -1;
+}
+
+static inline void google_dns4_primary(struct in_addr *out);
+static inline void google_dns4_secondary(struct in_addr *out);
+
 static inline int dns_resolve_aaaa_google(const char *host, uint8_t out_ip[16])
 {
 	struct in6_addr ns;
 	google_dns_primary(&ns);
 	if (dns_try_server_aaaa(&ns, host, out_ip) == 0) return 0;
 	google_dns_secondary(&ns);
-	return dns_try_server_aaaa(&ns, host, out_ip);
+	if (dns_try_server_aaaa(&ns, host, out_ip) == 0) return 0;
+
+	/* Fallback: query Google DNS over IPv4 if IPv6 DNS path is unavailable. */
+	struct in_addr ns4;
+	google_dns4_primary(&ns4);
+	if (dns_try_server_aaaa4(&ns4, host, out_ip) == 0) return 0;
+	google_dns4_secondary(&ns4);
+	return dns_try_server_aaaa4(&ns4, host, out_ip);
 }
 
 static inline void google_dns4_primary(struct in_addr *out)
@@ -320,8 +435,121 @@ static inline int dns_try_server_a4(const struct in_addr *ns_ip, const char *hos
 	return -1;
 }
 
+static inline int dns_try_server_a6(const struct in6_addr *ns_ip, const char *host, uint8_t out_ip4[4])
+{
+	int fd = sys_socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
+	if (fd < 0) return -1;
+
+	struct timeval tv;
+	tv.tv_sec = 1;
+	tv.tv_usec = 0;
+	(void)sys_setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, (uint32_t)sizeof(tv));
+
+	struct sockaddr_in6 ns;
+	c_memset(&ns, 0, sizeof(ns));
+	ns.sin6_family = (uint16_t)AF_INET6;
+	ns.sin6_port = htons(53);
+	ns.sin6_addr = *ns_ip;
+
+	uint8_t pkt[512];
+	c_memset(pkt, 0, sizeof(pkt));
+	struct dns_header *h = (struct dns_header *)pkt;
+
+	uint16_t id = 0x1234;
+	uint16_t rid = 0;
+	if (sys_getrandom(&rid, sizeof(rid), 0) == (long)sizeof(rid)) {
+		id = rid;
+	}
+
+	h->id = htons(id);
+	h->flags = htons(0x0100);
+	h->qdcount = htons(1);
+
+	size_t off = sizeof(struct dns_header);
+	size_t qn = dns_write_qname(&pkt[off], sizeof(pkt) - off, host);
+	if (qn == 0) {
+		sys_close(fd);
+		return -1;
+	}
+	off += qn;
+	if (off + 4 > sizeof(pkt)) {
+		sys_close(fd);
+		return -1;
+	}
+	/* QTYPE A (1), QCLASS IN (1) */
+	pkt[off + 0] = 0;
+	pkt[off + 1] = 1;
+	pkt[off + 2] = 0;
+	pkt[off + 3] = 1;
+	off += 4;
+
+	ssize_t sent = sys_sendto(fd, pkt, off, 0, &ns, (uint32_t)sizeof(ns));
+	if (sent < 0) {
+		sys_close(fd);
+		return -1;
+	}
+
+	uint8_t resp[512];
+	struct sockaddr_in6 from;
+	socklen_t fromlen = (socklen_t)sizeof(from);
+	ssize_t rcv = sys_recvfrom(fd, resp, sizeof(resp), 0, &from, &fromlen);
+	sys_close(fd);
+	if (rcv < (ssize_t)sizeof(struct dns_header)) {
+		return -1;
+	}
+
+	size_t rlen = (size_t)rcv;
+	const struct dns_header *rh = (const struct dns_header *)resp;
+	if (ntohs(rh->id) != id) {
+		return -1;
+	}
+	uint16_t flags = ntohs(rh->flags);
+	if ((flags & 0x8000u) == 0) return -1;
+	if ((flags & 0x000Fu) != 0) return -1;
+
+	uint16_t qd = ntohs(rh->qdcount);
+	uint16_t an = ntohs(rh->ancount);
+	if (qd < 1 || an < 1) return -1;
+
+	size_t roff = sizeof(struct dns_header);
+	for (uint16_t qi = 0; qi < qd; qi++) {
+		size_t noff = dns_skip_name(resp, rlen, roff);
+		if (noff == 0 || noff + 4 > rlen) return -1;
+		off = noff + 4;
+		roff = off;
+	}
+
+	for (uint16_t ai = 0; ai < an; ai++) {
+		size_t noff = dns_skip_name(resp, rlen, roff);
+		if (noff == 0 || noff + 10 > rlen) return -1;
+		uint16_t type = (uint16_t)((resp[noff + 0] << 8) | resp[noff + 1]);
+		uint16_t cls = (uint16_t)((resp[noff + 2] << 8) | resp[noff + 3]);
+		uint16_t rdlen = (uint16_t)((resp[noff + 8] << 8) | resp[noff + 9]);
+		size_t rdata = noff + 10;
+		if (rdata + rdlen > rlen) return -1;
+
+		if (type == 1 && cls == 1 && rdlen == 4) {
+			out_ip4[0] = resp[rdata + 0];
+			out_ip4[1] = resp[rdata + 1];
+			out_ip4[2] = resp[rdata + 2];
+			out_ip4[3] = resp[rdata + 3];
+			return 0;
+		}
+		roff = rdata + rdlen;
+	}
+
+	return -1;
+}
+
 static inline int dns_resolve_a_google4(const char *host, uint8_t out_ip4[4])
 {
+	/* Prefer Google DNS via IPv6 for A too (some setups have IPv6 but not IPv4). */
+	struct in6_addr ns6;
+	google_dns_primary(&ns6);
+	if (dns_try_server_a6(&ns6, host, out_ip4) == 0) return 0;
+	google_dns_secondary(&ns6);
+	if (dns_try_server_a6(&ns6, host, out_ip4) == 0) return 0;
+
 	struct in_addr ns;
 	google_dns4_primary(&ns);
 	if (dns_try_server_a4(&ns, host, out_ip4) == 0) return 0;

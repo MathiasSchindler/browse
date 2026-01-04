@@ -16,6 +16,7 @@ struct run_style {
 };
 
 struct ui_buttons {
+	uint32_t sp_x, sp_y, sp_w, sp_h;
 	uint32_t en_x, en_y, en_w, en_h;
 	uint32_t de_x, de_y, de_w, de_h;
 	uint32_t reload_x, reload_y, reload_w, reload_h;
@@ -24,12 +25,15 @@ struct ui_buttons {
 static struct ui_buttons ui_layout_buttons(const struct shm_fb *fb)
 {
 	struct ui_buttons b;
+	b.sp_w = 32;
 	b.en_w = 32;
 	b.de_w = 32;
 	b.reload_w = 64;
+	b.sp_h = 18;
 	b.en_h = 18;
 	b.de_h = 18;
 	b.reload_h = 18;
+	b.sp_y = 3;
 	b.en_y = 3;
 	b.de_y = 3;
 	b.reload_y = 3;
@@ -42,6 +46,8 @@ static struct ui_buttons ui_layout_buttons(const struct shm_fb *fb)
 	b.de_x = (right > b.de_w) ? (right - b.de_w) : 0;
 	right = (b.de_x > pad) ? (b.de_x - pad) : 0;
 	b.en_x = (right > b.en_w) ? (right - b.en_w) : 0;
+	right = (b.en_x > pad) ? (b.en_x - pad) : 0;
+	b.sp_x = (right > b.sp_w) ? (right - b.sp_w) : 0;
 
 	return b;
 }
@@ -51,13 +57,25 @@ static int ui_layout_urlbar_rect(const struct shm_fb *fb, uint32_t *out_x, uint3
 	if (!fb || !out_x || !out_y || !out_w || !out_h) return 0;
 	struct ui_buttons b = ui_layout_buttons(fb);
 	uint32_t url_x = 8u;
-	uint32_t url_right = (b.en_x > 8u) ? (b.en_x - 8u) : 0u;
+	uint32_t url_right = (b.sp_x > 8u) ? (b.sp_x - 8u) : 0u;
 	uint32_t url_w = (url_right > url_x) ? (url_right - url_x) : 0u;
 	*out_x = url_x;
 	*out_y = 0u;
 	*out_w = url_w;
 	*out_h = UI_TOPBAR_H;
 	return (url_w > 0u) ? 1 : 0;
+}
+
+static int host_ends_with(const char *host, const char *suffix)
+{
+	if (!host || !suffix) return 0;
+	size_t hlen = c_strnlen_s(host, 256);
+	size_t slen = c_strnlen_s(suffix, 64);
+	if (slen == 0 || hlen < slen) return 0;
+	for (size_t i = 0; i < slen; i++) {
+		if (host[hlen - slen + i] != suffix[i]) return 0;
+	}
+	return 1;
 }
 
 static void draw_text_clipped_u32(void *base, uint32_t stride_bytes, uint32_t x, uint32_t y, uint32_t max_w_px, const char *s, struct text_color color)
@@ -93,18 +111,21 @@ void browser_draw_ui(struct shm_fb *fb, const char *active_host, const char *url
 
 	int active_en = (active_host && active_host[0] == 'e');
 	int active_de = (active_host && active_host[0] == 'd');
+	int active_sp = host_ends_with(active_host, "spiegel.de");
 
+	fill_rect_u32(fb->pixels, fb->stride, b.sp_x, b.sp_y, b.sp_w, b.sp_h, active_sp ? bg_active : bg_idle);
 	fill_rect_u32(fb->pixels, fb->stride, b.en_x, b.en_y, b.en_w, b.en_h, active_en ? bg_active : bg_idle);
 	fill_rect_u32(fb->pixels, fb->stride, b.de_x, b.de_y, b.de_w, b.de_h, active_de ? bg_active : bg_idle);
 	fill_rect_u32(fb->pixels, fb->stride, b.reload_x, b.reload_y, b.reload_w, b.reload_h, bg_reload);
 
+	draw_text_u32(fb->pixels, fb->stride, b.sp_x + 8, b.sp_y + 7, "SP", dim);
 	draw_text_u32(fb->pixels, fb->stride, b.en_x + 8, b.en_y + 7, "EN", dim);
 	draw_text_u32(fb->pixels, fb->stride, b.de_x + 8, b.de_y + 7, "DE", dim);
 	draw_text_u32(fb->pixels, fb->stride, b.reload_x + 8, b.reload_y + 7, "Reload", dim);
 
 	/* URL + HTTP status (clipped to available space). */
 	uint32_t url_x = 8;
-	uint32_t url_right = (b.en_x > 8) ? (b.en_x - 8) : 0;
+	uint32_t url_right = (b.sp_x > 8) ? (b.sp_x - 8) : 0;
 	uint32_t url_w = (url_right > url_x) ? (url_right - url_x) : 0;
 	char top[512];
 	top[0] = 0;
@@ -1094,6 +1115,7 @@ static int ui_hit_rect(uint32_t x, uint32_t y, uint32_t rx, uint32_t ry, uint32_
 enum ui_action browser_ui_action_from_click(const struct shm_fb *fb, uint32_t x, uint32_t y)
 {
 	struct ui_buttons b = ui_layout_buttons(fb);
+	if (ui_hit_rect(x, y, b.sp_x, b.sp_y, b.sp_w, b.sp_h)) return UI_GO_SP;
 	if (ui_hit_rect(x, y, b.en_x, b.en_y, b.en_w, b.en_h)) return UI_GO_EN;
 	if (ui_hit_rect(x, y, b.de_x, b.de_y, b.de_w, b.de_h)) return UI_GO_DE;
 	if (ui_hit_rect(x, y, b.reload_x, b.reload_y, b.reload_w, b.reload_h)) return UI_RELOAD;

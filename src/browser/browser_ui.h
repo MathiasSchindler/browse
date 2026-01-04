@@ -8,8 +8,9 @@ enum ui_action {
 	UI_NONE = 0,
 	UI_GO_EN = 1,
 	UI_GO_DE = 2,
-	UI_RELOAD = 3,
-	UI_FOCUS_URLBAR = 4,
+	UI_GO_SP = 3,
+	UI_RELOAD = 4,
+	UI_FOCUS_URLBAR = 5,
 };
 
 void browser_draw_ui(struct shm_fb *fb,

@@ -13,6 +13,46 @@
 #include "../core/text.h"
 #include "../core/log.h"
 
+static void nav_log_resolve(const char *host, const char *path)
+{
+	if (!host) host = "";
+	if (!path) path = "";
+	char msg[256];
+	size_t o = 0;
+	const char *pfx = "GET https://";
+	for (size_t i = 0; pfx[i] && o + 1 < sizeof(msg); i++) msg[o++] = pfx[i];
+	for (size_t i = 0; host[i] && o + 1 < sizeof(msg); i++) msg[o++] = host[i];
+	for (size_t i = 0; path[i] && o + 1 < sizeof(msg); i++) msg[o++] = path[i];
+	msg[o] = 0;
+	LOGI("nav", msg);
+}
+
+static void nav_log_dns6_ok(const uint8_t ip6[16])
+{
+	char ip_str6[48];
+	ip6_to_str(ip_str6, ip6);
+	char msg[96];
+	size_t o = 0;
+	const char *pfx = "DNS AAAA ok: ";
+	for (size_t i = 0; pfx[i] && o + 1 < sizeof(msg); i++) msg[o++] = pfx[i];
+	for (size_t i = 0; ip_str6[i] && o + 1 < sizeof(msg); i++) msg[o++] = ip_str6[i];
+	msg[o] = 0;
+	LOGI("nav", msg);
+}
+
+static void nav_log_dns4_ok(const uint8_t ip4[4])
+{
+	char ip_str4[16];
+	ip4_to_str(ip_str4, ip4);
+	char msg[64];
+	size_t o = 0;
+	const char *pfx = "DNS A ok: ";
+	for (size_t i = 0; pfx[i] && o + 1 < sizeof(msg); i++) msg[o++] = pfx[i];
+	for (size_t i = 0; ip_str4[i] && o + 1 < sizeof(msg); i++) msg[o++] = ip_str4[i];
+	msg[o] = 0;
+	LOGI("nav", msg);
+}
+
 void browser_compose_url_bar(char *out, size_t out_len, const char *host, const char *path)
 {
 	if (!out || out_len == 0) return;
@@ -63,8 +103,9 @@ void browser_do_https_status(struct shm_fb *fb,
 	img_cache_begin_new_page();
 
 	for (int step = 0; step < 6; step++) {
+		nav_log_resolve(host, path);
 		browser_compose_url_bar(url_bar, URL_BUF_LEN, host, path);
-		browser_draw_ui(fb, host, url_bar, "", "Resolving (AAAA/A) via Google DNS ...", host, path);
+		browser_draw_ui(fb, host, url_bar, "", "Resolving (AAAA/A) via Google DNS (IPv6 preferred; IPv4 fallback) ...", host, path);
 		fb->hdr->frame_counter++;
 
 		uint8_t ip6[16];
@@ -72,6 +113,11 @@ void browser_do_https_status(struct shm_fb *fb,
 		c_memset(ip6, 0, sizeof(ip6));
 		c_memset(ip4, 0, sizeof(ip4));
 		int dns6_ok = (dns_resolve_aaaa_google(host, ip6) == 0);
+		if (dns6_ok) {
+			nav_log_dns6_ok(ip6);
+		} else {
+			LOGW("nav", "DNS AAAA failed (Google DNS over IPv6+IPv4)");
+		}
 		int dns4_ok = 0;
 		int use_v4 = 0;
 		int sock = -1;
@@ -100,13 +146,48 @@ void browser_do_https_status(struct shm_fb *fb,
 			sock = tcp6_connect(ip6, 443);
 			if (sock >= 0) {
 				use_v4 = 0;
+			} else {
+				LOGW("nav", "TCP connect (IPv6) failed");
 			}
 		}
 		if (sock < 0) {
 			dns4_ok = (dns_resolve_a_google4(host, ip4) == 0);
 			if (dns4_ok) {
+				nav_log_dns4_ok(ip4);
+			} else {
+				LOGW("nav", "DNS A failed (Google DNS over IPv6+IPv4)");
+			}
+			if (dns4_ok) {
 				sock = tcp4_connect(ip4, 443);
-				if (sock >= 0) use_v4 = 1;
+				if (sock >= 0) {
+					use_v4 = 1;
+				} else {
+					LOGW("nav", "TCP connect (IPv4) failed");
+				}
+			}
+		}
+		/* If we ended up using IPv4, adjust the DNS line to avoid confusion.
+		 * (Otherwise it may still say “trying A...” even when A succeeded.)
+		 */
+		if (dns4_ok) {
+			char ip_str4[16];
+			ip4_to_str(ip_str4, ip4);
+			c_memset(line1, 0, sizeof(line1));
+			o = 0;
+			if (dns6_ok) {
+				char ip_str6[48];
+				ip6_to_str(ip_str6, ip6);
+				const char *pfx = "DNS AAAA/A = ";
+				for (size_t i = 0; pfx[i] && o + 1 < sizeof(line1); i++) line1[o++] = pfx[i];
+				for (size_t i = 0; ip_str6[i] && o + 1 < sizeof(line1); i++) line1[o++] = ip_str6[i];
+				if (o + 3 < sizeof(line1)) { line1[o++] = ' '; line1[o++] = '/'; line1[o++] = ' '; }
+				for (size_t i = 0; ip_str4[i] && o + 1 < sizeof(line1); i++) line1[o++] = ip_str4[i];
+				line1[o] = 0;
+			} else {
+				const char *pfx = "DNS A = ";
+				for (size_t i = 0; pfx[i] && o + 1 < sizeof(line1); i++) line1[o++] = pfx[i];
+				for (size_t i = 0; ip_str4[i] && o + 1 < sizeof(line1); i++) line1[o++] = ip_str4[i];
+				line1[o] = 0;
 			}
 		}
 
@@ -117,12 +198,22 @@ void browser_do_https_status(struct shm_fb *fb,
 
 		if (sock < 0) {
 			if (page.status_bar && page.status_bar_cap) {
-				(void)c_strlcpy_s(page.status_bar, page.status_bar_cap, "CONNECT FAILED (need IPv4 fallback or IPv6?)");
+				(void)c_strlcpy_s(page.status_bar, page.status_bar_cap, "CONNECT FAILED (IPv6+IPv4)");
 			}
 			if (page.visible && page.visible_cap) {
-				const char *m = dns6_ok ? "IPv6 connect failed; no IPv4 A record or IPv4 connect failed." : "DNS AAAA failed and DNS A/connect failed. Missing IPv6 and/or IPv4 connectivity.";
+				const char *m = 0;
+				if (!dns6_ok && !dns4_ok) {
+					m = "DNS failed (Google DNS unreachable/blocked?)";
+				} else if (dns6_ok && !dns4_ok) {
+					m = "IPv6 connect failed; DNS A failed too.";
+				} else if (!dns6_ok && dns4_ok) {
+					m = "DNS A ok but connect failed (IPv4).";
+				} else {
+					m = "IPv6 connect failed; IPv4 connect failed too.";
+				}
 				(void)c_strlcpy_s(page.visible, page.visible_cap, m);
 			}
+			LOGW("nav", "CONNECT FAILED (IPv6+IPv4)");
 			*page.have_page = 1;
 			browser_render_page(fb,
 					  host,

@@ -67,16 +67,29 @@ static inline void log__prefix(enum log_level lvl, const char *tag)
 	}
 }
 
+static inline void log__maybe_newline(const char *buf, size_t n)
+{
+	if (buf && n > 0 && buf[n - 1] == '\n') return;
+	log__write_lit("\n");
+}
+
 static inline void log_write(enum log_level lvl, const char *tag, const char *buf, size_t n)
 {
 	log__prefix(lvl, tag);
 	if (buf && n) sys_write(2, buf, n);
+	log__maybe_newline(buf, n);
 }
 
 static inline void log_cstr(enum log_level lvl, const char *tag, const char *s)
 {
 	log__prefix(lvl, tag);
-	if (s) sys_write(2, s, c_strlen(s));
+	if (s) {
+		size_t n = c_strlen(s);
+		if (n) sys_write(2, s, n);
+		log__maybe_newline(s, n);
+	} else {
+		log__maybe_newline(0, 0);
+	}
 }
 
 #define LOGE(tag, msg) do { if (LOG_LEVEL >= 0) log_cstr(LOG_LVL_ERROR, (tag), (msg)); } while (0)

@@ -194,7 +194,7 @@ static struct browser_page make_page(void)
 	return page;
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
 	struct shm_fb fb;
 	if (shm_fb_open(&fb, FB_W, FB_H) < 0) {
@@ -220,6 +220,14 @@ int main(void)
 	char url_bar[URL_BUF_LEN];
 	(void)c_strlcpy_s(host, sizeof(host), "de.wikipedia.org");
 	(void)c_strlcpy_s(path, sizeof(path), "/");
+	if (argc > 1 && argv && argv[1] && argv[1][0]) {
+		char new_host[HOST_BUF_LEN];
+		char new_path[PATH_BUF_LEN];
+		if (url_parse_user_input(argv[1], host, new_host, sizeof(new_host), new_path, sizeof(new_path)) == 0) {
+			(void)c_strlcpy_s(host, sizeof(host), new_host);
+			(void)c_strlcpy_s(path, sizeof(path), new_path);
+		}
+	}
 	browser_compose_url_bar(url_bar, sizeof(url_bar), host, path);
 	browser_draw_ui(&fb, host, url_bar, "", "CRYPTO SELFTEST: OK", "Click EN / DE / Reload", host);
 	fb.hdr->frame_counter++;
@@ -317,7 +325,15 @@ int main(void)
 						url_edit_cancel();
 						redraw_now(&fb, g_active_host, g_status_bar, g_visible, &g_links, &g_spans, &g_inline_imgs, g_scroll_rows, g_have_page);
 					}
-					if (a == UI_GO_EN) {
+					if (a == UI_GO_SP) {
+						(void)c_strlcpy_s(host, sizeof(host), "www.spiegel.de");
+						(void)c_strlcpy_s(path, sizeof(path), "/");
+						g_scroll_rows = 0;
+						browser_compose_url_bar(url_bar, sizeof(url_bar), host, path);
+						browser_draw_ui(&fb, host, url_bar, "", "SP clicked", host, "Fetching ...");
+						fb.hdr->frame_counter++;
+						browser_do_https_status(&fb, host, path, url_bar, page);
+					} else if (a == UI_GO_EN) {
 						(void)c_strlcpy_s(host, sizeof(host), "en.wikipedia.org");
 						(void)c_strlcpy_s(path, sizeof(path), "/");
 						g_scroll_rows = 0;
