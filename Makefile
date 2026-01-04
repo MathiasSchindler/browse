@@ -3,8 +3,16 @@ CC ?= gcc
 # Build toggles:
 # - SIZE=1 enables size-oriented optimizations (-Os + section GC).
 # - STRIP=1 splits debug info into a separate file and strips it from the binary.
+# - LTO=1 enables link-time optimization (default on).
 SIZE ?= 0
 STRIP ?= 0
+LTO ?= 1
+
+# Console logging:
+# - LOG_LEVEL: 0=ERROR, 1=WARN, 2=INFO, 3=DEBUG
+# - LOG_COLOR: 0=off, 1=ANSI colored level prefix
+LOG_LEVEL ?= 2
+LOG_COLOR ?= 0
 
 OBJCOPY ?= objcopy
 STRIPBIN ?= strip
@@ -14,7 +22,12 @@ ifeq ($(SIZE),1)
 OPTFLAGS := -Os
 endif
 
-CFLAGS_COMMON := -Wall -Wextra -Werror $(OPTFLAGS) -g
+LTOFLAGS :=
+ifeq ($(LTO),1)
+LTOFLAGS += -flto
+endif
+
+CFLAGS_COMMON := -Wall -Wextra -Werror $(OPTFLAGS) -g $(LTOFLAGS)
 
 BACKEND ?= shm
 
@@ -30,7 +43,12 @@ endif
 CORE_CFLAGS := $(CFLAGS_COMMON) $(CORE_BACKEND_CFLAGS) \
 	-ffreestanding -fno-builtin -fno-stack-protector -fno-asynchronous-unwind-tables -fno-unwind-tables \
 	-fno-pie -no-pie
-CORE_LDFLAGS := -nostdlib -nodefaultlibs -nostartfiles -Wl,-e,_start -no-pie
+
+CORE_CFLAGS += -DLOG_LEVEL=$(LOG_LEVEL)
+ifeq ($(LOG_COLOR),1)
+CORE_CFLAGS += -DLOG_COLOR=1
+endif
+CORE_LDFLAGS := -nostdlib -nodefaultlibs -nostartfiles -Wl,-e,_start -no-pie $(LTOFLAGS)
 
 ifeq ($(SIZE),1)
 CORE_CFLAGS += -ffunction-sections -fdata-sections

@@ -6,6 +6,8 @@
 #include "url.h"
 #include "util.h"
 
+#include "../core/log.h"
+
 #include "../tls/gcm.h"
 #include "../tls/hkdf_sha256.h"
 #include "../tls/hmac_sha256.h"
@@ -1095,7 +1097,7 @@ int tls13_https_get_status_location_and_body(int sock,
 		(void)sys_setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, (uint32_t)sizeof(tv));
 	}
 
-	dbg_write("tls: building ClientHello\n");
+	LOGI("tls", "building ClientHello\n");
 
 	struct sha256_ctx transcript;
 	sha256_init(&transcript);
@@ -1107,10 +1109,10 @@ int tls13_https_get_status_location_and_body(int sock,
 	if (build_client_hello(host, ch_hs, &ch_hs_len, priv, pub) != 0) return -1;
 
 	/* Send ClientHello */
-	dbg_write("tls: sending ClientHello\n");
+	LOGI("tls", "sending ClientHello\n");
 	if (send_plain_handshake_record(sock, ch_hs, ch_hs_len) != 0) return -1;
 	sha256_update(&transcript, ch_hs, ch_hs_len);
-	dbg_write("tls: ClientHello sent\n");
+	LOGI("tls", "ClientHello sent\n");
 
 	/* Read until ServerHello */
 	uint8_t hdr[5];
@@ -1137,7 +1139,7 @@ int tls13_https_get_status_location_and_body(int sock,
 		crypto_memcpy(sh_hs, payload, sh_hs_len);
 		break;
 	}
-	dbg_write("tls: got ServerHello\n");
+	LOGI("tls", "got ServerHello\n");
 
 	if (parse_server_hello(sh_hs, sh_hs_len, server_pub) != 0) return -1;
 	sha256_update(&transcript, sh_hs, sh_hs_len);
@@ -1155,7 +1157,7 @@ int tls13_https_get_status_location_and_body(int sock,
 	uint8_t c_hs_traffic[32];
 	uint8_t s_hs_traffic[32];
 	if (derive_hs_traffic(&transcript, shared, c_hs_traffic, s_hs_traffic, &tx_hs, &rx_hs) != 0) return -1;
-	dbg_write("tls: derived handshake keys\n");
+	LOGI("tls", "derived handshake keys\n");
 
 	/* Process encrypted handshake messages until server Finished. */
 	uint8_t got_server_finished = 0;
@@ -1200,7 +1202,7 @@ int tls13_https_get_status_location_and_body(int sock,
 				if (!crypto_memeq(server_finished_verify, hs_msg + 4, 32)) return -1;
 				sha256_update(&transcript, hs_msg, hs_msg_len);
 				got_server_finished = 1;
-				dbg_write("tls: server Finished verified\n");
+				LOGI("tls", "server Finished verified\n");
 				break;
 			}
 
@@ -1238,7 +1240,7 @@ int tls13_https_get_status_location_and_body(int sock,
 	if (tls13_seal_record(sock, &tx_hs, 0x16, fin_hs, sizeof(fin_hs)) != 0) return -1;
 	sha256_update(&transcript, fin_hs, sizeof(fin_hs));
 	crypto_memset(fin_hs, 0, sizeof(fin_hs));
-	dbg_write("tls: client Finished sent\n");
+	LOGI("tls", "client Finished sent\n");
 
 	/* Now use application write keys. */
 	tls13_aead_reset(&tx_app);
@@ -1249,7 +1251,7 @@ int tls13_https_get_status_location_and_body(int sock,
 	if (req_len < 0) return -1;
 	if (tls13_seal_record(sock, &tx_app, 0x17, (const uint8_t *)req, (size_t)req_len) != 0) return -1;
 	crypto_memset(req, 0, sizeof(req));
-	dbg_write("tls: HTTP request sent\n");
+	LOGI("tls", "HTTP request sent\n");
 
 	/* Read response headers, then (optionally) a bounded amount of body.
 	 * Phase 0.1: Content-Length supported; chunked not yet.
@@ -1268,7 +1270,7 @@ int tls13_https_get_status_location_and_body(int sock,
 	int chunked_done = 0;
 	size_t body_len = 0;
 
-	dbg_write("tls: waiting for HTTP response...\n");
+	LOGI("tls", "waiting for HTTP response...\n");
 	for (;;) {
 		int rr = tls_read_record_stream(sock, hdr, payload, sizeof(payload), &payload_len);
 		if (rr == 1) {
@@ -1276,7 +1278,7 @@ int tls13_https_get_status_location_and_body(int sock,
 			break;
 		}
 		if (rr != 0) {
-			dbg_write("tls: read app record failed\n");
+			LOGE("tls", "read app record failed\n");
 			return -1;
 		}
 		uint8_t typ = hdr[0];
@@ -1289,13 +1291,13 @@ int tls13_https_get_status_location_and_body(int sock,
 			size_t t_len = 0;
 			if (tls13_open_record(&tmp, hdr, payload, payload_len, dec, sizeof(dec), &t_type, &t_len) == 0) {
 				rx_hs = tmp;
-				if (t_type == 0x15) dbg_write("tls: got alert under handshake keys\n");
-				else if (t_type == 0x16) dbg_write("tls: got handshake under handshake keys\n");
-				else if (t_type == 0x17) dbg_write("tls: got appdata under handshake keys\n");
-				else dbg_write("tls: got unknown inner type under handshake keys\n");
+				if (t_type == 0x15) LOGI("tls", "got alert under handshake keys\n");
+				else if (t_type == 0x16) LOGI("tls", "got handshake under handshake keys\n");
+				else if (t_type == 0x17) LOGI("tls", "got appdata under handshake keys\n");
+				else LOGW("tls", "got unknown inner type under handshake keys\n");
 				return -1;
 			}
-			dbg_write("tls: decrypt app record failed\n");
+			LOGE("tls", "decrypt app record failed\n");
 			return -1;
 		}
 		if (dec_type == 0x15) return -1;
@@ -1425,7 +1427,7 @@ int tls13_https_get_status_location_and_body(int sock,
 
 	if (body_len_out) *body_len_out = body_len;
 	if (content_length_out) *content_length_out = (!is_chunked && have_content_len) ? content_len : 0;
-	dbg_write("tls: got HTTP response headers/body\n");
+	LOGI("tls", "got HTTP response headers/body\n");
 
 	crypto_memset(shared, 0, sizeof(shared));
 	crypto_memset(c_hs_traffic, 0, sizeof(c_hs_traffic));

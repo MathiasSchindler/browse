@@ -540,11 +540,11 @@ int png_decode_xrgb(const uint8_t *data,
 	if (!seen_ihdr || w == 0 || h == 0) return -1;
 	if (bit_depth != 8) return -1;
 	if (interlace != 0) return -1;
-	if (!(color_type==0 || color_type==2 || color_type==3 || color_type==6)) return -1;
+	if (!(color_type==0 || color_type==2 || color_type==3 || color_type==4 || color_type==6)) return -1;
 	if ((uint64_t)w * (uint64_t)h > (uint64_t)out_cap_pixels) return -1;
 	if (idat_n == 0) return -1;
 
-	uint32_t channels = (color_type==0) ? 1u : (color_type==2) ? 3u : (color_type==3) ? 1u : 4u;
+	uint32_t channels = (color_type==0) ? 1u : (color_type==2) ? 3u : (color_type==3) ? 1u : (color_type==4) ? 2u : 4u;
 	uint32_t bpp = channels; /* bytes per pixel for filter */
 	uint32_t rowbytes = w * channels;
 	uint64_t need = (uint64_t)h * (uint64_t)(1u + rowbytes);
@@ -589,6 +589,25 @@ int png_decode_xrgb(const uint8_t *data,
 			for (uint32_t x = 0; x < w; x++) {
 				uint32_t g = (uint32_t)src[x];
 				out_pixels[(size_t)y * (size_t)w + (size_t)x] = 0xff000000u | (g << 16) | (g << 8) | g;
+			}
+		}
+	} else if (color_type == 4) {
+		/* Grayscale+alpha: composite over the UI background (dark) so SVG-rendered
+		 * thumbnails with transparency don't disappear.
+		 */
+		const uint32_t bg = 0xff101014u;
+		const uint32_t bgr = (bg >> 16) & 0xffu;
+		const uint32_t bgg = (bg >> 8) & 0xffu;
+		const uint32_t bgb = (bg >> 0) & 0xffu;
+		for (uint32_t y = 0; y < h; y++) {
+			const uint8_t *src = &rows[(size_t)y * (size_t)rowbytes];
+			for (uint32_t x = 0; x < w; x++) {
+				uint32_t g = (uint32_t)src[(size_t)x * 2u + 0u];
+				uint32_t a = (uint32_t)src[(size_t)x * 2u + 1u];
+				uint32_t r = (bgr * (255u - a) + g * a + 127u) / 255u;
+				uint32_t gg = (bgg * (255u - a) + g * a + 127u) / 255u;
+				uint32_t b = (bgb * (255u - a) + g * a + 127u) / 255u;
+				out_pixels[(size_t)y * (size_t)w + (size_t)x] = 0xff000000u | (r << 16) | (gg << 8) | b;
 			}
 		}
 	} else if (color_type == 2) {

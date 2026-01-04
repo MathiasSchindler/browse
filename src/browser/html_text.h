@@ -17,7 +17,7 @@ enum {
 	 * Keep this bounded but large enough for long articles.
 	 */
 	HTML_MAX_LINKS = 2048,
-	HTML_HREF_MAX = 256,
+	HTML_HREF_MAX = 512,
 };
 
 struct html_link {
@@ -59,7 +59,7 @@ struct html_spans {
 
 enum {
 	HTML_MAX_INLINE_IMGS = 512,
-	HTML_INLINE_IMG_URL_MAX = 256,
+	HTML_INLINE_IMG_URL_MAX = 512,
 };
 
 struct html_inline_img {

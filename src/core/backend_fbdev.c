@@ -2,6 +2,7 @@
 
 #include "demo_frame.h"
 #include "fbdev.h"
+#include "log.h"
 
 int run_fbdev_backend(void)
 {
@@ -12,7 +13,7 @@ int run_fbdev_backend(void)
 	}
 
 	if (fb.bpp != 32) {
-		dbg_write("fbdev backend currently requires 32bpp\n");
+		LOGE("fbdev", "backend currently requires 32bpp\n");
 		return 1;
 	}
 

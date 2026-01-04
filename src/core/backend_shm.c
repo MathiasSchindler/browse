@@ -2,6 +2,7 @@
 
 #include "cfb.h"
 #include "demo_frame.h"
+#include "log.h"
 
 #define FB_W 1920u
 #define FB_H 1080u
@@ -16,19 +17,19 @@ int run_shm_backend(void)
 
 	int fd = sys_openat(AT_FDCWD, path, O_CREAT | O_RDWR, 0666);
 	if (fd < 0) {
-		dbg_write("openat /dev/shm/cfb0 failed\n");
+		LOGE("shm", "openat /dev/shm/cfb0 failed\n");
 		return 1;
 	}
 
 	if (sys_ftruncate(fd, (off_t)total_size) < 0) {
-		dbg_write("ftruncate failed\n");
+		LOGE("shm", "ftruncate failed\n");
 		sys_close(fd);
 		return 1;
 	}
 
 	void *mapped = sys_mmap(0, total_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 	if (mapped == MAP_FAILED) {
-		dbg_write("mmap failed\n");
+		LOGE("shm", "mmap failed\n");
 		sys_close(fd);
 		return 1;
 	}

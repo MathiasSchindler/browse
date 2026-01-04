@@ -2,6 +2,8 @@
 #include "style_attr.h"
 #include "css_tiny.h"
 
+#include "../core/log.h"
+
 static int is_ascii_space(uint8_t c)
 {
 	return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\f';
@@ -506,7 +508,7 @@ static void warn_unrenderable_codepoint(uint32_t cp)
 	for (uint32_t i = 0; p[i] && n + 1 < sizeof(msg); i++) msg[n++] = p[i];
 	for (uint32_t i = 0; hex8[i] && n + 1 < sizeof(msg); i++) msg[n++] = hex8[i];
 	if (n + 1 < sizeof(msg)) msg[n++] = '\n';
-	sys_write(2, msg, n);
+	LOGW_BUF("text", msg, n);
 }
 
 static void warn_invalid_utf8_start(uint8_t b0)
@@ -523,7 +525,7 @@ static void warn_invalid_utf8_start(uint8_t b0)
 	msg[n++] = hex[(b0 >> 4) & 0x0f];
 	msg[n++] = hex[b0 & 0x0f];
 	if (n + 1 < sizeof(msg)) msg[n++] = '\n';
-	sys_write(2, msg, n);
+	LOGW_BUF("text", msg, n);
 }
 
 static void warn_unsupported_entity(const uint8_t *ent, size_t n)
@@ -539,7 +541,7 @@ static void warn_unsupported_entity(const uint8_t *ent, size_t n)
 	}
 	if (o + 1 < sizeof(msg)) msg[o++] = ';';
 	if (o + 1 < sizeof(msg)) msg[o++] = '\n';
-	sys_write(2, msg, o);
+	LOGW_BUF("text", msg, o);
 }
 
 static int utf8_decode_one(const uint8_t *s, size_t n, uint32_t *out_cp, size_t *out_adv)

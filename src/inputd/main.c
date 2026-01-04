@@ -1,4 +1,5 @@
 #include "../core/cfb.h"
+#include "../core/log.h"
 
 enum {
 	CFB_HEADER_V1_SIZE = 56u,
@@ -125,7 +126,7 @@ static uint32_t btn_id_from_code(uint16_t code)
 
 int main(void)
 {
-	dbg_write("inputd: starting\n");
+	LOGI("inputd", "starting\n");
 
 	int input_fds[32];
 	uint32_t input_fd_count = 0;
@@ -160,7 +161,7 @@ int main(void)
 	}
 
 	if (input_fd_count == 0) {
-		dbg_write("inputd: no readable /dev/input/event* devices (need perms?)\n");
+		LOGW("inputd", "no readable /dev/input/event* devices (need perms?)\n");
 	}
 
 	struct cfb_mapping fb;
@@ -175,7 +176,7 @@ int main(void)
 	for (;;) {
 		if (!fb.ptr) {
 			if (cfb_try_map(&fb) == 0) {
-				dbg_write("inputd: mapped /dev/shm/cfb0\n");
+				LOGI("inputd", "mapped /dev/shm/cfb0\n");
 			} else {
 				struct timespec ts = {0, 100000000}; /* 100ms */
 				sys_nanosleep(&ts, 0);
@@ -254,7 +255,7 @@ int main(void)
 					hdr->input_counter++;
 
 					if (btn_id == 1u) {
-						dbg_write(ev[i].value ? "inputd: left down\n" : "inputd: left up\n");
+						LOGI("inputd", ev[i].value ? "left down\n" : "left up\n");
 					}
 				}
 			}

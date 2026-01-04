@@ -16,6 +16,7 @@
 #include "../core/text.h"
 
 static uint32_t g_img_use_tick;
+static uint32_t g_img_generation;
 
 /* Keep enough entries for Wikipedia-scale pages (lots of icons/thumbs). */
 static struct img_sniff_cache_entry g_img_sniff_cache[1024];
@@ -123,6 +124,7 @@ static int img_cache_evict_one(void)
 	e->state = 0;
 	e->inflight = 0;
 	e->want_pixels = 0;
+	e->gen = 0;
 	e->fetch_failures = 0;
 	e->pix_failures = 0;
 	e->fmt = IMG_FMT_UNKNOWN;
@@ -163,6 +165,7 @@ static int img_cache_drop_pending_one(void)
 	e->state = 0;
 	e->inflight = 0;
 	e->want_pixels = 0;
+	e->gen = 0;
 	e->fetch_failures = 0;
 	e->pix_failures = 0;
 	e->fmt = IMG_FMT_UNKNOWN;
@@ -263,7 +266,7 @@ struct img_sniff_cache_entry *img_cache_find_done(const char *active_host, const
 	char path[PATH_BUF_LEN];
 	if (url_apply_location(active_host, url, host, sizeof(host), path, sizeof(path)) != 0) return 0;
 
-	char key[256];
+	char key[512];
 	key[0] = 0;
 	(void)c_strlcpy_s(key, sizeof(key), host);
 	{
@@ -471,7 +474,7 @@ enum img_fmt img_cache_get_or_mark_pending(const char *active_host, const char *
 		return IMG_FMT_UNKNOWN;
 	}
 
-	char key[256];
+	char key[512];
 	key[0] = 0;
 	(void)c_strlcpy_s(key, sizeof(key), host);
 	/* Append '|' + path (best-effort). */
@@ -489,6 +492,7 @@ enum img_fmt img_cache_get_or_mark_pending(const char *active_host, const char *
 		if (e->hash == h && streq(e->key, key)) {
 			e->last_use = ++g_img_use_tick;
 			e->want_pixels = 1;
+			e->gen = g_img_generation;
 			return (e->state == 2) ? e->fmt : IMG_FMT_UNKNOWN;
 		}
 	}
@@ -519,6 +523,7 @@ enum img_fmt img_cache_get_or_mark_pending(const char *active_host, const char *
 		slot->state = 1;
 		slot->inflight = 0;
 		slot->want_pixels = 1;
+		slot->gen = g_img_generation;
 		slot->fetch_failures = 0;
 		slot->pix_failures = 0;
 		slot->fmt = IMG_FMT_UNKNOWN;
@@ -546,7 +551,8 @@ enum {
 
 struct img_worker_shm {
 	volatile uint32_t state; /* 0=idle, 1=req, 2=done */
-	char key[256];
+	char key[512];
+	uint32_t gen;
 	uint32_t fmt;
 	uint32_t has_dims;
 	uint16_t w;
@@ -560,6 +566,7 @@ struct img_worker_shm {
 };
 
 static struct img_worker_shm *g_img_workers;
+static int32_t g_img_worker_pids[IMG_WORKERS];
 
 static struct img_sniff_cache_entry *img_cache_find_by_key(const char *key)
 {
@@ -675,6 +682,7 @@ static void img_worker_loop(uint32_t wi)
 void img_workers_init(void)
 {
 	if (g_img_workers) return;
+	for (uint32_t i = 0; i < IMG_WORKERS; i++) g_img_worker_pids[i] = -1;
 	void *p = sys_mmap(0,
 					 sizeof(struct img_worker_shm) * (size_t)IMG_WORKERS,
 					 PROT_READ | PROT_WRITE,
@@ -686,6 +694,7 @@ void img_workers_init(void)
 	for (uint32_t i = 0; i < IMG_WORKERS; i++) {
 		g_img_workers[i].state = 0;
 		g_img_workers[i].key[0] = 0;
+		g_img_workers[i].gen = 0;
 	}
 	for (uint32_t i = 0; i < IMG_WORKERS; i++) {
 		int pid = sys_fork();
@@ -694,23 +703,57 @@ void img_workers_init(void)
 			sys_exit(0);
 		}
 		/* Parent: if fork failed, just leave fewer workers. */
+		if (pid > 0) g_img_worker_pids[i] = (int32_t)pid;
 		if (pid < 0) break;
 	}
 }
 
-int img_workers_pump(int *out_any_dims_changed)
+void img_workers_cancel_all(void)
+{
+	if (!g_img_workers) return;
+	for (uint32_t i = 0; i < IMG_WORKERS; i++) {
+		int32_t pid = g_img_worker_pids[i];
+		if (pid > 0) (void)sys_kill((int)pid, SIGKILL);
+	}
+	/* Best-effort reap to avoid zombies. */
+	for (uint32_t i = 0; i < IMG_WORKERS; i++) {
+		int32_t pid = g_img_worker_pids[i];
+		if (pid <= 0) continue;
+		for (int tries = 0; tries < 64; tries++) {
+			int st = 0;
+			int r = sys_wait4((int)pid, &st, WNOHANG, 0);
+			if (r == pid) break;
+			struct timespec req;
+			req.tv_sec = 0;
+			req.tv_nsec = 1 * 1000 * 1000;
+			(void)sys_nanosleep(&req, 0);
+		}
+		g_img_worker_pids[i] = -1;
+	}
+
+	(void)sys_munmap((void *)g_img_workers, sizeof(struct img_worker_shm) * (size_t)IMG_WORKERS);
+	g_img_workers = 0;
+
+	/* Ensure cache doesn't wedge on stale inflight flags. */
+	for (size_t i = 0; i < sizeof(g_img_sniff_cache) / sizeof(g_img_sniff_cache[0]); i++) {
+		g_img_sniff_cache[i].inflight = 0;
+	}
+}
+
+int img_workers_pump(int *out_any_dims_changed, int *out_any_pixels_changed)
 {
 	if (out_any_dims_changed) *out_any_dims_changed = 0;
+	if (out_any_pixels_changed) *out_any_pixels_changed = 0;
 	if (!g_img_workers) return 0;
-	int did_complete = 0;
+	int did_relevant_change = 0;
 
 	/* Collect completed workers. */
 	for (uint32_t wi = 0; wi < IMG_WORKERS; wi++) {
 		struct img_worker_shm *w = &g_img_workers[wi];
 		if (w->state != 2u) continue;
-		did_complete = 1;
 		struct img_sniff_cache_entry *e = img_cache_find_by_key(w->key);
 		if (e) {
+			int is_current = (e->gen == g_img_generation) && e->want_pixels;
 			if (w->rc != 0) {
 				/* Transient failure: keep pending so we can retry a few times. */
 				e->inflight = 0;
@@ -731,11 +774,9 @@ int img_workers_pump(int *out_any_dims_changed)
 			e->has_dims = (uint8_t)(w->has_dims != 0);
 			e->w = w->w;
 			e->h = w->h;
-			if (out_any_dims_changed && e->has_dims && !had_dims) {
-				*out_any_dims_changed = 1;
-			}
+			if (is_current && out_any_dims_changed && e->has_dims && !had_dims) *out_any_dims_changed = 1;
 
-			if (w->has_pixels && w->pix_len != 0) {
+			if (is_current && w->has_pixels && w->pix_len != 0) {
 				/* Replace existing pixels if any. */
 				if (e->has_pixels && e->pix_len != 0) {
 					img_pixel_free(e->pix_off, e->pix_len);
@@ -763,10 +804,11 @@ int img_workers_pump(int *out_any_dims_changed)
 					e->pix_h = w->pix_h;
 					e->pix_len = w->pix_len;
 					e->pix_failures = 0;
+					if (out_any_pixels_changed) *out_any_pixels_changed = 1;
 				}
 			} else {
 				/* If this was a small image we tried to decode but got no pixels, allow a few retries. */
-				if (e->has_dims && !e->has_pixels && e->want_pixels &&
+				if (is_current && e->has_dims && !e->has_pixels && e->want_pixels &&
 				    e->w > 0 && e->h > 0 && e->w <= IMG_WORKER_MAX_W && e->h <= IMG_WORKER_MAX_H &&
 				    (e->fmt == IMG_FMT_PNG || e->fmt == IMG_FMT_JPG || e->fmt == IMG_FMT_GIF)) {
 					if (e->pix_failures < 0xffu) e->pix_failures++;
@@ -782,6 +824,7 @@ int img_workers_pump(int *out_any_dims_changed)
 			e->state = 2;
 			e->inflight = 0;
 			e->last_use = ++g_img_use_tick;
+			if (is_current) did_relevant_change = 1;
 		}
 
 		w->state = 0u;
@@ -796,6 +839,8 @@ int img_workers_pump(int *out_any_dims_changed)
 		for (uint32_t i = 0; i < (uint32_t)(sizeof(g_img_sniff_cache) / sizeof(g_img_sniff_cache[0])); i++) {
 			struct img_sniff_cache_entry *e = &g_img_sniff_cache[i];
 			if (!e->used) continue;
+			if (!e->want_pixels) continue;
+			if (e->gen != g_img_generation) continue;
 			int eligible = 0;
 			if (e->state == 1) {
 				eligible = 1;
@@ -807,7 +852,6 @@ int img_workers_pump(int *out_any_dims_changed)
 			}
 			if (!eligible) continue;
 			if (e->inflight) continue;
-			if (!e->want_pixels) continue;
 			if (!pick || e->last_use > best_use) {
 				pick = e;
 				best_use = e->last_use;
@@ -816,11 +860,12 @@ int img_workers_pump(int *out_any_dims_changed)
 		if (!pick) break;
 		pick->inflight = 1;
 		(void)c_strlcpy_s(w->key, sizeof(w->key), pick->key);
+		w->gen = pick->gen;
 		w->state = 1u;
 		w->rc = 0;
 	}
 
-	return did_complete;
+	return did_relevant_change;
 }
 
 int img_decode_large_pump_one(void)
@@ -830,6 +875,7 @@ int img_decode_large_pump_one(void)
 		if (!e->used) continue;
 		if (e->state != 2) continue;
 		if (!e->want_pixels) continue;
+		if (e->gen != g_img_generation) continue;
 		if (e->inflight) continue;
 		if (e->has_pixels) continue;
 		if (!e->has_dims) continue;
@@ -901,6 +947,13 @@ void img_cache_clear_want_pixels(void)
 	for (size_t i = 0; i < sizeof(g_img_sniff_cache) / sizeof(g_img_sniff_cache[0]); i++) {
 		g_img_sniff_cache[i].want_pixels = 0;
 	}
+}
+
+void img_cache_begin_new_page(void)
+{
+	/* Move to a new generation so stale in-flight work won't be dispatched/rendered. */
+	g_img_generation++;
+	img_cache_clear_want_pixels();
 }
 
 void prefetch_page_images(const char *active_host, const char *visible_text, const struct html_inline_imgs *inline_imgs)

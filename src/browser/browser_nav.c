@@ -9,6 +9,7 @@
 #include "url.h"
 
 #include "../core/text.h"
+#include "../core/log.h"
 
 void browser_compose_url_bar(char *out, size_t out_len, const char *host, const char *path)
 {
@@ -52,7 +53,12 @@ void browser_do_https_status(struct shm_fb *fb,
 	*page.scroll_rows = 0;
 	*page.have_page = 0;
 
-	img_cache_clear_want_pixels();
+	/* Navigation: stop any in-flight image fetch/decode from the previous page,
+	 * and start a new generation so only current-page images are eligible.
+	 */
+	img_workers_cancel_all();
+	img_workers_init();
+	img_cache_begin_new_page();
 
 	for (int step = 0; step < 6; step++) {
 		browser_compose_url_bar(url_bar, URL_BUF_LEN, host, path);
@@ -122,13 +128,28 @@ void browser_do_https_status(struct shm_fb *fb,
 			break;
 		}
 
-		dbg_write("http: ");
-		dbg_write(status);
-		dbg_write("\n");
+		/* Log HTTP status/location (best-effort first line only). */
+		{
+			char msg[256];
+			size_t omsg = 0;
+			const char *pfx = "status: ";
+			for (size_t i = 0; pfx[i] && omsg + 1 < sizeof(msg); i++) msg[omsg++] = pfx[i];
+			for (size_t i = 0; status[i] && status[i] != '\n' && status[i] != '\r' && omsg + 1 < sizeof(msg); i++) {
+				msg[omsg++] = status[i];
+			}
+			if (omsg + 1 < sizeof(msg)) msg[omsg++] = '\n';
+			LOGI_BUF("http", msg, omsg);
+		}
 		if (location[0]) {
-			dbg_write("loc: ");
-			dbg_write(location);
-			dbg_write("\n");
+			char msg[640];
+			size_t omsg = 0;
+			const char *pfx = "location: ";
+			for (size_t i = 0; pfx[i] && omsg + 1 < sizeof(msg); i++) msg[omsg++] = pfx[i];
+			for (size_t i = 0; location[i] && location[i] != '\n' && location[i] != '\r' && omsg + 1 < sizeof(msg); i++) {
+				msg[omsg++] = location[i];
+			}
+			if (omsg + 1 < sizeof(msg)) msg[omsg++] = '\n';
+			LOGI_BUF("http", msg, omsg);
 		}
 
 		/* Keep only first line of status in status bar (best effort) */
@@ -183,7 +204,7 @@ void browser_do_https_status(struct shm_fb *fb,
 	*page.have_page = 1;
 
 	prefetch_page_images(host, page.visible, page.inline_imgs);
-	(void)img_workers_pump(0);
+	(void)img_workers_pump(0, 0);
 
 	browser_render_page(fb,
 			      host,

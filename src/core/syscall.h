@@ -26,6 +26,8 @@ enum {
 	SYS_write = 1,
 	SYS_open = 2,
 	SYS_close = 3,
+	SYS_wait4 = 61,
+	SYS_kill = 62,
 	SYS_fork = 57,
 	SYS_socket = 41,
 	SYS_connect = 42,
@@ -45,6 +47,11 @@ enum {
 
 enum {
 	AT_FDCWD = -100,
+};
+
+enum {
+	SIGKILL = 9,
+	WNOHANG = 1,
 };
 
 enum {
@@ -165,6 +172,16 @@ static inline int sys_openat(int dirfd, const char *path, int flags, int mode)
 static inline int sys_close(int fd)
 {
 	return (int)sys_call1(SYS_close, (long)fd);
+}
+
+static inline int sys_kill(int pid, int sig)
+{
+	return (int)sys_call2(SYS_kill, (long)pid, (long)sig);
+}
+
+static inline int sys_wait4(int pid, int *wstatus, int options, void *rusage)
+{
+	return (int)sys_call4(SYS_wait4, (long)pid, (long)wstatus, (long)options, (long)rusage);
 }
 
 static inline int sys_fork(void)

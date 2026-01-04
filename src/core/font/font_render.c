@@ -1,5 +1,7 @@
 #include "font.h"
 
+#include "../log.h"
+
 #ifdef FONT_LOG_MISSING_GLYPHS
 /* Log missing glyph bytes once per translation unit. */
 static uint8_t font_missing_seen[256];
@@ -26,7 +28,7 @@ void font_log_missing_glyph(unsigned char ch)
 		msg[n++] = ')';
 	}
 	if (n + 1 < sizeof(msg)) msg[n++] = '\n';
-	sys_write(2, msg, n);
+	LOGW_BUF("font", msg, n);
 }
 #endif
 

@@ -182,7 +182,8 @@ int main(void)
 
 		if (g_have_page) {
 			int dims_changed = 0;
-			if (img_workers_pump(&dims_changed)) {
+			int pixels_changed = 0;
+			if (img_workers_pump(&dims_changed, &pixels_changed)) {
 				if (dims_changed && g_body_len > 0) {
 					struct img_dim_ctx ctx = { .active_host = g_active_host };
 					(void)html_visible_text_extract_links_spans_and_inline_imgs_ex(g_body,
@@ -196,7 +197,9 @@ int main(void)
 									      &ctx);
 					prefetch_page_images(g_active_host, g_visible, &g_inline_imgs);
 				}
-				browser_render_page(&fb, g_active_host, g_url_bar, g_status_bar, g_visible, &g_links, &g_spans, &g_inline_imgs, g_scroll_rows);
+				if (dims_changed || pixels_changed) {
+					browser_render_page(&fb, g_active_host, g_url_bar, g_status_bar, g_visible, &g_links, &g_spans, &g_inline_imgs, g_scroll_rows);
+				}
 			}
 		}
 
