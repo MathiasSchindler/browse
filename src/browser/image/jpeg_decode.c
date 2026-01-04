@@ -3,8 +3,109 @@
 #include "../util.h"
 
 #ifdef JPEG_DECODE_DEBUG
-#include <stdio.h>
-#define JDLOG(...) do { fprintf(stderr, __VA_ARGS__); } while (0)
+#include <stdarg.h>
+
+static void jdlog_append(char *dst, uint32_t *io_n, uint32_t cap, const char *s)
+{
+	if (!dst || !io_n || cap == 0 || !s) return;
+	uint32_t n = *io_n;
+	for (uint32_t i = 0; s[i] && n + 1 < cap; i++) dst[n++] = s[i];
+	*io_n = n;
+}
+
+static void jdlog_append_u32_dec(char *dst, uint32_t *io_n, uint32_t cap, uint32_t v)
+{
+	if (!dst || !io_n || cap == 0) return;
+	char tmp[11];
+	uint32_t t = 0;
+	if (v == 0) {
+		if (*io_n + 1 < cap) dst[(*io_n)++] = '0';
+		return;
+	}
+	while (v > 0 && t < 10) {
+		tmp[t++] = (char)('0' + (v % 10u));
+		v /= 10u;
+	}
+	while (t > 0) {
+		if (*io_n + 1 >= cap) break;
+		dst[(*io_n)++] = tmp[--t];
+	}
+}
+
+static void jdlog_append_u32_hex(char *dst, uint32_t *io_n, uint32_t cap, uint32_t v, uint32_t width)
+{
+	if (!dst || !io_n || cap == 0) return;
+	static const char hex[16] = {
+		'0','1','2','3','4','5','6','7','8','9','a','b','c','d','e','f',
+	};
+	char tmp[8];
+	uint32_t t = 0;
+	if (width > 8) width = 8;
+	for (uint32_t i = 0; i < width && t < sizeof(tmp); i++) {
+		tmp[t++] = hex[v & 0xFu];
+		v >>= 4;
+	}
+	while (t > 0) {
+		if (*io_n + 1 >= cap) break;
+		dst[(*io_n)++] = tmp[--t];
+	}
+}
+
+static void jdlogf(const char *fmt, ...)
+{
+	if (!fmt) return;
+	char buf[256];
+	uint32_t n = 0;
+
+	va_list ap;
+	va_start(ap, fmt);
+	for (uint32_t i = 0; fmt[i] && n + 1 < sizeof(buf); i++) {
+		char c = fmt[i];
+		if (c != '%') {
+			buf[n++] = c;
+			continue;
+		}
+		char c1 = fmt[++i];
+		if (c1 == 0) break;
+		if (c1 == '%') {
+			buf[n++] = '%';
+			continue;
+		}
+		uint32_t width = 0;
+		if (c1 >= '0' && c1 <= '9') {
+			while (c1 >= '0' && c1 <= '9') {
+				width = width * 10u + (uint32_t)(c1 - '0');
+				c1 = fmt[++i];
+				if (c1 == 0) break;
+			}
+		}
+		if (c1 == 'u') {
+			uint32_t v = (uint32_t)va_arg(ap, unsigned);
+			(void)width;
+			jdlog_append_u32_dec(buf, &n, (uint32_t)sizeof(buf), v);
+			continue;
+		}
+		if (c1 == 'x') {
+			uint32_t v = (uint32_t)va_arg(ap, unsigned);
+			if (width == 0) width = 1;
+			jdlog_append_u32_hex(buf, &n, (uint32_t)sizeof(buf), v, width);
+			continue;
+		}
+		if (c1 == 's') {
+			const char *s = va_arg(ap, const char *);
+			jdlog_append(buf, &n, (uint32_t)sizeof(buf), s ? s : "(null)");
+			continue;
+		}
+		/* Unknown specifier: emit literally. */
+		buf[n++] = '%';
+		if (n + 1 < sizeof(buf)) buf[n++] = c1;
+	}
+	va_end(ap);
+
+	if (n) sys_write(2, buf, n);
+}
+
+#define JDLOG(...) do { jdlogf(__VA_ARGS__); } while (0)
 #else
 #define JDLOG(...) do { } while (0)
 #endif

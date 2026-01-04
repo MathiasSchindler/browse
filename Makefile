@@ -82,7 +82,7 @@ BROWSER_SRCS := src/core/start.S src/browser/main.c src/browser/browser_img.c sr
 BROWSER_BIN := build/browser
 BROWSER_CFLAGS := $(CORE_CFLAGS) -DTEXT_LOG_MISSING_GLYPHS
 
-.PHONY: all core browser inputd tests test test-crypto test-net-ipv6 test-http test-text-layout test-links test-style-attr test-spans test-css-parser test-text-font clean clean-all viewer
+.PHONY: all core browser inputd tests test test-crypto test-net-ipv6 test-http test-text-layout test-links test-style-attr test-spans test-css-parser test-text-font clean clean-all viewer audit
 .PHONY: fontgen fonts
 .PHONY: test-x25519
 .PHONY: test-http
@@ -332,6 +332,10 @@ viewer: build $(VIEWER_BIN)
 
 $(VIEWER_BIN): tools/viewer_sdl.c
 	$(CC) $(CFLAGS_COMMON) -o $@ $< $(shell pkg-config --cflags --libs sdl2)
+
+audit:
+	@chmod +x tools/audit_no_external.sh
+	@./tools/audit_no_external.sh
 
 clean:
 	rm -f $(CORE_BIN) $(CORE_BIN).debug

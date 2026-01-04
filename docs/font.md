@@ -61,6 +61,10 @@ Generator tool (host-side, not linked into the browser):
    - no external dependencies (no SDL, no FreeType)
    - glyphs are authored in-repo (as code/spec), so we don’t rely on third-party font content
 
+Repo policy checks:
+
+- `make audit` verifies that runtime code stays syscall-only and that SDL2 usage is confined to the dev-only viewer.
+
 Optionally keep a thin compatibility wrapper:
 
 - `src/core/text.h` (temporary)

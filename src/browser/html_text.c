@@ -482,6 +482,66 @@ static void u32_to_dec_local(char out[11], uint32_t v)
 	out[n] = 0;
 }
 
+static uint32_t warn_recent_cp[64];
+static uint32_t warn_recent_cp_pos;
+static uint8_t warn_invalid_utf8_start_seen[256];
+
+static int warn_should_emit_cp(uint32_t cp)
+{
+	for (size_t i = 0; i < sizeof(warn_recent_cp) / sizeof(warn_recent_cp[0]); i++) {
+		if (warn_recent_cp[i] == cp) return 0;
+	}
+	warn_recent_cp[warn_recent_cp_pos++ % (sizeof(warn_recent_cp) / sizeof(warn_recent_cp[0]))] = cp;
+	return 1;
+}
+
+static void warn_unrenderable_codepoint(uint32_t cp)
+{
+	if (!warn_should_emit_cp(cp)) return;
+	char hex8[9];
+	u32_to_hex8(hex8, cp);
+	char msg[64];
+	uint32_t n = 0;
+	const char *p = "unrenderable codepoint: U+";
+	for (uint32_t i = 0; p[i] && n + 1 < sizeof(msg); i++) msg[n++] = p[i];
+	for (uint32_t i = 0; hex8[i] && n + 1 < sizeof(msg); i++) msg[n++] = hex8[i];
+	if (n + 1 < sizeof(msg)) msg[n++] = '\n';
+	sys_write(2, msg, n);
+}
+
+static void warn_invalid_utf8_start(uint8_t b0)
+{
+	if (warn_invalid_utf8_start_seen[b0]) return;
+	warn_invalid_utf8_start_seen[b0] = 1;
+	static const char hex[16] = {
+		'0','1','2','3','4','5','6','7','8','9','A','B','C','D','E','F',
+	};
+	char msg[64];
+	uint32_t n = 0;
+	const char *p = "invalid utf-8 start byte: 0x";
+	for (uint32_t i = 0; p[i] && n + 1 < sizeof(msg); i++) msg[n++] = p[i];
+	msg[n++] = hex[(b0 >> 4) & 0x0f];
+	msg[n++] = hex[b0 & 0x0f];
+	if (n + 1 < sizeof(msg)) msg[n++] = '\n';
+	sys_write(2, msg, n);
+}
+
+static void warn_unsupported_entity(const uint8_t *ent, size_t n)
+{
+	char msg[96];
+	uint32_t o = 0;
+	const char *p = "unsupported entity: &";
+	for (uint32_t i = 0; p[i] && o + 1 < sizeof(msg); i++) msg[o++] = p[i];
+	for (size_t i = 0; i < n && o + 1 < sizeof(msg); i++) {
+		uint8_t c = ent[i];
+		if (c < 32 || c >= 127) c = '?';
+		msg[o++] = (char)c;
+	}
+	if (o + 1 < sizeof(msg)) msg[o++] = ';';
+	if (o + 1 < sizeof(msg)) msg[o++] = '\n';
+	sys_write(2, msg, o);
+}
+
 static int utf8_decode_one(const uint8_t *s, size_t n, uint32_t *out_cp, size_t *out_adv)
 {
 	if (out_cp) *out_cp = 0;
@@ -601,6 +661,7 @@ static int emit_codepoint(char *out, size_t out_len, size_t *io_o, int *io_last_
 			break;
 	}
 
+	warn_unrenderable_codepoint(cp);
 	return 0;
 }
 
@@ -784,6 +845,9 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 				 void *img_dim_lookup_ctx)
 {
 	if (!out || out_len == 0) return -1;
+	for (size_t i = 0; i < sizeof(warn_recent_cp) / sizeof(warn_recent_cp[0]); i++) warn_recent_cp[i] = 0;
+	warn_recent_cp_pos = 0;
+	for (size_t i = 0; i < sizeof(warn_invalid_utf8_start_seen); i++) warn_invalid_utf8_start_seen[i] = 0;
 	out[0] = 0;
 	if (!html || html_len == 0) return 0;
 	if (out_links) {
@@ -1691,6 +1755,35 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 					i = j;
 					continue;
 				}
+				/* decode failed: if numeric, try to log the codepoint; otherwise log entity name */
+				if (n >= 2 && ent[0] == '#') {
+					uint32_t v = 0;
+					size_t k = 1;
+					int base = 10;
+					if (k < n && (ent[k] == 'x' || ent[k] == 'X')) {
+						base = 16;
+						k++;
+					}
+					int ok = 1;
+					for (; k < n; k++) {
+						uint8_t cc = ent[k];
+						uint32_t d;
+						if (base == 10) {
+							if (cc < '0' || cc > '9') { ok = 0; break; }
+							d = (uint32_t)(cc - '0');
+							v = v * 10u + d;
+						} else {
+							if (cc >= '0' && cc <= '9') d = (uint32_t)(cc - '0');
+							else if (cc >= 'a' && cc <= 'f') d = 10u + (uint32_t)(cc - 'a');
+							else if (cc >= 'A' && cc <= 'F') d = 10u + (uint32_t)(cc - 'A');
+							else { ok = 0; break; }
+							v = (v << 4) | d;
+						}
+					}
+					if (ok && v) warn_unrenderable_codepoint(v);
+				} else {
+					warn_unsupported_entity(ent, n);
+				}
 			}
 			/* fallback: treat '&' as normal char */
 		}
@@ -1715,6 +1808,7 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 				i += adv - 1;
 				continue;
 			}
+			warn_invalid_utf8_start(c);
 			continue;
 		}
 
