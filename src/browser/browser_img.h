@@ -18,6 +18,8 @@ struct img_sniff_cache_entry {
 	uint8_t state; /* 0=empty, 1=pending, 2=done */
 	uint8_t inflight; /* dispatched to a worker */
 	uint8_t want_pixels;
+	uint8_t fetch_failures;
+	uint8_t pix_failures;
 	enum img_fmt fmt;
 	uint8_t has_dims;
 	uint16_t w;

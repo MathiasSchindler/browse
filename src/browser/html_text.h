@@ -13,7 +13,10 @@
 int html_visible_text_extract(const uint8_t *html, size_t html_len, char *out, size_t out_len);
 
 enum {
-	HTML_MAX_LINKS = 512,
+	/* Wikipedia-scale pages can easily exceed 512 anchors.
+	 * Keep this bounded but large enough for long articles.
+	 */
+	HTML_MAX_LINKS = 2048,
 	HTML_HREF_MAX = 256,
 };
 

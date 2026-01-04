@@ -17,7 +17,8 @@
 
 static uint32_t g_img_use_tick;
 
-static struct img_sniff_cache_entry g_img_sniff_cache[256];
+/* Keep enough entries for Wikipedia-scale pages (lots of icons/thumbs). */
+static struct img_sniff_cache_entry g_img_sniff_cache[1024];
 
 static uint8_t g_img_fetch_buf[1024 * 1024];
 
@@ -122,6 +123,8 @@ static int img_cache_evict_one(void)
 	e->state = 0;
 	e->inflight = 0;
 	e->want_pixels = 0;
+	e->fetch_failures = 0;
+	e->pix_failures = 0;
 	e->fmt = IMG_FMT_UNKNOWN;
 	e->has_dims = 0;
 	e->w = 0;
@@ -160,6 +163,8 @@ static int img_cache_drop_pending_one(void)
 	e->state = 0;
 	e->inflight = 0;
 	e->want_pixels = 0;
+	e->fetch_failures = 0;
+	e->pix_failures = 0;
 	e->fmt = IMG_FMT_UNKNOWN;
 	e->has_dims = 0;
 	e->w = 0;
@@ -514,6 +519,8 @@ enum img_fmt img_cache_get_or_mark_pending(const char *active_host, const char *
 		slot->state = 1;
 		slot->inflight = 0;
 		slot->want_pixels = 1;
+		slot->fetch_failures = 0;
+		slot->pix_failures = 0;
 		slot->fmt = IMG_FMT_UNKNOWN;
 		slot->has_dims = 0;
 		slot->w = 0;
@@ -607,6 +614,8 @@ static void img_worker_loop(uint32_t wi)
 			w->state = 2u;
 			continue;
 		}
+		/* Sniff succeeded. */
+		w->rc = 0;
 		w->fmt = (uint32_t)img_fmt_from_sniff(sniff_buf, got);
 		uint32_t dim_w = 0, dim_h = 0;
 		if ((enum img_fmt)w->fmt == IMG_FMT_JPG) {
@@ -655,16 +664,9 @@ static void img_worker_loop(uint32_t wi)
 						w->pix_h = (uint16_t)dh;
 						w->pix_len = (uint32_t)(dw * dh);
 						w->rc = 0;
-					} else {
-						w->rc = -1;
 					}
 				}
 			}
-		}
-
-		if (w->rc != 0) {
-			/* Even if pixel decode failed, keep sniff results (fmt/dims) best-effort. */
-			w->rc = 0;
 		}
 		w->state = 2u;
 	}
@@ -709,6 +711,21 @@ int img_workers_pump(int *out_any_dims_changed)
 		did_complete = 1;
 		struct img_sniff_cache_entry *e = img_cache_find_by_key(w->key);
 		if (e) {
+			if (w->rc != 0) {
+				/* Transient failure: keep pending so we can retry a few times. */
+				e->inflight = 0;
+				if (e->fetch_failures < 0xffu) e->fetch_failures++;
+				if (e->fetch_failures >= 3u) {
+					e->want_pixels = 0;
+					e->state = 2;
+				} else {
+					e->state = 1;
+				}
+				w->state = 0u;
+				continue;
+			}
+			e->fetch_failures = 0;
+
 			uint8_t had_dims = e->has_dims;
 			e->fmt = (enum img_fmt)w->fmt;
 			e->has_dims = (uint8_t)(w->has_dims != 0);
@@ -745,6 +762,21 @@ int img_workers_pump(int *out_any_dims_changed)
 					e->pix_w = w->pix_w;
 					e->pix_h = w->pix_h;
 					e->pix_len = w->pix_len;
+					e->pix_failures = 0;
+				}
+			} else {
+				/* If this was a small image we tried to decode but got no pixels, allow a few retries. */
+				if (e->has_dims && !e->has_pixels && e->want_pixels &&
+				    e->w > 0 && e->h > 0 && e->w <= IMG_WORKER_MAX_W && e->h <= IMG_WORKER_MAX_H &&
+				    (e->fmt == IMG_FMT_PNG || e->fmt == IMG_FMT_JPG || e->fmt == IMG_FMT_GIF)) {
+					if (e->pix_failures < 0xffu) e->pix_failures++;
+					if (e->pix_failures >= 3u) {
+						e->want_pixels = 0;
+					}
+				}
+				/* Unsupported formats: don't keep burning worker cycles. */
+				if (e->fmt == IMG_FMT_WEBP || e->fmt == IMG_FMT_SVG) {
+					e->want_pixels = 0;
 				}
 			}
 			e->state = 2;
@@ -764,7 +796,16 @@ int img_workers_pump(int *out_any_dims_changed)
 		for (uint32_t i = 0; i < (uint32_t)(sizeof(g_img_sniff_cache) / sizeof(g_img_sniff_cache[0])); i++) {
 			struct img_sniff_cache_entry *e = &g_img_sniff_cache[i];
 			if (!e->used) continue;
-			if (e->state != 1) continue;
+			int eligible = 0;
+			if (e->state == 1) {
+				eligible = 1;
+			} else if (e->state == 2 && e->want_pixels && !e->has_pixels && e->has_dims &&
+					   e->w > 0 && e->h > 0 && e->w <= IMG_WORKER_MAX_W && e->h <= IMG_WORKER_MAX_H &&
+					   (e->fmt == IMG_FMT_PNG || e->fmt == IMG_FMT_JPG || e->fmt == IMG_FMT_GIF) &&
+					   e->pix_failures < 3u) {
+				eligible = 1;
+			}
+			if (!eligible) continue;
 			if (e->inflight) continue;
 			if (!e->want_pixels) continue;
 			if (!pick || e->last_use > best_use) {

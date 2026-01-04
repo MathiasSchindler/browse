@@ -31,6 +31,7 @@ int main(void)
 	if (expect_eq("comment", "A<!-- hidden -->B", "A B")) return 1;
 	if (expect_eq("numeric", "A&#32;B&#x20;C", "A B C")) return 1;
 	if (expect_eq("umlaut", "WIKIPEDIA DIE FREIE ENZYKLOP\xC3\x84" "DIE", "WIKIPEDIA DIE FREIE ENZYKLOP\xC4" "DIE")) return 1;
+	if (expect_eq("utf8_punct", "foo\xE2\x80\x93" "bar" "\xE2\x80\xA6", "foo-bar...")) return 1;
 	if (expect_eq("img_placeholder", "A<img alt='Example image' src='https://upload.wikimedia.org/wikipedia/commons/a/a9/X.png'>B",
 	              "A\n\x1e" "IMG 8 ? Example image\x1fhttps://upload.wikimedia.org/wikipedia/commons/a/a9/X.png\n\n\n\n\n\n\n\n\nB")) return 1;
 	if (expect_eq("img_srcset_pick", "A<img srcset='https://x/y/a.webp 1x, https://x/y/b.png 2x'>B",

@@ -46,6 +46,33 @@ int main(void)
 	if (expect_one("spaced", "A <a href='/wiki/X'>X</a> B", "A X B", "/wiki/X", 2, 3)) return 1;
 	if (expect_one("nested", "<a href=\"/x\"><b>hi</b></a>", "hi", "/x", 0, 2)) return 1;
 	{
+		/* Stress: long articles can contain far more than 512 anchors.
+		 * Keep this deterministic and offline.
+		 */
+		enum { N = 600 };
+		enum { HTML_CAP = 20000, OUT_CAP = 5000 };
+		char html[HTML_CAP];
+		char out[OUT_CAP];
+		html[0] = 0;
+		out[0] = 0;
+		/* Build: <a href="/x">X</a> repeated with spaces. */
+		size_t o = 0;
+		for (int i = 0; i < N; i++) {
+			const char *s = "<a href=\"/x\">X</a> ";
+			for (size_t k = 0; s[k] && o + 1 < sizeof(html); k++) html[o++] = s[k];
+		}
+		html[o < sizeof(html) ? o : (sizeof(html) - 1)] = 0;
+
+		struct html_links links;
+		memset(&links, 0, sizeof(links));
+		memset(out, 0, sizeof(out));
+		if (html_visible_text_extract_links((const uint8_t *)html, strlen(html), out, sizeof(out), &links) != 0) return 1;
+		if (links.n != (uint32_t)N) {
+			printf("links stress: FAIL (n=%u, want=%u)\n", links.n, (unsigned)N);
+			return 1;
+		}
+	}
+	{
 		char out[256];
 		memset(out, 0, sizeof(out));
 		struct html_links links;

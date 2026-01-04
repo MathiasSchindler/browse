@@ -482,6 +482,188 @@ static void u32_to_dec_local(char out[11], uint32_t v)
 	out[n] = 0;
 }
 
+static int utf8_decode_one(const uint8_t *s, size_t n, uint32_t *out_cp, size_t *out_adv)
+{
+	if (out_cp) *out_cp = 0;
+	if (out_adv) *out_adv = 0;
+	if (!s || n == 0 || !out_cp || !out_adv) return -1;
+
+	uint8_t b0 = s[0];
+	if (b0 < 0x80) {
+		*out_cp = b0;
+		*out_adv = 1;
+		return 0;
+	}
+	if (b0 < 0xC2) return -1;
+
+	if ((b0 & 0xE0) == 0xC0) {
+		if (n < 2) return -1;
+		uint8_t b1 = s[1];
+		if ((b1 & 0xC0) != 0x80) return -1;
+		*out_cp = ((uint32_t)(b0 & 0x1Fu) << 6) | (uint32_t)(b1 & 0x3Fu);
+		*out_adv = 2;
+		return 0;
+	}
+	if ((b0 & 0xF0) == 0xE0) {
+		if (n < 3) return -1;
+		uint8_t b1 = s[1];
+		uint8_t b2 = s[2];
+		if ((b1 & 0xC0) != 0x80 || (b2 & 0xC0) != 0x80) return -1;
+		uint32_t cp = ((uint32_t)(b0 & 0x0Fu) << 12) | ((uint32_t)(b1 & 0x3Fu) << 6) | (uint32_t)(b2 & 0x3Fu);
+		if (cp >= 0xD800 && cp <= 0xDFFF) return -1;
+		if (cp < 0x800) return -1;
+		*out_cp = cp;
+		*out_adv = 3;
+		return 0;
+	}
+	if ((b0 & 0xF8) == 0xF0) {
+		if (n < 4) return -1;
+		uint8_t b1 = s[1];
+		uint8_t b2 = s[2];
+		uint8_t b3 = s[3];
+		if ((b1 & 0xC0) != 0x80 || (b2 & 0xC0) != 0x80 || (b3 & 0xC0) != 0x80) return -1;
+		uint32_t cp = ((uint32_t)(b0 & 0x07u) << 18) | ((uint32_t)(b1 & 0x3Fu) << 12) | ((uint32_t)(b2 & 0x3Fu) << 6) | (uint32_t)(b3 & 0x3Fu);
+		if (cp < 0x10000 || cp > 0x10FFFF) return -1;
+		*out_cp = cp;
+		*out_adv = 4;
+		return 0;
+	}
+
+	return -1;
+}
+
+static int emit_codepoint(char *out, size_t out_len, size_t *io_o, int *io_last_was_space, uint32_t cp)
+{
+	if (!out || out_len == 0 || !io_o || !io_last_was_space) return -1;
+
+	if (cp == 0xAD) {
+		/* Soft hyphen: ignore (used for optional hyphenation). */
+		return 0;
+	}
+	if (cp == 0xA0) {
+		append_space_collapse(out, out_len, io_o, io_last_was_space);
+		return 0;
+	}
+	if (cp >= 32 && cp < 127) {
+		(void)append_char(out, out_len, io_o, (char)cp);
+		*io_last_was_space = 0;
+		return 0;
+	}
+	if (cp >= 0xA0 && cp <= 0xFF) {
+		(void)append_char(out, out_len, io_o, (char)(uint8_t)cp);
+		*io_last_was_space = 0;
+		return 0;
+	}
+
+	switch (cp) {
+		case 0x2010: /* hyphen */
+		case 0x2011: /* non-breaking hyphen */
+		case 0x2012: /* figure dash */
+		case 0x2013: /* en dash */
+		case 0x2014: /* em dash */
+		case 0x2015: /* horizontal bar */
+		case 0x2212: /* minus sign */
+			(void)append_char(out, out_len, io_o, '-');
+			*io_last_was_space = 0;
+			return 0;
+		case 0x2018: /* left single quotation */
+		case 0x2019: /* right single quotation */
+		case 0x2032: /* prime */
+			(void)append_char(out, out_len, io_o, '\'');
+			*io_last_was_space = 0;
+			return 0;
+		case 0x201C: /* left double quotation */
+		case 0x201D: /* right double quotation */
+		case 0x2033: /* double prime */
+			(void)append_char(out, out_len, io_o, '"');
+			*io_last_was_space = 0;
+			return 0;
+		case 0x2026: /* ellipsis */
+			(void)append_char(out, out_len, io_o, '.');
+			(void)append_char(out, out_len, io_o, '.');
+			(void)append_char(out, out_len, io_o, '.');
+			*io_last_was_space = 0;
+			return 0;
+		case 0x2022: /* bullet */
+		case 0x00B7: /* middle dot */
+			(void)append_char(out, out_len, io_o, '*');
+			*io_last_was_space = 0;
+			return 0;
+		case 0x2190: /* left arrow */
+			(void)append_char(out, out_len, io_o, '<');
+			*io_last_was_space = 0;
+			return 0;
+		case 0x2192: /* right arrow */
+			(void)append_char(out, out_len, io_o, '>');
+			*io_last_was_space = 0;
+			return 0;
+		default:
+			break;
+	}
+
+	return 0;
+}
+
+static int map_codepoint_to_single_char(uint32_t cp, char *out_ch, int *out_ignore)
+{
+	if (out_ignore) *out_ignore = 0;
+	if (!out_ch) return -1;
+	*out_ch = 0;
+
+	if (cp == 0xAD) {
+		if (out_ignore) *out_ignore = 1;
+		return 0;
+	}
+	if (cp == 0xA0) {
+		*out_ch = ' ';
+		return 0;
+	}
+	if (cp >= 32 && cp < 127) {
+		*out_ch = (char)cp;
+		return 0;
+	}
+	if (cp >= 0xA0 && cp <= 0xFF) {
+		*out_ch = (char)(uint8_t)cp;
+		return 0;
+	}
+
+	switch (cp) {
+		case 0x2010:
+		case 0x2011:
+		case 0x2012:
+		case 0x2013:
+		case 0x2014:
+		case 0x2015:
+		case 0x2212:
+			*out_ch = '-';
+			return 0;
+		case 0x2018:
+		case 0x2019:
+		case 0x2032:
+			*out_ch = '\'';
+			return 0;
+		case 0x201C:
+		case 0x201D:
+		case 0x2033:
+			*out_ch = '"';
+			return 0;
+		case 0x2022:
+		case 0x00B7:
+			*out_ch = '*';
+			return 0;
+		case 0x2190:
+			*out_ch = '<';
+			return 0;
+		case 0x2192:
+			*out_ch = '>';
+			return 0;
+		default:
+			break;
+	}
+
+	return -1;
+}
+
 static int decode_entity(const uint8_t *s, size_t n, char *out_ch)
 {
 	/* s points to after '&', n is bytes up to before ';' */
@@ -557,17 +739,9 @@ static int decode_entity(const uint8_t *s, size_t n, char *out_ch)
 			*out_ch = ' ';
 			return 0;
 		}
-		if (v == 0xA0) {
-			*out_ch = ' ';
-			return 0;
-		}
-		if (v >= 32 && v < 127) {
-			*out_ch = (char)v;
-			return 0;
-		}
-		if (v >= 0xA0 && v <= 0xFF) {
-			*out_ch = (char)(uint8_t)v;
-			return 0;
+		int ign = 0;
+		if (map_codepoint_to_single_char(v, out_ch, &ign) == 0) {
+			return ign ? 1 : 0;
 		}
 		return -1;
 	}
@@ -1503,7 +1677,12 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 				size_t n = j - (i + 1);
 				uint8_t ent[32];
 				for (size_t k = 0; k < n && k < sizeof(ent); k++) ent[k] = html[i + 1 + k];
-				if (decode_entity(ent, n, &ch) == 0) {
+				int drc = decode_entity(ent, n, &ch);
+				if (drc == 1) {
+					i = j;
+					continue;
+				}
+				if (drc == 0) {
 					if (ch == ' ') append_space_collapse(out, out_len, &o, &last_was_space);
 					else {
 						(void)append_char(out, out_len, &o, ch);
@@ -1529,33 +1708,13 @@ static int html_visible_text_extract_impl(const uint8_t *html,
 		}
 
 		if (c < 32 || c >= 127) {
-			/* Minimal UTF-8 handling: decode 2-byte sequences that map into Latin-1.
-			 * This covers German umlauts and ß, plus most Western European punctuation.
-			 */
-			if (i + 1 < html_len) {
-				uint8_t c0 = c;
-				uint8_t c1 = html[i + 1];
-				if ((c0 & 0xE0) == 0xC0 && (c1 & 0xC0) == 0x80) {
-					uint32_t cp = ((uint32_t)(c0 & 0x1Fu) << 6) | (uint32_t)(c1 & 0x3Fu);
-					if (cp == 0xAD) {
-						/* Soft hyphen: ignore (used for optional hyphenation). */
-						i++;
-						continue;
-					}
-					if (cp == 0xA0) {
-						append_space_collapse(out, out_len, &o, &last_was_space);
-						i++;
-						continue;
-					}
-					if (cp >= 0xA0 && cp <= 0xFF) {
-						(void)append_char(out, out_len, &o, (char)(uint8_t)cp);
-						last_was_space = 0;
-						i++;
-						continue;
-					}
-				}
+			uint32_t cp = 0;
+			size_t adv = 0;
+			if (utf8_decode_one(html + i, html_len - i, &cp, &adv) == 0 && adv > 0) {
+				(void)emit_codepoint(out, out_len, &o, &last_was_space, cp);
+				i += adv - 1;
+				continue;
 			}
-			/* Other non-ASCII ignored for now. */
 			continue;
 		}
 

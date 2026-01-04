@@ -123,10 +123,19 @@ static int links_contains_index(const struct html_links *links, uint32_t idx)
 	if (links->n == 0) return 0;
 	if (idx < links->links[0].start) return 0;
 	if (idx >= links->links[links->n - 1].end) return 0;
-	for (uint32_t i = 0; i < links->n; i++) {
-		if (idx >= links->links[i].start && idx < links->links[i].end) return 1;
+	/* Find the last link whose start <= idx, then check containment.
+	 * This assumes links are emitted in non-decreasing start order.
+	 */
+	uint32_t lo = 0;
+	uint32_t hi = links->n;
+	while (lo < hi) {
+		uint32_t mid = lo + (hi - lo) / 2u;
+		if (links->links[mid].start <= idx) lo = mid + 1u;
+		else hi = mid;
 	}
-	return 0;
+	if (lo == 0) return 0;
+	const struct html_link *ln = &links->links[lo - 1u];
+	return (idx >= ln->start && idx < ln->end) ? 1 : 0;
 }
 
 static struct run_style spans_style_at_index(const struct html_spans *spans, uint32_t idx, uint32_t default_fg_xrgb)
@@ -143,17 +152,22 @@ static struct run_style spans_style_at_index(const struct html_spans *spans, uin
 	if (idx < spans->spans[0].start) return st;
 	if (idx >= spans->spans[spans->n - 1].end) return st;
 
-	for (uint32_t i = 0; i < spans->n; i++) {
-		const struct html_span *sp = &spans->spans[i];
-		if (idx < sp->start || idx >= sp->end) continue;
-		st.has_fg = sp->has_fg;
-		st.fg_xrgb = sp->has_fg ? sp->fg_xrgb : default_fg_xrgb;
-		st.has_bg = sp->has_bg;
-		st.bg_xrgb = sp->bg_xrgb;
-		st.bold = sp->bold;
-		st.underline = sp->underline;
-		return st;
+	uint32_t lo = 0;
+	uint32_t hi = spans->n;
+	while (lo < hi) {
+		uint32_t mid = lo + (hi - lo) / 2u;
+		if (spans->spans[mid].start <= idx) lo = mid + 1u;
+		else hi = mid;
 	}
+	if (lo == 0) return st;
+	const struct html_span *sp = &spans->spans[lo - 1u];
+	if (idx < sp->start || idx >= sp->end) return st;
+	st.has_fg = sp->has_fg;
+	st.fg_xrgb = sp->has_fg ? sp->fg_xrgb : default_fg_xrgb;
+	st.has_bg = sp->has_bg;
+	st.bg_xrgb = sp->bg_xrgb;
+	st.bold = sp->bold;
+	st.underline = sp->underline;
 	return st;
 }
 
@@ -171,17 +185,22 @@ static struct run_style links_style_at_index(const struct html_links *links, uin
 	if (idx < links->links[0].start) return st;
 	if (idx >= links->links[links->n - 1].end) return st;
 
-	for (uint32_t i = 0; i < links->n; i++) {
-		const struct html_link *ln = &links->links[i];
-		if (idx < ln->start || idx >= ln->end) continue;
-		st.has_fg = ln->has_fg;
-		st.fg_xrgb = ln->has_fg ? ln->fg_xrgb : default_fg_xrgb;
-		st.has_bg = ln->has_bg;
-		st.bg_xrgb = ln->bg_xrgb;
-		st.bold = ln->bold;
-		st.underline = 1;
-		return st;
+	uint32_t lo = 0;
+	uint32_t hi = links->n;
+	while (lo < hi) {
+		uint32_t mid = lo + (hi - lo) / 2u;
+		if (links->links[mid].start <= idx) lo = mid + 1u;
+		else hi = mid;
 	}
+	if (lo == 0) return st;
+	const struct html_link *ln = &links->links[lo - 1u];
+	if (idx < ln->start || idx >= ln->end) return st;
+	st.has_fg = ln->has_fg;
+	st.fg_xrgb = ln->has_fg ? ln->fg_xrgb : default_fg_xrgb;
+	st.has_bg = ln->has_bg;
+	st.bg_xrgb = ln->bg_xrgb;
+	st.bold = ln->bold;
+	st.underline = 1;
 	return st;
 }
 
@@ -190,12 +209,17 @@ static const char *links_href_at_index(const struct html_links *links, uint32_t 
 	if (!links || links->n == 0) return 0;
 	if (idx < links->links[0].start) return 0;
 	if (idx >= links->links[links->n - 1].end) return 0;
-	for (uint32_t i = 0; i < links->n; i++) {
-		const struct html_link *ln = &links->links[i];
-		if (idx < ln->start || idx >= ln->end) continue;
-		return ln->href;
+	uint32_t lo = 0;
+	uint32_t hi = links->n;
+	while (lo < hi) {
+		uint32_t mid = lo + (hi - lo) / 2u;
+		if (links->links[mid].start <= idx) lo = mid + 1u;
+		else hi = mid;
 	}
-	return 0;
+	if (lo == 0) return 0;
+	const struct html_link *ln = &links->links[lo - 1u];
+	if (idx < ln->start || idx >= ln->end) return 0;
+	return ln->href;
 }
 
 static void draw_line_with_links(struct shm_fb *fb,
@@ -502,12 +526,21 @@ static void draw_body_wrapped(struct shm_fb *fb,
 						/* Keep bottom border visible. */
 						dst_h = (dst_h > 1u) ? (dst_h - 1u) : 0u;
 					}
+					if (inner_w != 0u && dst_h != 0u) {
+						/* Clear interior first so partial blits don't leave artifacts. */
+						fill_rect_u32(fb->pixels, fb->stride, inner_x, row_y, inner_w, dst_h, 0xff101014u);
+					}
 					uint32_t src_y0 = (rbox - 1u) * 16u;
 					if (dst_h != 0u && src_y0 < (uint32_t)img_box.entry->pix_h) {
 						const uint32_t *pool = img_entry_pixels(img_box.entry);
 						const uint32_t *src = pool ? (pool + (size_t)src_y0 * (size_t)img_box.entry->pix_w) : 0;
 						uint32_t src_h = (uint32_t)img_box.entry->pix_h - src_y0;
-						if (src) blit_xrgb_clipped(fb, inner_x, row_y, inner_w, dst_h, src, img_box.entry->pix_w, src_h);
+						if (src) {
+							uint32_t draw_w = inner_w;
+							if (draw_w > img_box.entry->pix_w) draw_w = img_box.entry->pix_w;
+							uint32_t draw_x = inner_x + ((inner_w > draw_w) ? ((inner_w - draw_w) / 2u) : 0u);
+							blit_xrgb_clipped(fb, draw_x, row_y, draw_w, dst_h, src, img_box.entry->pix_w, src_h);
+						}
 					}
 				}
 			}
@@ -562,12 +595,20 @@ static void draw_body_wrapped(struct shm_fb *fb,
 						if (rbox + 1u == rows_total && dst_h > 0u) {
 							dst_h = (dst_h > 1u) ? (dst_h - 1u) : 0u;
 						}
+						if (inner_w != 0u && dst_h != 0u) {
+							fill_rect_u32(fb->pixels, fb->stride, inner_x, row_y, inner_w, dst_h, 0xff101014u);
+						}
 						uint32_t src_y0 = (rbox - 1u) * 16u;
 						if (dst_h != 0u && src_y0 < (uint32_t)float_box.entry->pix_h) {
 							const uint32_t *pool = img_entry_pixels(float_box.entry);
 							const uint32_t *src = pool ? (pool + (size_t)src_y0 * (size_t)float_box.entry->pix_w) : 0;
 							uint32_t src_h = (uint32_t)float_box.entry->pix_h - src_y0;
-							if (src) blit_xrgb_clipped(fb, inner_x, row_y, inner_w, dst_h, src, float_box.entry->pix_w, src_h);
+							if (src) {
+								uint32_t draw_w = inner_w;
+								if (draw_w > float_box.entry->pix_w) draw_w = float_box.entry->pix_w;
+								uint32_t draw_x = inner_x + ((inner_w > draw_w) ? ((inner_w - draw_w) / 2u) : 0u);
+								blit_xrgb_clipped(fb, draw_x, row_y, draw_w, dst_h, src, float_box.entry->pix_w, src_h);
+							}
 						}
 					}
 				}
@@ -679,7 +720,8 @@ static void draw_body_wrapped(struct shm_fb *fb,
 				float_box.active = 1;
 				float_box.rows_total = rows;
 				float_box.cols_total = fcols;
-				float_box.row_in_box = 0;
+				/* Next visual row should draw the first pixel slice (label row is this row). */
+				float_box.row_in_box = 1;
 
 				/* Draw the next text line on the same row (mirrors old behavior). */
 				uint32_t use_cols2 = max_cols;
